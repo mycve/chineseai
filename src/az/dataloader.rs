@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
@@ -28,6 +28,25 @@ use super::{
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
+const MOVES_LEFT_PAIR_GAPS: [u16; 3] = [2, 8, 16];
+
+fn moves_left_key(sample: &AzTrainingSample) -> Option<(u32, u64, u16)> {
+    (sample.meta.game_id != 0
+        && sample.moves_left_weight.is_finite()
+        && sample.moves_left_weight > 0.0
+        && sample.moves_left.is_finite()
+        && sample.moves_left >= 0.0)
+        .then_some((
+            sample.meta.generation_update,
+            sample.meta.game_id,
+            sample.meta.ply,
+        ))
+}
+
+fn moves_left_pair_matches(from: &AzTrainingSample, to: &AzTrainingSample) -> bool {
+    ((from.moves_left - to.moves_left) - (f32::from(to.meta.ply) - f32::from(from.meta.ply))).abs()
+        < 0.01
+}
 
 /// 稀疏参数在一个确定性抽样训练子集中的激活覆盖。
 ///
@@ -149,14 +168,58 @@ struct BatchStep {
 }
 
 impl BatchPlan {
-    pub(super) fn epoch(sample_count: usize, config: &DataLoaderConfig) -> Self {
+    pub(super) fn epoch(samples: &[AzTrainingSample], config: &DataLoaderConfig) -> Self {
         let batch_size = config.batch_size.max(1);
-        let mut order = (0..sample_count).collect::<Vec<_>>();
+        let mut order = (0..samples.len()).collect::<Vec<_>>();
         if config.shuffle {
             shuffle_indices(&mut order, config.seed);
+            if batch_size > 1 {
+                // 只调整随机排列中的相邻关系，不重复采样、不增加前向次数。
+                let positions = samples
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, sample)| moves_left_key(sample).map(|key| (key, index)))
+                    .collect::<HashMap<_, _>>();
+                let mut used = vec![false; samples.len()];
+                let mut paired_order = Vec::with_capacity(order.len());
+                let mut state = config.seed;
+                for index in order {
+                    if used[index] {
+                        continue;
+                    }
+                    used[index] = true;
+                    paired_order.push(index);
+                    if paired_order.len().is_multiple_of(batch_size) {
+                        continue;
+                    }
+                    let Some((generation, game, ply)) = moves_left_key(&samples[index]) else {
+                        continue;
+                    };
+                    // 每轮改变间隔和前后方向，避免约束永远只覆盖相邻两步。
+                    let choice = splitmix_next(&mut state) as usize;
+                    let partner = (0..6).find_map(|offset| {
+                        let choice = (choice % 6 + offset) % 6;
+                        let gap = MOVES_LEFT_PAIR_GAPS[choice / 2];
+                        let next = if choice % 2 == 0 {
+                            ply.checked_add(gap)
+                        } else {
+                            ply.checked_sub(gap)
+                        }?;
+                        let &partner = positions.get(&(generation, game, next))?;
+                        (!used[partner]
+                            && moves_left_pair_matches(&samples[index], &samples[partner]))
+                        .then_some(partner)
+                    });
+                    if let Some(partner) = partner {
+                        used[partner] = true;
+                        paired_order.push(partner);
+                    }
+                }
+                order = paired_order;
+            }
         }
 
-        let mut steps = Vec::with_capacity(sample_count.div_ceil(batch_size));
+        let mut steps = Vec::with_capacity(samples.len().div_ceil(batch_size));
         for chunk in order.chunks(batch_size) {
             if config.drop_last && chunk.len() < batch_size {
                 break;
@@ -209,6 +272,9 @@ pub(super) struct PackedBatch {
     pub value_weights: Vec<f32>,
     pub moves_left_targets: Vec<f32>,
     pub moves_left_weights: Vec<f32>,
+    pub moves_left_pair_from: Vec<u32>,
+    pub moves_left_pair_to: Vec<u32>,
+    pub moves_left_pair_weights: Vec<f32>,
     pub value_phase_masks: Vec<f32>,
     pub value_source_phase_masks: Vec<f32>,
 }
@@ -300,6 +366,9 @@ impl PackedBatch {
             value_weights: vec![1.0f32; batch_size],
             moves_left_targets: vec![0.0; batch_size],
             moves_left_weights: vec![0.0; batch_size],
+            moves_left_pair_from: Vec::new(),
+            moves_left_pair_to: Vec::new(),
+            moves_left_pair_weights: Vec::new(),
             value_phase_masks: vec![0.0f32; batch_size * 3],
             value_source_phase_masks: vec![0.0f32; batch_size * 9],
         };
@@ -347,7 +416,41 @@ impl PackedBatch {
             packed.value_source_phase_masks
                 [row * 9 + sample.meta.start_source.index() * 3 + phase] = 1.0;
         }
+        packed.pack_moves_left_pairs(samples, batch);
         packed
+    }
+
+    fn pack_moves_left_pairs(&mut self, samples: &[AzTrainingSample], batch: &[usize]) {
+        let mut positions = BTreeMap::new();
+        for (row, &index) in batch.iter().enumerate() {
+            let meta = samples[index].meta;
+            if meta.game_id != 0 && self.moves_left_weights[row] > 0.0 {
+                positions
+                    .entry((meta.generation_update, meta.game_id, meta.ply))
+                    .or_insert(row);
+            }
+        }
+        // 只比较同局同方行棋的真实时间差；未知、跨局或不一致的距离标签不参与。
+        for (&(generation, game, ply), &from) in &positions {
+            for gap in MOVES_LEFT_PAIR_GAPS {
+                let Some(next) = ply.checked_add(gap) else {
+                    continue;
+                };
+                let Some(&to) = positions.get(&(generation, game, next)) else {
+                    continue;
+                };
+                let expected = f32::from(gap) / super::MOVES_LEFT_SCALE;
+                if (self.moves_left_targets[from] - self.moves_left_targets[to] - expected).abs()
+                    > 1e-4
+                {
+                    continue;
+                }
+                self.moves_left_pair_from.push(from as u32);
+                self.moves_left_pair_to.push(to as u32);
+                self.moves_left_pair_weights
+                    .push(self.moves_left_weights[from].min(self.moves_left_weights[to]));
+            }
+        }
     }
 
     fn pack_features(&mut self, row: usize, sample: &AzTrainingSample) {
@@ -668,6 +771,27 @@ mod tests {
     }
 
     #[test]
+    fn moves_left_pairs_require_matching_game_generation_and_valid_time_differences() {
+        let mut samples = (0..7).map(sample).collect::<Vec<_>>();
+        for (s, ply) in samples.iter_mut().zip([0, 2, 8, 16, 8, 8, 8]) {
+            s.meta.game_id = 17;
+            s.meta.generation_update = 3;
+            s.meta.ply = ply;
+            s.moves_left = 40.0 - f32::from(ply);
+            s.moves_left_weight = 1.0;
+        }
+        samples[2].moves_left_weight = 0.0;
+        samples[3].moves_left = 9.0; // 与同局时间差不一致。
+        samples[4].meta.game_id = 18;
+        samples[5].meta.generation_update = 4;
+        samples[6].meta.game_id = 0;
+        let packed = PackedBatch::from_indices(&samples, &[1, 0, 2, 3, 4, 5, 6]);
+        assert_eq!(packed.moves_left_pair_from, [1]);
+        assert_eq!(packed.moves_left_pair_to, [0]);
+        assert_eq!(packed.moves_left_pair_weights, [1.0]);
+    }
+
+    #[test]
     fn batch_plan_respects_drop_last() {
         let config = DataLoaderConfig {
             batch_size: 3,
@@ -675,10 +799,92 @@ mod tests {
             drop_last: true,
             ..DataLoaderConfig::default()
         };
-        let plan = BatchPlan::epoch(8, &config);
+        let samples = (0..8).map(sample).collect::<Vec<_>>();
+        let plan = BatchPlan::epoch(&samples, &config);
         assert_eq!(plan.len(), 2);
         assert_eq!(plan.steps[0].indices, vec![0, 1, 2]);
         assert_eq!(plan.steps[1].indices, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn shuffled_batches_keep_time_pairs_without_repeating_or_losing_samples() {
+        let mut samples = (0..2049).map(|_| sample(0)).collect::<Vec<_>>();
+        for (index, item) in samples[..2048].iter_mut().enumerate() {
+            item.meta.game_id = (index / 2 + 1) as u64;
+            item.meta.ply = if index % 2 == 0 {
+                0
+            } else {
+                MOVES_LEFT_PAIR_GAPS[(index / 2) % 3]
+            };
+            item.moves_left = 40.0 - f32::from(item.meta.ply);
+            item.moves_left_weight = 1.0;
+        }
+        for batch_size in [1, 3, 64] {
+            let config = DataLoaderConfig {
+                batch_size,
+                seed: 971,
+                ..DataLoaderConfig::default()
+            };
+            let plan = BatchPlan::epoch(&samples, &config);
+            let repeated = BatchPlan::epoch(&samples, &config);
+            let order = plan
+                .steps
+                .iter()
+                .flat_map(|step| &step.indices)
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                order,
+                repeated
+                    .steps
+                    .iter()
+                    .flat_map(|step| &step.indices)
+                    .copied()
+                    .collect::<Vec<_>>()
+            );
+            assert_ne!(order, (0..samples.len()).collect::<Vec<_>>());
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..samples.len()).collect::<Vec<_>>());
+            assert!(
+                plan.steps[..plan.len() - 1]
+                    .iter()
+                    .all(|step| step.indices.len() == batch_size)
+            );
+            if batch_size == 64 {
+                let pairs = plan
+                    .steps
+                    .iter()
+                    .map(|step| {
+                        PackedBatch::from_indices(&samples, &step.indices)
+                            .moves_left_pair_from
+                            .len()
+                    })
+                    .sum::<usize>();
+                assert!(pairs >= 1000, "只有 {pairs} 对实际进入训练批次");
+            }
+            let dropped = BatchPlan::epoch(
+                &samples,
+                &DataLoaderConfig {
+                    drop_last: true,
+                    ..config
+                },
+            );
+            assert!(
+                dropped
+                    .steps
+                    .iter()
+                    .all(|step| step.indices.len() == batch_size)
+            );
+            assert_eq!(
+                dropped
+                    .steps
+                    .iter()
+                    .map(|step| step.indices.len())
+                    .sum::<usize>(),
+                samples.len() / batch_size * batch_size
+            );
+        }
     }
 
     #[test]
@@ -755,7 +961,7 @@ mod tests {
             prefetch_batches: 2,
             ..DataLoaderConfig::default()
         };
-        let plan = BatchPlan::epoch(samples.len(), &config);
+        let plan = BatchPlan::epoch(&samples, &config);
         let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
         let mut sizes = Vec::new();
         while let Some(batch) = loader.next_packed().unwrap() {

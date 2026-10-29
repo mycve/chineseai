@@ -145,6 +145,9 @@ pub(crate) fn build_async_training_report(
         value_loss: stats.value_loss,
         moves_left_loss: stats.moves_left_loss,
         moves_left_samples: stats.moves_left_samples,
+        moves_left_pairs: stats.moves_left_pairs,
+        moves_left_pair_accuracy: stats.moves_left_correct_pairs as f32
+            / stats.moves_left_pairs.max(1) as f32,
         value_mse: stats.value_error_sq_sum / train_stat_samples,
         value_pred_mean,
         value_target_mean,

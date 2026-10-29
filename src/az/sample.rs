@@ -71,6 +71,8 @@ pub struct AzLoopReport {
     pub value_loss: f32,
     pub moves_left_loss: f32,
     pub moves_left_samples: usize,
+    pub moves_left_pairs: usize,
+    pub moves_left_pair_accuracy: f32,
     pub value_mse: f32,
     pub value_pred_mean: f32,
     pub value_target_mean: f32,
@@ -439,6 +441,8 @@ pub struct AzTrainStats {
     pub policy_ce: f32,
     pub moves_left_loss: f32,
     pub moves_left_samples: usize,
+    pub moves_left_pairs: usize,
+    pub moves_left_correct_pairs: usize,
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
@@ -462,6 +466,8 @@ pub struct AzHoldoutReport {
     pub value_loss: f32,
     pub moves_left_rmse: f32,
     pub moves_left_samples: usize,
+    pub moves_left_pairs: usize,
+    pub moves_left_pair_accuracy: f32,
     pub policy_kl: f32,
     pub value_rmse: f32,
 }
@@ -500,6 +506,8 @@ impl AzTrainStats {
         self.policy_ce += other.policy_ce;
         self.moves_left_loss += other.moves_left_loss;
         self.moves_left_samples += other.moves_left_samples;
+        self.moves_left_pairs += other.moves_left_pairs;
+        self.moves_left_correct_pairs += other.moves_left_correct_pairs;
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
         self.value_target_sum += other.value_target_sum;

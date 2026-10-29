@@ -78,13 +78,15 @@ impl TrainingConsole {
             if checkpoint { " checkpoint=saved" } else { "" }
         );
         let loss = format!(
-            "train: samples={} loss={:.4} WDL={:.4} policy_KL={:.4} MLH={:.4}/{}",
+            "train: samples={} loss={:.4} WDL={:.4} policy_KL={:.4} MLH={:.4}/{} MLH_pair={:.1}%/{}",
             report.train_samples,
             report.loss,
             report.value_loss,
             report.policy_kl,
             report.moves_left_loss,
-            report.moves_left_samples
+            report.moves_left_samples,
+            report.moves_left_pair_accuracy * 100.0,
+            report.moves_left_pairs
         );
         let value = format!(
             "value: RMSE={:.4} corr={:.3} lr={:.6} sims={:.1} train={:.1}s",
@@ -100,8 +102,7 @@ impl TrainingConsole {
             self.cycle.set_position(
                 report
                     .training_steps
-                    .saturating_sub((cycle_number - 1) * PX0_CYCLE_STEPS)
-                    as u64,
+                    .saturating_sub((cycle_number - 1) * PX0_CYCLE_STEPS) as u64,
             );
             self.production.set_message(production);
             self.loss.set_message(loss);
@@ -121,8 +122,16 @@ impl TrainingConsole {
             format!("WDL={:.4} RMSE={:.4}", check.value_loss, check.value_rmse)
         };
         let line = format!(
-            "test: step={} samples={} value_samples={} loss={:.4} policy_KL={:.4} {value}",
-            check.step, check.samples, check.value_samples, check.loss, check.policy_kl
+            "test: step={} samples={} value_samples={} loss={:.4} policy_KL={:.4} {value} MLH_RMSE={:.1}/{} MLH_pair={:.1}%/{}",
+            check.step,
+            check.samples,
+            check.value_samples,
+            check.loss,
+            check.policy_kl,
+            check.moves_left_rmse,
+            check.moves_left_samples,
+            check.moves_left_pair_accuracy * 100.0,
+            check.moves_left_pairs
         );
         if self.interactive {
             self.test.set_message(line);

@@ -6,7 +6,7 @@ use std::{sync::Arc, thread, time::Instant};
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainOptimizer, AzTrainStats, AzTrainingSample,
     AzValueMomentStats, WDL_HEAD_SIZE,
-    candle_model::{AzCandleModel, BatchTensors},
+    candle_model::{AzCandleModel, BatchTensors, MovesLeftPairs},
     dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PackedStepBatch, PrefetchDataLoader},
 };
 
@@ -68,7 +68,7 @@ pub(super) fn train_samples_gpu(
                 prefetch_batches: 2,
                 ..DataLoaderConfig::default()
             };
-            let plan = BatchPlan::epoch(samples.len(), &config);
+            let plan = BatchPlan::epoch(&samples, &config);
             let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
             stats = AzTrainStats::default();
             loop {
@@ -213,6 +213,9 @@ impl GpuTrainer {
                 .sqrt()
                 * super::MOVES_LEFT_SCALE,
             moves_left_samples: stats.moves_left_samples,
+            moves_left_pairs: stats.moves_left_pairs,
+            moves_left_pair_accuracy: stats.moves_left_correct_pairs as f32
+                / stats.moves_left_pairs.max(1) as f32,
             policy_kl: stats.policy_ce / stats.samples.max(1) as f32
                 - super::policy_target_entropy(samples),
             value_rmse: (stats.value_error_sq_sum / valid.max(1) as f32)
@@ -351,8 +354,9 @@ impl GpuReplica {
             .broadcast_mul(&batch_tensors.policy_weights)?
             .sum_all()?
             .affine(policy_weight.max(0.0) as f64, 0.0)?;
+        let moves_left_prediction = forward.moves_left.squeeze(1)?;
         let moves_left_error =
-            (forward.moves_left.squeeze(1)? - &batch_tensors.moves_left_targets)?.sqr()?;
+            (&moves_left_prediction - &batch_tensors.moves_left_targets)?.sqr()?;
         let moves_left_loss = (&moves_left_error * &batch_tensors.moves_left_weights)?.sum_all()?;
         let valid_moves_left = batch_tensors
             .moves_left_weights
@@ -360,8 +364,18 @@ impl GpuReplica {
             .to_dtype(candle_core::DType::F32)?
             .sum_all()?
             .to_scalar::<f32>()? as usize;
+        let moves_left_objective = moves_left_objective(
+            &moves_left_prediction,
+            &batch_tensors.moves_left_targets,
+            &batch_tensors.moves_left_weights,
+            batch_tensors.moves_left_pairs.as_ref(),
+        )?;
+        let (moves_left_pairs, correct_pairs) = moves_left_pair_metrics(
+            &moves_left_prediction,
+            batch_tensors.moves_left_pairs.as_ref(),
+        )?;
         let loss_sum = ((weighted_value_loss + weighted_policy_ce)?
-            + moves_left_loss.affine(super::MOVES_LEFT_LOSS_WEIGHT as f64, 0.0)?)?;
+            + moves_left_objective.affine(super::MOVES_LEFT_LOSS_WEIGHT as f64, 0.0)?)?;
         let loss_tensor = (&loss_sum / batch_len as f64)?;
         let moments = masked_value_moments(
             &value,
@@ -382,6 +396,7 @@ impl GpuReplica {
                 value_ce.detach(),
                 policy_ce.detach(),
                 moves_left_loss.detach(),
+                correct_pairs,
             ],
             0,
         )?
@@ -392,6 +407,8 @@ impl GpuReplica {
             policy_ce: metrics[2],
             moves_left_loss: metrics[3],
             moves_left_samples: valid_moves_left,
+            moves_left_pairs,
+            moves_left_correct_pairs: metrics[4] as usize,
             value_pred_sum: global.pred_sum,
             value_pred_sq_sum: global.pred_sq_sum,
             value_target_sum: global.target_sum,
@@ -404,6 +421,55 @@ impl GpuReplica {
         };
         Ok(BatchLossOutput { loss_tensor, stats })
     }
+}
+
+// 按100半回合归一化：绝对回归使用30半回合的稳健区间，局部时间差使用3半回合。
+// 监控仍记录原来的均方误差；这里的优化目标额外关注同一对局内的局部排序。
+fn smooth_l1(error: &Tensor, beta: f64) -> CandleResult<Tensor> {
+    let absolute = error.abs()?;
+    let quadratic = absolute.clamp(0.0, beta)?;
+    quadratic.sqr()?.affine(0.5 / beta, 0.0)? + (absolute - quadratic)?
+}
+
+fn moves_left_objective(
+    prediction: &Tensor,
+    target: &Tensor,
+    weights: &Tensor,
+    pairs: Option<&MovesLeftPairs>,
+) -> CandleResult<Tensor> {
+    let absolute = (smooth_l1(&(prediction - target)?, 0.3)? * weights)?.sum_all()?;
+    let Some(pairs) = pairs else {
+        return Ok(absolute);
+    };
+    let difference =
+        (prediction.index_select(&pairs.from, 0)? - prediction.index_select(&pairs.to, 0)?)?;
+    let expected = (target.index_select(&pairs.from, 0)? - target.index_select(&pairs.to, 0)?)?;
+    let relative = (smooth_l1(&(difference - expected)?, 0.03)? * &pairs.weights)?
+        .sum_all()?
+        .affine(pairs.total_weight.recip(), 0.0)?;
+    // 少量配对最多覆盖各自两个样本，避免稀疏配对被放大到整批标签的权重。
+    let covered_weight = weights.sum_all()?.clamp(0.0, pairs.total_weight * 2.0)?;
+    absolute + (relative * covered_weight)?
+}
+
+fn moves_left_pair_metrics(
+    prediction: &Tensor,
+    pairs: Option<&MovesLeftPairs>,
+) -> CandleResult<(usize, Tensor)> {
+    let Some(pairs) = pairs else {
+        return Ok((
+            0,
+            Tensor::zeros((), prediction.dtype(), prediction.device())?,
+        ));
+    };
+    // from 始终早于 to；严格大于才算正确，相同预测不算命中。
+    let prediction = prediction.detach();
+    let correct = prediction
+        .index_select(&pairs.from, 0)?
+        .gt(&prediction.index_select(&pairs.to, 0)?)?
+        .to_dtype(candle_core::DType::F32)?
+        .sum_all()?;
+    Ok((pairs.from.elem_count(), correct))
 }
 
 fn masked_value_moments(
@@ -537,6 +603,80 @@ fn dataloader_error(error: super::dataloader::DataLoaderError) -> candle_core::E
 #[cfg(test)]
 mod monitoring_tests {
     use super::*;
+
+    fn check_moves_left_robust_ranking_objective(device: &Device) {
+        let prediction = candle_core::Var::from_slice(&[0.2f32, 0.4, 1.0], 3, device).unwrap();
+        let target = Tensor::new(&[0.4f32, 0.38, 123.0], device).unwrap();
+        let weights = Tensor::new(&[1.0f32, 1.0, 0.0], device).unwrap();
+        let pairs = MovesLeftPairs {
+            from: Tensor::new(&[0u32], device).unwrap(),
+            to: Tensor::new(&[1u32], device).unwrap(),
+            weights: Tensor::new(&[1.0f32], device).unwrap(),
+            total_weight: 1.0,
+        };
+        let loss =
+            moves_left_objective(prediction.as_tensor(), &target, &weights, Some(&pairs)).unwrap();
+        assert!((loss.to_scalar::<f32>().unwrap() - 0.47733334).abs() < 1e-5);
+        let grads = loss.backward().unwrap();
+        let gradient = grads.get(&prediction).unwrap().to_vec1::<f32>().unwrap();
+        assert!((gradient[0] + 2.6666667).abs() < 1e-5);
+        assert!((gradient[1] - 2.0666667).abs() < 1e-5);
+        assert_eq!(gradient[2], 0.0);
+        let (count, correct) =
+            moves_left_pair_metrics(prediction.as_tensor(), Some(&pairs)).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(correct.to_scalar::<f32>().unwrap(), 0.0);
+        let ordered = Tensor::new(&[0.4f32, 0.2, 1.0], device).unwrap();
+        let (_, correct) = moves_left_pair_metrics(&ordered, Some(&pairs)).unwrap();
+        assert_eq!(correct.to_scalar::<f32>().unwrap(), 1.0);
+        let tied = Tensor::new(&[0.3f32, 0.3, 1.0], device).unwrap();
+        let (_, correct) = moves_left_pair_metrics(&tied, Some(&pairs)).unwrap();
+        assert_eq!(correct.to_scalar::<f32>().unwrap(), 0.0);
+        let crowded_weights = Tensor::new(&[1.0f32, 1.0, 50.0], device).unwrap();
+        let crowded_target = Tensor::new(&[0.4f32, 0.38, 1.0], device).unwrap();
+        let crowded = moves_left_objective(
+            prediction.as_tensor(),
+            &crowded_target,
+            &crowded_weights,
+            Some(&pairs),
+        )
+        .unwrap();
+        assert!((crowded.to_scalar::<f32>().unwrap() - 0.47733334).abs() < 1e-5);
+        let absolute =
+            moves_left_objective(prediction.as_tensor(), &target, &weights, None).unwrap();
+        let shifted = prediction.affine(1.0, 0.1).unwrap();
+        let shifted_loss = moves_left_objective(&shifted, &target, &weights, Some(&pairs)).unwrap();
+        let shifted_absolute = moves_left_objective(&shifted, &target, &weights, None).unwrap();
+        assert!(
+            ((loss - absolute).unwrap().to_scalar::<f32>().unwrap()
+                - (shifted_loss - shifted_absolute)
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap())
+            .abs()
+                < 1e-5
+        );
+        let masked = moves_left_objective(
+            prediction.as_tensor(),
+            &target,
+            &weights.zeros_like().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(masked.to_scalar::<f32>().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn moves_left_robust_ranking_objective_matches_reference_cpu() {
+        check_moves_left_robust_ranking_objective(&Device::Cpu);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn moves_left_robust_ranking_objective_matches_reference_cuda() {
+        let device = crate::az::cuda_test_device::shared_cuda_device().expect("CUDA is required");
+        check_moves_left_robust_ranking_objective(device);
+    }
 
     #[cfg(feature = "slow-tests")]
     #[test]

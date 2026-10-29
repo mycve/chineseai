@@ -171,6 +171,13 @@ pub(super) struct ForwardOutput {
     pub(super) policy_logits: Tensor,
 }
 
+pub(super) struct MovesLeftPairs {
+    pub(super) from: Tensor,
+    pub(super) to: Tensor,
+    pub(super) weights: Tensor,
+    pub(super) total_weight: f64,
+}
+
 pub(super) struct BatchTensors {
     pub(super) batch_size: usize,
     pub(super) value_buckets: Tensor,
@@ -192,6 +199,7 @@ pub(super) struct BatchTensors {
     pub(super) value_weights: Tensor,
     pub(super) moves_left_targets: Tensor,
     pub(super) moves_left_weights: Tensor,
+    pub(super) moves_left_pairs: Option<MovesLeftPairs>,
     pub(super) value_phase_masks: Tensor,
     pub(super) value_source_phase_masks: Tensor,
 }
@@ -216,8 +224,25 @@ impl BatchTensors {
                 .iter()
                 .all(|&index| index == PADDING_ITEM || index < VALUE_KING_PIECE_VOCAB as u32)
         );
+        let pair_count = packed.moves_left_pair_from.len();
+        let moves_left_pairs = if pair_count == 0 {
+            None
+        } else {
+            let total_weight = packed
+                .moves_left_pair_weights
+                .iter()
+                .map(|&w| f64::from(w))
+                .sum();
+            Some(MovesLeftPairs {
+                from: Tensor::from_vec(packed.moves_left_pair_from, pair_count, device)?,
+                to: Tensor::from_vec(packed.moves_left_pair_to, pair_count, device)?,
+                weights: Tensor::from_vec(packed.moves_left_pair_weights, pair_count, device)?,
+                total_weight,
+            })
+        };
         Ok(Self {
             batch_size,
+            moves_left_pairs,
             value_buckets: Tensor::from_vec(packed.value_buckets, batch_size, device)?,
             feature_items: Tensor::from_vec(
                 packed.feature_items,

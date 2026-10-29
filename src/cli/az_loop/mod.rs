@@ -752,6 +752,8 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             if check.value_samples > 0 {
                 log_scalar(&mut tb, "test/wdl_ce", check.step, check.value_loss);
                 log_scalar(&mut tb, "test/value_rmse", check.step, check.value_rmse);
+            }
+            if check.moves_left_samples > 0 {
                 log_scalar(
                     &mut tb,
                     "test/moves_left_rmse_plies",
@@ -765,12 +767,31 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                     check.moves_left_samples as f32,
                 );
             }
+            if check.moves_left_pairs > 0 {
+                log_scalar(
+                    &mut tb,
+                    "test/moves_left_pair_accuracy",
+                    check.step,
+                    check.moves_left_pair_accuracy,
+                );
+                log_scalar(
+                    &mut tb,
+                    "test/moves_left_pairs",
+                    check.step,
+                    check.moves_left_pairs as f32,
+                );
+            }
         }
         for (tag, value) in [
             ("train/optimized_loss", report.loss),
             ("train/wdl_ce", report.value_loss),
             ("train/moves_left_mse", report.moves_left_loss),
             ("train/moves_left_samples", report.moves_left_samples as f32),
+            ("train/moves_left_pairs", report.moves_left_pairs as f32),
+            (
+                "train/moves_left_pair_accuracy",
+                report.moves_left_pair_accuracy,
+            ),
             ("train/policy_kl", report.policy_kl),
             ("train/value_rmse", value_rmse),
             ("train/value_corr", report.value_corr),
