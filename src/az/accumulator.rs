@@ -20,7 +20,7 @@ pub(crate) struct AzEvalScratch {
     pub(crate) threat_activation: Vec<f32>,
     pub(crate) threat_precomputed: Option<super::node_threat::ThreatEncoding>,
     pub(crate) policy_gives_check: Vec<f32>,
-    /// 本节点的双方攻击位板，统一上下文、机动特征和策略战术共用。
+    /// 本节点的双方攻击位板，统一上下文和策略战术共用。
     pub(crate) attack_masks: [u128; 2],
     /// `policy_gives_check` / `attack_masks` 是否已经是**当前局面**的值。
     /// 与 `scratch` 跨节点复用的做法配合：每次评估开头清零。

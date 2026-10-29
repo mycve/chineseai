@@ -135,7 +135,7 @@ impl AzNnue {
     }
 
     /// 准备共享局面事实：候选将军标记和双方攻击位板。
-    /// 位板供统一上下文、机动特征和策略战术共用，并复用已有威胁缓存中的结果。
+    /// 位板供统一上下文和策略战术共用。
     pub(crate) fn fill_policy_inputs(
         &self,
         position: &Position,
@@ -145,10 +145,7 @@ impl AzNnue {
     ) {
         self.fill_policy_gives_checks(position, moves, &mut scratch.policy_gives_check);
         if with_masks {
-            scratch.attack_masks = scratch.threat_precomputed.as_ref().map_or_else(
-                || position.attacked_squares_masks(),
-                |cached| cached.attacks,
-            );
+            scratch.attack_masks = position.attacked_squares_masks();
         }
         scratch.policy_inputs_ready = true;
     }

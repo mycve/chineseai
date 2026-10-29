@@ -24,7 +24,7 @@ use super::{
     normalize_wdl_target, policy_move_pieces, policy_move_tactical_flags,
     policy_sparse_capture_index, policy_sparse_main_index, policy_tactical_indices,
     sparse_pool::PADDING_ITEM,
-    visit_threat_entries_with_masks, visit_value_king_piece_features,
+    visit_value_king_piece_features, visit_value_threat_entries_from,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -252,8 +252,7 @@ impl PackedBatch {
             .collect::<Vec<_>>();
         let value_threats = positions
             .iter()
-            .zip(&attack_masks)
-            .map(|(p, masks)| value_threat_features(p, *masks))
+            .map(value_threat_features)
             .collect::<Vec<_>>();
         let max_value_threats = value_threats.iter().map(Vec::len).max().unwrap_or(0).max(1);
         let value_king_pieces = positions
@@ -465,18 +464,11 @@ impl PackedBatch {
     }
 }
 
-fn value_threat_features(position: &Position, attacks: [u128; 2]) -> Vec<u32> {
+fn value_threat_features(position: &Position) -> Vec<u32> {
     let mut features = Vec::with_capacity(32);
-    visit_threat_entries_with_masks(
-        position,
-        Color::Red,
-        u128::MAX,
-        u128::MAX,
-        attacks,
-        |entry| {
-            features.push(entry as u16 as u32);
-        },
-    );
+    visit_value_threat_entries_from(position, Color::Red, u128::MAX, |entry| {
+        features.push(entry as u16 as u32);
+    });
     assert!(
         features.len() <= VALUE_THREAT_MAX_ACTIVE,
         "too many active value threats"

@@ -50,19 +50,11 @@ pub(crate) const VALUE_THREAT_PAIR_VOCAB: usize = 10_443;
 /// 仅保留方向、距离、阻挡次序及数量可同时满足的射线组合。
 pub(crate) const VALUE_RAY_VOCAB: usize = 7_040;
 pub(crate) const VALUE_CANNON_TRIPLE_VOCAB: usize = 32_768;
-pub(crate) const HORSE_TWO_HOP_OFFSET: usize =
+pub(crate) const VALUE_THREAT_VOCAB: usize =
     VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB + VALUE_CANNON_TRIPLE_VOCAB;
-/// 双方马 × 1708个两跳起终点组合 × 空格/敌子。
-pub(crate) const HORSE_TWO_HOP_VOCAB: usize = 6_832;
-pub(crate) const HORSE_LEG_OFFSET: usize = HORSE_TWO_HOP_OFFSET + HORSE_TWO_HOP_VOCAB;
-/// 4368种堵腿关系：548行复用旧配对，492对互反共享，其余分配新行。
-pub(crate) const HORSE_LEG_VOCAB: usize = 3_328;
-pub(crate) const MOBILITY_OFFSET: usize = HORSE_LEG_OFFSET + HORSE_LEG_VOCAB;
-/// 双方×车马炮×未受控落点档×受控落点档，每档为0、1、2～3、4以上。
-pub(crate) const MOBILITY_VOCAB: usize = 2 * 3 * 4 * 4;
-pub(crate) const VALUE_THREAT_VOCAB: usize = MOBILITY_OFFSET + MOBILITY_VOCAB;
-pub(crate) const VALUE_THREAT_MAX_ACTIVE: usize = 348;
-pub(crate) const THREAT_SOURCE_MAX_ACTIVE: usize = 44;
+pub(crate) const VALUE_THREAT_MAX_ACTIVE: usize = 192;
+/// 炮的四条射线，每方向最多首阻挡、次阻挡及炮架三项。
+pub(crate) const THREAT_SOURCE_MAX_ACTIVE: usize = 12;
 pub(crate) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
