@@ -55,14 +55,15 @@ impl AzCandleModel {
         let encoded = self.encode_shared(batch)?;
         let value_logits = self.value_head(batch, &encoded)?;
         let policy_logits = self.policy_head(batch, &encoded)?;
-        let moves_left = encoded
+        let moves_left_raw = encoded
             .hidden
             .matmul(&self.moves_left_output.t()?)?
             .broadcast_add(&self.moves_left_bias)?
-            .affine(1.0, 1.0)?
-            .relu()?;
+            .affine(1.0, 1.0)?;
+        let moves_left = moves_left_raw.relu()?;
         Ok(ForwardOutput {
             moves_left,
+            moves_left_raw,
             value_logits,
             policy_logits,
         })
@@ -167,6 +168,8 @@ impl AzCandleModel {
 pub(super) struct ForwardOutput {
     /// 已除以 MOVES_LEFT_SCALE 的半回合数。
     pub(super) moves_left: Tensor,
+    /// 回归使用截断前读出，负激活也能收到距离标签的修正梯度。
+    pub(super) moves_left_raw: Tensor,
     pub(super) value_logits: Tensor,
     pub(super) policy_logits: Tensor,
 }

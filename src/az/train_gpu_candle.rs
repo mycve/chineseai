@@ -365,7 +365,9 @@ impl GpuReplica {
             .sum_all()?
             .to_scalar::<f32>()? as usize;
         let moves_left_objective = moves_left_objective(
-            &moves_left_prediction,
+            // 距离标签非负；直接约束截断前的线性读出，避免 ReLU 负区失去梯度。
+            // 监控与搜索继续使用上面的非负输出，参数形状和推理语义不变。
+            &forward.moves_left_raw.squeeze(1)?,
             &batch_tensors.moves_left_targets,
             &batch_tensors.moves_left_weights,
             batch_tensors.moves_left_pairs.as_ref(),
@@ -605,6 +607,19 @@ mod monitoring_tests {
     use super::*;
 
     fn check_moves_left_robust_ranking_objective(device: &Device) {
+        let negative = candle_core::Var::from_slice(&[-0.2f32, -0.03, -1.0], 3, device).unwrap();
+        let target = Tensor::new(&[0.11f32, 0.05, 123.0], device).unwrap();
+        let weights = Tensor::new(&[1.0f32, 1.0, 0.0], device).unwrap();
+        let loss = moves_left_objective(negative.as_tensor(), &target, &weights, None).unwrap();
+        let gradient = loss
+            .backward()
+            .unwrap()
+            .get(&negative)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(gradient[0] < 0.0 && gradient[1] < 0.0);
+        assert_eq!(gradient[2], 0.0, "未知距离仍必须屏蔽");
         let prediction = candle_core::Var::from_slice(&[0.2f32, 0.4, 1.0], 3, device).unwrap();
         let target = Tensor::new(&[0.4f32, 0.38, 123.0], device).unwrap();
         let weights = Tensor::new(&[1.0f32, 1.0, 0.0], device).unwrap();
@@ -786,7 +801,7 @@ mod monitoring_tests {
     }
 
     #[test]
-    fn moves_left_loss_trains_head_and_masks_unknown_distance() {
+    fn moves_left_loss_revives_negative_readout_and_masks_unknown_distance() {
         let position = crate::xiangqi::Position::startpos();
         let moves = position.legal_moves();
         let sample = AzTrainingSample {
@@ -811,18 +826,39 @@ mod monitoring_tests {
             meta: Default::default(),
         };
         let mut model = AzNnue::random(8, 81);
+        model.moves_left_bias[0] = -1.01;
+        model.rebuild_moves_left();
         let replica = GpuReplica::new_cpu(&model).unwrap();
         let batch = BatchTensors::from_packed(
             PackedBatch::from_indices(&[sample.clone()], &[0]),
             &Device::Cpu,
         )
         .unwrap();
+        let forward = replica.model.forward(&batch).unwrap();
+        assert_eq!(
+            forward
+                .moves_left
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            [0.0]
+        );
+        assert!(
+            forward
+                .moves_left_raw
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()[0]
+                < 0.0
+        );
         let initial = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
         assert_eq!(initial.stats.moves_left_samples, 1);
         let initial_loss = initial.stats.moves_left_loss;
         let (vars, decay) = replica.model.all_vars_with_decay();
         let mut optimizer = AzAdamW::new(vars, decay, 4e-4).unwrap();
-        for _ in 0..5 {
+        for _ in 0..80 {
             let loss = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
             optimizer
                 .step(&loss.loss_tensor.backward().unwrap())
@@ -834,6 +870,18 @@ mod monitoring_tests {
             .stats
             .moves_left_loss;
         assert!(final_loss < initial_loss, "{final_loss} >= {initial_loss}");
+        assert!(
+            replica
+                .model
+                .forward(&batch)
+                .unwrap()
+                .moves_left
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()[0]
+                > 0.0
+        );
         replica.model.copy_to_model(&mut model).unwrap();
         assert!(model.moves_left_active);
         assert_ne!(model.shared_hidden, AzNnue::random(8, 81).shared_hidden);

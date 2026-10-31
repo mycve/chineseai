@@ -1508,6 +1508,7 @@ impl<'a> AzTree<'a> {
         children
             .iter()
             .enumerate()
+            .filter(|(_, child)| self.follows_proven_distance(node_index, child))
             .max_by(|(_, left), (_, right)| {
                 self.child_priority(left)
                     .cmp(&self.child_priority(right))
@@ -1519,6 +1520,25 @@ impl<'a> AzTree<'a> {
                     .then_with(|| left.prior.total_cmp(&right.prior))
             })
             .map(|(index, _)| index)
+    }
+
+    /// 已证明胜负时，最终走法与证明距离采用同一条见证路线：快赢、慢输。
+    /// 未证明或只有胜负证明时，保留原来的访问量选择，不使用 MLH 猜测距离。
+    fn follows_proven_distance(&self, node_index: usize, child: &AzChild) -> bool {
+        let node = &self.nodes[node_index];
+        if !matches!(node.solved, Some(1 | -1)) {
+            return true;
+        }
+        let Some(distance) = node.proven_moves_left else {
+            return true;
+        };
+        if self.child_solved(child) != node.solved {
+            return false;
+        }
+        child
+            .child_node()
+            .and_then(|index| self.nodes[index].proven_moves_left)
+            .is_some_and(|child_distance| child_distance + 1 == distance)
     }
 
     fn compute_cpuct(&self, visits: u32, is_root: bool) -> f32 {
@@ -1581,22 +1601,25 @@ impl<'a> AzTree<'a> {
             .map(|child| self.child_priority(child))
             .max()
             .unwrap_or(0);
-        let eligible = |child: &&AzChild| self.child_priority(child) == priority;
+        let eligible = |child: &AzChild| {
+            self.child_priority(child) == priority
+                && self.follows_proven_distance(node_index, child)
+        };
         let total_visits = children
             .iter()
-            .filter(eligible)
+            .filter(|child| eligible(child))
             .map(|child| child.visits as f32)
             .sum::<f32>()
             .max(1.0);
         if children
             .iter()
-            .filter(eligible)
+            .filter(|child| eligible(child))
             .any(|child| child.visits > 0)
         {
             return children
                 .iter()
                 .map(|child| {
-                    if self.child_priority(child) == priority {
+                    if eligible(child) {
                         child.visits as f32 / total_visits
                     } else {
                         0.0
@@ -1607,14 +1630,14 @@ impl<'a> AzTree<'a> {
 
         let total_prior = children
             .iter()
-            .filter(eligible)
+            .filter(|child| eligible(child))
             .map(|child| child.prior)
             .sum::<f32>()
             .max(1e-12);
         children
             .iter()
             .map(|child| {
-                if self.child_priority(child) == priority {
+                if eligible(child) {
                     child.prior / total_prior
                 } else {
                     0.0
@@ -1766,7 +1789,8 @@ impl<'a> AzTree<'a> {
     }
 
     fn update_solved(&mut self, node_index: usize) {
-        if self.nodes[node_index].solved.is_some() {
+        if let Some(value) = self.nodes[node_index].solved {
+            self.set_proven(node_index, value);
             return;
         }
         let children = self.node_children(node_index);
@@ -1791,10 +1815,11 @@ impl<'a> AzTree<'a> {
     }
 
     fn set_proven(&mut self, node_index: usize, value: i8) {
-        if self.nodes[node_index].solved.is_some() {
+        let previous = self.nodes[node_index].solved;
+        if previous.is_some_and(|solved| solved != value) {
             return;
         }
-        let distances: Option<Vec<usize>> = self
+        let distances = self
             .node_children(node_index)
             .iter()
             .filter(|child| self.child_solved(child) == Some(value))
@@ -1804,18 +1829,25 @@ impl<'a> AzTree<'a> {
                     .and_then(|index| self.nodes[index].proven_moves_left)
                     .map(|distance| distance + 1)
             })
-            .collect();
-        let distance = distances.and_then(|distances| {
-            if value == -1 {
-                distances.into_iter().max()
-            } else {
-                distances.into_iter().min()
-            }
-        });
+            .collect::<Vec<_>>();
+        let distance = if value == -1 {
+            // 必败距离需要覆盖全部应对；必胜只需要一条已知获胜见证。
+            distances
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .and_then(|d| d.into_iter().max())
+        } else {
+            distances.into_iter().flatten().min()
+        }
+        .or(self.nodes[node_index].proven_moves_left);
         let node = &mut self.nodes[node_index];
         node.proven_moves_left = distance;
         if let Some(distance) = distance {
             node.moves_left = distance as f32;
+        }
+        // 已有胜负证明后，独立连杀证明仍可能补充更短的获胜路线。
+        if previous.is_some() {
+            return;
         }
         node.solved = Some(value);
         node.bounds = (value, value);
@@ -2688,6 +2720,62 @@ mod tests {
         );
         tree.set_proven(tree.root, 1);
         assert_eq!(tree.nodes[tree.root].proven_moves_left, None);
+    }
+
+    #[test]
+    fn proven_distance_controls_final_move_and_training_policy_despite_old_visits() {
+        let model = AzNnue::random(8, 91);
+        let position = Position::startpos();
+        for outcome in [1, -1] {
+            let mut tree = AzTree::new(
+                position.clone(),
+                position.initial_rule_history(),
+                None,
+                &model,
+                AzSearchLimits::default(),
+            );
+            let root = tree.root;
+            tree.expand(root);
+            for index in 0..tree.node_children(root).len() {
+                tree.simulate_child(root, index, 1);
+            }
+            let expected = tree.node_children(root)[1].mv;
+            for index in 0..tree.node_children(root).len() {
+                let child_node = tree.node_children(root)[index].child_node().unwrap();
+                let distance = match (outcome, index) {
+                    (1, 1) => 3,
+                    (1, _) => 9,
+                    (-1, 1) => 9,
+                    (-1, _) => 3,
+                    _ => unreachable!(),
+                };
+                let node = &mut tree.nodes[child_node];
+                node.solved = Some(-outcome);
+                node.bounds = (-outcome, -outcome);
+                // 另一路只知道胜负、没有距离，也不能挡住已知的获胜见证。
+                node.proven_moves_left = (outcome != 1 || index != 2).then_some(distance - 1);
+                node.moves_left = (distance - 1) as f32;
+                tree.node_children_mut(root)[index].visits = if index == 0 { 1000 } else { 1 };
+            }
+            tree.update_solved(root);
+            assert_eq!(tree.best_root_child(root), Some(1));
+            let policy = tree.root_policy(root);
+            assert_eq!(policy[0], 0.0);
+            assert_eq!(policy[1], 1.0);
+            let result = tree.search_result(0);
+            assert_eq!(result.best_move, Some(expected));
+            assert_eq!(
+                result.proven_moves_left,
+                Some(if outcome == 1 { 3 } else { 9 })
+            );
+            let child_node = tree.node_children(root)[2].child_node().unwrap();
+            let improved = if outcome == 1 { 1 } else { 15 };
+            tree.nodes[child_node].proven_moves_left = Some(improved - 1);
+            tree.update_solved(root);
+            assert_eq!(tree.nodes[root].proven_moves_left, Some(improved));
+            assert_eq!(tree.best_root_child(root), Some(2));
+            assert_eq!(tree.root_policy(root)[2], 1.0);
+        }
     }
 
     #[test]

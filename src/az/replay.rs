@@ -324,21 +324,28 @@ pub struct AzExperiencePool {
     sample_count: usize,
 }
 
-/// Px0 train.py SKIP=32 与 shufflebuffer.py insert_or_replace。
-/// 降采样发生在每次读取对局时；不永久删除经验池里的其余局面。
+/// SKIP=32 在配对单元上抽样，缓冲也保留单元；每个原样本的入选概率仍为1/32。
+/// 缓冲容量按双样本单元近似计数，总样本数不超过配置容量向上取偶数。
+struct ReplaySampleUnit {
+    first: AzTrainingSample,
+    second: Option<AzTrainingSample>,
+}
+
 pub struct Px0ReplaySampler {
     capacity: usize,
-    buffer: Vec<AzTrainingSample>,
-    pending: VecDeque<AzTrainingSample>,
+    buffer: Vec<ReplaySampleUnit>,
+    pending: VecDeque<ReplaySampleUnit>,
+    output: VecDeque<AzTrainingSample>,
     partition: Option<(u64, bool)>,
 }
 
 impl Px0ReplaySampler {
     pub fn new(shuffle_size: usize) -> Self {
         Self {
-            capacity: shuffle_size.max(1),
+            capacity: shuffle_size.max(1).div_ceil(2),
             buffer: Vec::new(),
             pending: VecDeque::new(),
+            output: VecDeque::new(),
             partition: None,
         }
     }
@@ -374,6 +381,12 @@ impl Px0ReplaySampler {
         let mut batch = AzReplaySampleBatch::default();
         batch.samples.reserve(count);
         while batch.samples.len() < count {
+            if let Some(item) = self.output.pop_front() {
+                batch.actual_recent_samples += usize::from(recent_ids.contains(&item.meta.game_id));
+                batch.source_samples[item.meta.start_source.index()] += 1;
+                batch.samples.push(item);
+                continue;
+            }
             if self.pending.is_empty() {
                 let mut order: Vec<_> = pool
                     .chunks
@@ -386,9 +399,18 @@ impl Px0ReplaySampler {
                     order.swap(i, j);
                 }
                 for index in order {
-                    for entry in &pool.chunks[index].entries {
+                    let samples = pool.chunks[index]
+                        .entries
+                        .iter()
+                        .map(|entry| &entry.sample)
+                        .collect::<Vec<_>>();
+                    for [first, second] in super::mlh::sampling_units(&samples, rng.next_u64()) {
                         if rng.next_u64() % 32 == 0 {
-                            self.pending.push_back(entry.sample.clone());
+                            self.pending.push_back(ReplaySampleUnit {
+                                first: samples[first].clone(),
+                                second: (second != super::mlh::NO_PARTNER)
+                                    .then(|| samples[second].clone()),
+                            });
                         }
                     }
                 }
@@ -404,9 +426,8 @@ impl Px0ReplaySampler {
                 self.buffer.push(item);
                 continue;
             }
-            batch.actual_recent_samples += usize::from(recent_ids.contains(&item.meta.game_id));
-            batch.source_samples[item.meta.start_source.index()] += 1;
-            batch.samples.push(item);
+            self.output.push_back(item.first);
+            self.output.extend(item.second);
         }
         batch.full_window_samples = count;
         batch
@@ -887,7 +908,14 @@ mod tests {
             early > 4000 && early < 4900,
             "unexpected phase bias: {early}/5000"
         );
-        assert_eq!(sampler.buffer.len(), 128);
+        assert_eq!(
+            sampler
+                .buffer
+                .iter()
+                .map(|unit| 1 + usize::from(unit.second.is_some()))
+                .sum::<usize>(),
+            128
+        );
         assert_eq!(pool.sample_count(), 1000);
         assert_eq!(first.recent_samples, 0);
         assert_eq!(first.full_window_samples, 2500);
@@ -933,6 +961,35 @@ mod tests {
         assert_eq!(decoded.moves_left_weight, 1.0);
         assert_eq!(decoded.repetition_flags, original.repetition_flags);
         assert_eq!(decoded.history_features, original.history_features);
+    }
+
+    #[test]
+    fn skip_and_shuffle_keep_temporal_pairs_together_across_odd_requests() {
+        let mut pool = AzExperiencePool::new(4096);
+        for game in 1..=2048 {
+            let mut slow = sample(AzStartSource::OpeningBook, 1, game);
+            slow.moves_left = 30.0;
+            slow.moves_left_weight = 1.0;
+            slow.value_weight = 0.0;
+            slow.policy_weight = 0.0;
+            let mut fast = slow.clone();
+            fast.meta.ply = 2;
+            fast.moves_left = 28.0;
+            fast.features = vec![1];
+            slow.features = vec![0];
+            pool.add_games(vec![vec![slow, fast]]);
+        }
+        let mut sampler = Px0ReplaySampler::new(128);
+        let mut rng = SplitMix64::new(73);
+        let mut rows = sampler.sample(&pool, 4095, 0, &mut rng).samples;
+        rows.extend(sampler.sample(&pool, 1, 0, &mut rng).samples);
+        assert_eq!(rows.len(), 4096);
+        for pair in rows.chunks_exact(2) {
+            assert_eq!(pair[0].meta.game_id, pair[1].meta.game_id);
+            assert_eq!(pair[0].meta.ply, 0);
+            assert_eq!(pair[1].meta.ply, 2);
+            assert_eq!(pair[0].moves_left - pair[1].moves_left, 2.0);
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod fused_sparse_policy;
 mod history;
 mod inference;
 mod mate;
+mod mlh;
 pub mod nnue;
 mod node_threat;
 mod play;
