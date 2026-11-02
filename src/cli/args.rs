@@ -196,10 +196,10 @@ pub(crate) struct AzSearchArgs {
     #[arg(long, default_value_t = 1.0)]
     pub(crate) value_scale: f32,
     /// 指定杀法，例如 double-cannon、iron-bolt、horse-cannon、elbow-horse；none 关闭。
-    #[arg(long, default_value = "none")]
+    #[arg(long, default_value = "iron-bolt")]
     pub(crate) mating_target: chineseai::az::MatingTarget,
     /// 杀法偏好强度，范围 0..1；0 关闭偏好。
-    #[arg(long, default_value = "1", value_parser = parse_mating_strength)]
+    #[arg(long, default_value = "0.8", value_parser = parse_mating_strength)]
     pub(crate) mating_strength: f32,
     /// 执行目标的一方，默认应用 --move 后局面的行棋方；整次搜索固定。
     #[arg(long, value_enum)]

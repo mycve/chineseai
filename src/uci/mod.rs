@@ -23,6 +23,8 @@ const DEFAULT_FPU_VALUE: f32 = 0.23;
 const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 1.0;
 const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.4;
 const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
+const DEFAULT_MATING_STRENGTH: f32 = 0.8;
+const DEFAULT_MATING_TARGET: MatingTarget = MatingTarget::IronBolt;
 /// 对局/分析时默认开启的连杀证明深度：15 半回合 = 最多 mate in 8。
 ///
 /// 与自博弈配置默认的 9 不同，因为 UCI 这边是"人看着的强度/分析"，而自博弈还要考虑
@@ -34,6 +36,12 @@ const DEFAULT_MATE_SEARCH_PLIES: usize = 15;
 ///
 /// 20 万覆盖实测的 mate-in-8（58,178 节点），同时是"最坏情况花多少时间"的硬兜底。
 const DEFAULT_MATE_SEARCH_NODES: usize = 200_000;
+
+#[derive(Clone, Copy)]
+enum MatingSideMode {
+    Auto(Option<Color>),
+    Fixed(Color),
+}
 
 #[derive(Clone)]
 struct UciState {
@@ -70,6 +78,7 @@ struct UciState {
     mate_search_nodes: usize,
     moves_left_params: AzMovesLeftParams,
     mating_goal: AzMatingGoal,
+    mating_side_mode: MatingSideMode,
 }
 
 impl Default for UciState {
@@ -102,7 +111,28 @@ impl Default for UciState {
             mate_search_plies: DEFAULT_MATE_SEARCH_PLIES,
             mate_search_nodes: DEFAULT_MATE_SEARCH_NODES,
             moves_left_params: AzMovesLeftParams::default(),
-            mating_goal: AzMatingGoal::NONE,
+            mating_goal: AzMatingGoal {
+                target: DEFAULT_MATING_TARGET,
+                strength: DEFAULT_MATING_STRENGTH,
+                ..AzMatingGoal::NONE
+            },
+            mating_side_mode: MatingSideMode::Auto(None),
+        }
+    }
+}
+
+impl UciState {
+    fn bind_mating_owner(&mut self) {
+        let current = self.position.side_to_move();
+        self.mating_goal.side = match &mut self.mating_side_mode {
+            MatingSideMode::Auto(bound) => *bound.get_or_insert(current),
+            MatingSideMode::Fixed(side) => *side,
+        };
+    }
+
+    fn reset_mating_owner(&mut self) {
+        if let MatingSideMode::Auto(bound) = &mut self.mating_side_mode {
+            *bound = None;
         }
     }
 }
@@ -146,6 +176,7 @@ pub fn run_uci() {
             }
             Some("ucinewgame") => {
                 stop_active_search(&mut active_search);
+                state.reset_mating_owner();
                 state.position = Position::startpos();
                 apply_rule_options(&mut state);
                 state.rule_history = state.position.initial_rule_history();
@@ -181,6 +212,18 @@ fn stop_active_search(active_search: &mut Option<ActiveSearch>) {
     }
 }
 
+fn mating_target_option() -> String {
+    let ordinary = MatingTarget::None.name();
+    let default = DEFAULT_MATING_TARGET.name();
+    format!(
+        "option name MatingTarget type combo default {default} var {ordinary}{}",
+        MatingTarget::ALL
+            .iter()
+            .map(|t| format!(" var {}", t.name()))
+            .collect::<String>()
+    )
+}
+
 fn print_uci_id() {
     println!("id name ChineseAI AZ-NNUE");
     println!("id author ChineseAI");
@@ -200,15 +243,9 @@ fn print_uci_id() {
     println!("option name OpeningTempPlies type spin default 0 min 0 max 1000");
     println!("option name OpeningTemperature type string default {DEFAULT_OPENING_TEMPERATURE}");
     println!("option name DrawScore type string default 0.0");
-    println!(
-        "option name MatingTarget type combo default none var none{}",
-        MatingTarget::ALL
-            .iter()
-            .map(|t| format!(" var {}", t.key().replace('_', "-")))
-            .collect::<String>()
-    );
-    println!("option name MatingStrength type string default 0.0");
-    println!("option name MatingSide type combo default red var red var black");
+    println!("{}", mating_target_option());
+    println!("option name MatingStrength type string default {DEFAULT_MATING_STRENGTH}");
+    println!("option name MatingSide type combo default auto var auto var red var black");
     println!("option name Sixty Move Rule type check default true");
     println!("option name RepetitionDraw type check default true");
     println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
@@ -302,9 +339,16 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             }
         }
         "matingside" => match value.to_ascii_lowercase().as_str() {
-            "red" => state.mating_goal.side = Color::Red,
-            "black" => state.mating_goal.side = Color::Black,
-            _ => println!("info string MatingSide must be red or black"),
+            "auto" => state.mating_side_mode = MatingSideMode::Auto(None),
+            "red" => {
+                state.mating_side_mode = MatingSideMode::Fixed(Color::Red);
+                state.mating_goal.side = Color::Red;
+            }
+            "black" => {
+                state.mating_side_mode = MatingSideMode::Fixed(Color::Black);
+                state.mating_goal.side = Color::Black;
+            }
+            _ => println!("info string MatingSide must be auto, red or black"),
         },
         "movesleftenabled" => {
             if let Ok(enabled) = value.to_ascii_lowercase().parse::<bool>() {
@@ -622,6 +666,7 @@ fn time_budget_ms(params: &GoParams, side: Color) -> Option<u64> {
 }
 
 fn start_go(line: &str, state: &mut UciState) -> ActiveSearch {
+    state.bind_mating_owner();
     ensure_model(state);
     let params = parse_go(line);
     let snapshot = state.clone();
@@ -1268,6 +1313,69 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.game_ply, None);
+    }
+
+    #[test]
+    fn automatic_mating_owner_is_bound_once_per_game_with_manual_override() {
+        let mut state = UciState::default();
+        handle_position("position startpos moves h2e2", &mut state);
+        state.bind_mating_owner();
+        assert_eq!(state.mating_goal.side, Color::Black);
+        handle_position("position startpos", &mut state);
+        state.bind_mating_owner();
+        assert_eq!(
+            state.mating_goal.side,
+            Color::Black,
+            "换根不能改变本盘执行方"
+        );
+        state.reset_mating_owner();
+        state.bind_mating_owner();
+        assert_eq!(state.mating_goal.side, Color::Red);
+        handle_setoption("setoption name MatingSide value black", &mut state);
+        state.reset_mating_owner();
+        state.bind_mating_owner();
+        assert_eq!(state.mating_goal.side, Color::Black);
+        handle_setoption("setoption name MatingSide value auto", &mut state);
+        state.bind_mating_owner();
+        assert_eq!(state.mating_goal.side, Color::Red);
+    }
+
+    #[test]
+    fn advertised_chinese_mating_combo_roundtrips_through_setoption() {
+        let definition = mating_target_option();
+        assert!(definition.starts_with("option name MatingTarget type combo default 铁门栓 var "));
+        let values = definition.split(" var ").skip(1).collect::<Vec<_>>();
+        assert_eq!(values.len(), 15);
+        let mut state = UciState::default();
+        assert_eq!(state.mating_goal.strength, 0.8);
+        assert!(state.mating_goal.enabled());
+        assert_eq!(state.mating_goal.target, MatingTarget::IronBolt);
+        state.mating_goal.target = MatingTarget::CrossRooks;
+        for value in values {
+            handle_setoption(
+                &format!("setoption name MatingTarget value {value}"),
+                &mut state,
+            );
+            assert_eq!(state.mating_goal.target.name(), value);
+            assert_eq!(
+                state.mating_goal.enabled(),
+                state.mating_goal.target != MatingTarget::None
+            );
+        }
+        for target in MatingTarget::ALL {
+            handle_setoption(
+                &format!(
+                    "setoption name MatingTarget value {}",
+                    target.key().replace('_', "-")
+                ),
+                &mut state,
+            );
+            assert_eq!(state.mating_goal.target, target);
+        }
+        handle_setoption("setoption name MatingTarget value 侧面虎", &mut state);
+        assert_eq!(state.mating_goal.target, MatingTarget::HighAnglerHorse);
+        handle_setoption("setoption name MatingTarget value none", &mut state);
+        assert_eq!(state.mating_goal.target, MatingTarget::None);
     }
 
     #[test]

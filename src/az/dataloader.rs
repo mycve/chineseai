@@ -556,6 +556,7 @@ impl PackedBatch {
         self.context[row * POSITION_CONTEXT_SIZE..(row + 1) * POSITION_CONTEXT_SIZE]
             .copy_from_slice(&context);
         let mut policy_offset = 0usize;
+        let mut goal_prior = goal.policy_prior(position);
         for (sample_offset, (&move_index, &target)) in sample
             .move_indices
             .iter()
@@ -565,10 +566,10 @@ impl PackedBatch {
             if move_index < DENSE_MOVE_SPACE {
                 self.policy_targets[policy_base + policy_offset] = target.max(0.0);
                 self.policy_mask[policy_base + policy_offset] = 0.0;
-                if goal.enabled() && goal.side == position.side_to_move() {
+                if let Some(prior) = &mut goal_prior {
                     if let Some((from, to)) = dense_move_squares(move_index) {
                         self.goal_policy_bias[policy_base + policy_offset] =
-                            goal.policy_bias(position, crate::xiangqi::Move::new(from, to));
+                            prior.bias(crate::xiangqi::Move::new(from, to));
                     }
                 }
                 self.policy_repetition[policy_base + policy_offset] = f32::from(

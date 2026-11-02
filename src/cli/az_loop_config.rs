@@ -162,8 +162,12 @@ impl Default for AzLoopFileConfig {
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
             mating_loss_weight: 0.1,
-            mating_goal: AzMatingGoal::default(),
-            mating_goal_mix: false,
+            mating_goal: AzMatingGoal {
+                target: chineseai::az::MatingTarget::IronBolt,
+                side: chineseai::xiangqi::Color::Red,
+                strength: 0.8,
+            },
+            mating_goal_mix: true,
             goal_loss_weight: 0.1,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
@@ -446,8 +450,13 @@ mod tests {
     #[test]
     fn mating_goal_config_roundtrips_mixing_and_keeps_none_strength() {
         let defaults = AzLoopFileConfig::default();
-        assert!(!defaults.mating_goal.enabled());
-        assert!(!defaults.mating_goal_mix);
+        assert!(defaults.mating_goal.enabled());
+        assert!(defaults.mating_goal_mix);
+        assert_eq!(
+            defaults.mating_goal.target,
+            chineseai::az::MatingTarget::IronBolt
+        );
+        assert_eq!(defaults.mating_goal.strength, 0.8);
         for target in std::iter::once(chineseai::az::MatingTarget::None)
             .chain(chineseai::az::MatingTarget::ALL)
         {

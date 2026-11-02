@@ -375,18 +375,37 @@ fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSe
     }
 }
 
-fn choose_selfplay_goal(config: &AzLoopConfig, rng: &mut SplitMix64) -> AzMatingGoal {
+fn choose_selfplay_goal(
+    config: &AzLoopConfig,
+    position: &Position,
+    rng: &mut SplitMix64,
+) -> AzMatingGoal {
     if !config.mating_goal_mix {
         return config.mating_goal;
     }
-    AzMatingGoal {
-        target: if rng.next_u64() % 3 == 0 {
-            MatingTarget::None
-        } else {
-            MatingTarget::ALL[rng.next_u64() as usize % MatingTarget::ALL.len()]
-        },
+    let mut goal = AzMatingGoal {
+        target: MatingTarget::None,
         ..config.mating_goal
+    };
+    if rng.next_u64() % 10 == 0 {
+        return goal;
     }
+    // 只排除必要资源已丢失的目标，不按网络概率筛选，以免永远学不到困难目标。
+    let mut available = [MatingTarget::None; crate::az::MATING_TARGET_COUNT];
+    let mut count = 0;
+    for target in MatingTarget::ALL {
+        if (AzMatingGoal { target, ..goal })
+            .effective(position)
+            .enabled()
+        {
+            available[count] = target;
+            count += 1;
+        }
+    }
+    if count > 0 {
+        goal.target = available[rng.next_u64() as usize % count];
+    }
+    goal
 }
 
 fn configure_selfplay_rules(mut position: Position, config: &AzLoopConfig) -> Position {
@@ -477,8 +496,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut search_workspace = AzSearchWorkspace::new(model);
 
     for game_index in 0..config.games {
-        let mating_goal = choose_selfplay_goal(config, &mut rng);
         let start = choose_selfplay_start(config, &mut rng, game_index);
+        let mating_goal = choose_selfplay_goal(config, &start.position, &mut rng);
         let mut position = start.position;
         let mut rule_history = start.rule_history;
         let start_phase_ply = start.phase_ply;
@@ -1616,19 +1635,62 @@ mod tests {
         let mut rng = SplitMix64::new(17);
         let mut counts = [0; crate::az::MATING_TARGET_COUNT + 1];
         for _ in 0..3000 {
-            let goal = choose_selfplay_goal(&config, &mut rng);
+            let goal = choose_selfplay_goal(&config, &Position::startpos(), &mut rng);
             assert_eq!(goal.side, Color::Black);
             assert_eq!(goal.strength, 0.6);
             counts[goal.target.index().map_or(0, |index| index + 1)] += 1;
         }
-        assert!((850..1150).contains(&counts[0]));
-        assert!(counts[1..].iter().all(|&count| (50..250).contains(&count)));
+        assert!((230..370).contains(&counts[0]));
+        assert!(counts[1..].iter().all(|&count| (100..300).contains(&count)));
         config.mating_goal_mix = false;
         config.mating_goal.target = MatingTarget::HorseCannon;
         for _ in 0..100 {
-            let goal = choose_selfplay_goal(&config, &mut rng);
+            let goal = choose_selfplay_goal(&config, &Position::startpos(), &mut rng);
             assert_eq!(goal, config.mating_goal);
         }
+    }
+
+    #[test]
+    fn mixed_goals_only_sample_necessary_resources_available_at_the_start() {
+        let mut config = selfplay_test_config(1);
+        config.mating_goal = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 0.8,
+        };
+        config.mating_goal_mix = true;
+        let position = Position::from_fen("4k4/9/9/2N6/9/9/9/9/3R5/5K3 w").unwrap();
+        let mut rng = SplitMix64::new(1903);
+        let mut seen = [false; crate::az::MATING_TARGET_COUNT];
+        for _ in 0..1000 {
+            let goal = choose_selfplay_goal(&config, &position, &mut rng);
+            assert_eq!(goal.side, config.mating_goal.side);
+            if goal.enabled() {
+                assert_eq!(goal.effective(&position), goal);
+                seen[goal.target.index().unwrap()] = true;
+                assert!(!matches!(
+                    goal.target,
+                    MatingTarget::DoubleCannon
+                        | MatingTarget::IronBolt
+                        | MatingTarget::HorseCannon
+                        | MatingTarget::SmotheredCannon
+                        | MatingTarget::HeavenEarthCannon
+                        | MatingTarget::DoubleHorse
+                        | MatingTarget::CrossRooks
+                        | MatingTarget::TwoGhosts
+                ));
+            }
+        }
+        assert!(seen.iter().filter(|&&v| v).count() >= 4);
+        let bare = Position::from_fen("4k4/9/9/9/9/9/9/9/9/3K5 w").unwrap();
+        for _ in 0..100 {
+            assert!(!choose_selfplay_goal(&config, &bare, &mut rng).enabled());
+        }
+        config.mating_goal_mix = false;
+        assert_eq!(
+            choose_selfplay_goal(&config, &bare, &mut rng),
+            config.mating_goal
+        );
     }
 
     #[test]

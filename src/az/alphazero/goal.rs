@@ -176,6 +176,68 @@ mod tests {
     use crate::az::MatingTarget;
     use crate::xiangqi::MateKind;
 
+    #[test]
+    #[ignore = "手动性能基准：固定局面、模型和预算，不断言耗时"]
+    fn goal_hot_path_benchmark() {
+        use std::hint::black_box;
+        let mut model = AzNnue::random(64, 1902);
+        for (i, weight) in model.goal_hidden.iter_mut().enumerate() {
+            *weight = (i % 17) as f32 * 0.01 - 0.08;
+        }
+        let position = Position::startpos();
+        let history = position.initial_rule_history();
+        let moves = position.legal_moves();
+        let goals = MatingTarget::ALL.map(|target| goal(target, Color::Red, 0.8));
+        for &instruction in &goals {
+            black_box(model.evaluate_with_goal(&position, &history, &moves, instruction));
+        }
+        let mut checksum = 0.0f64;
+        for (label, instructions) in [
+            ("ordinary_eval", vec![AzMatingGoal::NONE; 14]),
+            ("goal_eval", goals.to_vec()),
+        ] {
+            let started = Instant::now();
+            for _ in 0..100 {
+                for &instruction in &instructions {
+                    let (probability, wdl, logits) =
+                        model.evaluate_with_goal(&position, &history, &moves, instruction);
+                    checksum += f64::from(probability + wdl[0] + logits.iter().sum::<f32>());
+                    black_box(logits);
+                }
+            }
+            eprintln!(
+                "{label}: evaluations=1400 ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let started = Instant::now();
+        let mut simulations = 0;
+        for _ in 0..4 {
+            for &instruction in &goals {
+                let result = alphazero_search_with_rules(
+                    &position,
+                    Some(history.clone()),
+                    None,
+                    &model,
+                    AzSearchLimits {
+                        simulations: 128,
+                        max_depth: 4,
+                        mating_goal: instruction,
+                        ..Default::default()
+                    },
+                );
+                simulations += result.simulations;
+                let mv = result.best_move.unwrap();
+                checksum += f64::from(mv.from) + f64::from(mv.to);
+                black_box(result);
+            }
+        }
+        eprintln!(
+            "goal_search: searches=56 simulations={simulations} ms={:.3} checksum={checksum:.9}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
     fn goal(target: MatingTarget, side: Color, strength: f32) -> AzMatingGoal {
         AzMatingGoal {
             target,

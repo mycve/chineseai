@@ -1626,9 +1626,6 @@ impl<'a> AzTree<'a> {
     /// 已证明胜负时，最终走法与证明距离采用同一条见证路线：快赢、慢输。
     /// 未证明或只有胜负证明时，保留原来的访问量选择，不使用 MLH 猜测距离。
     fn follows_proven_distance(&self, node_index: usize, child: &AzChild) -> bool {
-        if self.goal_turn(node_index) {
-            return true;
-        }
         let node = &self.nodes[node_index];
         if !matches!(node.solved, Some(1 | -1)) {
             return true;
@@ -1700,23 +1697,23 @@ impl<'a> AzTree<'a> {
 
     fn root_policy(&self, node_index: usize) -> Vec<f32> {
         let children = self.node_children(node_index);
+        let goal_turn = self.goal_turn(node_index);
         let priority = children
             .iter()
             .map(|child| self.child_priority(child))
             .max()
             .unwrap_or(0);
         // 普通必胜路线间按目标成功估计选取，策略标签与实际选着保持一致。
-        let best_goal =
-            (self.goal_turn(node_index) && priority == proof_priority(Some(1))).then(|| {
-                children
-                    .iter()
-                    .filter(|child| self.child_priority(child) == priority)
-                    .map(|child| self.child_goal_value(child))
-                    .fold(0.0f32, f32::max)
-            });
+        let best_goal = (goal_turn && priority == proof_priority(Some(1))).then(|| {
+            children
+                .iter()
+                .filter(|child| self.child_priority(child) == priority)
+                .map(|child| self.child_goal_value(child))
+                .fold(0.0f32, f32::max)
+        });
         let eligible = |child: &AzChild| {
             self.child_priority(child) == priority
-                && self.follows_proven_distance(node_index, child)
+                && (goal_turn || self.follows_proven_distance(node_index, child))
                 && best_goal.is_none_or(|best| self.child_goal_value(child) >= best)
         };
         let total_visits = children

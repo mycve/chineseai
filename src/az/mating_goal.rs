@@ -54,7 +54,7 @@ impl FromStr for MatingTarget {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "none" | "普通" => return Ok(Self::None),
+            "none" | "普通" | "普通争胜" => return Ok(Self::None),
             "铁门闩" => return Ok(Self::IronBolt),
             "侧面虎" => return Ok(Self::HighAnglerHorse),
             _ => {}
@@ -76,6 +76,22 @@ pub struct AzMatingGoal {
     /// 执行指令的一方，整盘固定；不能随搜索根节点换边。
     pub side: Color,
     pub strength: f32,
+}
+
+/// 同一局面的所有候选共享基准分和工作棋盘；每次试走后完整撤销。
+pub(crate) struct MatingPolicyPrior {
+    goal: AzMatingGoal,
+    position: Position,
+    before: f32,
+}
+
+impl MatingPolicyPrior {
+    pub(crate) fn bias(&mut self, mv: Move) -> f32 {
+        let undo = self.position.make_move(mv);
+        let after = self.goal.progress(&self.position);
+        self.position.unmake_move(mv, undo);
+        (4.0 * self.goal.strength * (after - self.before)).clamp(-0.5, 0.5)
+    }
 }
 
 impl Default for AzMatingGoal {
@@ -113,6 +129,7 @@ impl AzMatingGoal {
         let mut cannons = 0;
         let mut finishers = 0;
         let mut defenders = 0;
+        let mut defending_advisors = 0;
         let mut horses = 0;
         let mut rooks = 0;
         let mut attackers = 0;
@@ -127,6 +144,7 @@ impl AzMatingGoal {
                     usize::from(matches!(piece.kind, PieceKind::Rook | PieceKind::Soldier));
             } else {
                 defenders += usize::from(piece.kind != PieceKind::General);
+                defending_advisors += usize::from(piece.kind == PieceKind::Advisor);
             }
         }
         let possible = match self.target {
@@ -134,16 +152,15 @@ impl AzMatingGoal {
             MatingTarget::DoubleCannon => cannons >= 2,
             MatingTarget::IronBolt => cannons >= 1 && finishers >= 1 && defenders >= 1,
             MatingTarget::HorseCannon => cannons >= 1 && horses >= 1,
-            MatingTarget::HeavenEarthCannon => cannons >= 2,
-            MatingTarget::SmotheredCannon => cannons >= 1,
+            MatingTarget::HeavenEarthCannon => cannons >= 2 && defenders >= 1,
+            MatingTarget::SmotheredCannon => cannons >= 1 && defending_advisors >= 2,
             MatingTarget::TwoGhosts => finishers >= 2,
             MatingTarget::DoubleHorse => horses >= 2,
             MatingTarget::CrossRooks => rooks >= 2,
-            MatingTarget::ElbowHorse
-            | MatingTarget::PalaceCornerHorse
-            | MatingTarget::AnglerHorse
+            MatingTarget::ElbowHorse | MatingTarget::PalaceCornerHorse => horses >= 1,
+            MatingTarget::AnglerHorse
             | MatingTarget::OctagonalHorse
-            | MatingTarget::HighAnglerHorse => horses >= 1,
+            | MatingTarget::HighAnglerHorse => horses >= 1 && attackers >= 2,
             MatingTarget::WhiteFacedGeneral => attackers >= 1,
         };
         if possible { self } else { Self::NONE }
@@ -185,14 +202,20 @@ impl AzMatingGoal {
     /// 训练初期的小幅几何先验；不表示成功概率，不写入胜负证明或价值标签。
     /// 走子合法性由调用方负责。对手回合和资源不足时不改变先验。
     pub fn policy_bias(self, position: &Position, mv: Move) -> f32 {
+        self.policy_prior(position)
+            .map_or(0.0, |mut prior| prior.bias(mv))
+    }
+
+    pub(crate) fn policy_prior(self, position: &Position) -> Option<MatingPolicyPrior> {
         let goal = self.effective(position);
         if !goal.enabled() || position.side_to_move() != goal.side {
-            return 0.0;
+            return None;
         }
-        let before = goal.progress(position);
-        let mut next = position.clone();
-        next.make_move(mv);
-        (4.0 * goal.strength * (goal.progress(&next) - before)).clamp(-0.5, 0.5)
+        Some(MatingPolicyPrior {
+            goal,
+            position: position.clone(),
+            before: goal.progress(position),
+        })
     }
 
     fn progress(self, position: &Position) -> f32 {
@@ -411,6 +434,54 @@ mod tests {
             "侧面虎".parse::<MatingTarget>().unwrap(),
             MatingTarget::HighAnglerHorse
         );
+    }
+
+    #[test]
+    fn prepared_prior_matches_full_move_reference_and_restores_all_board_state() {
+        let mut positions = vec![Position::startpos()];
+        let mut middle = Position::startpos();
+        for text in ["h2e2", "h9g7", "b0c2", "b7b4", "a0b0", "b4e4"] {
+            let mv = middle.parse_uci_move(text).unwrap();
+            middle.make_move(mv);
+        }
+        positions.extend([
+            middle,
+            Position::from_fen("4ka3/4a4/9/9/9/6C2/9/9/9/5K3 w").unwrap(),
+            Position::from_fen("4k4/4R4/9/9/9/9/9/9/9/3K5 w").unwrap(),
+        ]);
+        for position in positions {
+            let moves = position.legal_moves();
+            for target in MatingTarget::ALL {
+                for strength in [0.0, 0.4, 1.0] {
+                    for side in [Color::Red, Color::Black] {
+                        let goal = AzMatingGoal {
+                            target,
+                            side,
+                            strength,
+                        };
+                        let effective = goal.effective(&position);
+                        let mut prepared = goal.policy_prior(&position);
+                        for &mv in moves.iter().chain(moves.iter().rev()) {
+                            let expected = if effective.enabled() && side == position.side_to_move()
+                            {
+                                let before = effective.progress(&position);
+                                let mut after = position.clone();
+                                after.make_move(mv);
+                                (4.0 * strength * (effective.progress(&after) - before))
+                                    .clamp(-0.5, 0.5)
+                            } else {
+                                0.0
+                            };
+                            let actual = prepared.as_mut().map_or(0.0, |prior| prior.bias(mv));
+                            assert_eq!(actual, expected, "{target:?} {side:?} {mv}");
+                            if let Some(prior) = &prepared {
+                                assert_eq!(prior.position, position);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -1180,18 +1180,13 @@ impl AzNnue {
         if !goal.enabled() {
             return 0.0;
         }
-        let features = goal.features(position);
+        // 指令编码只有一个非零项，直接读取对应行，避免每通道扫描全部 28 项。
+        let role = usize::from(goal.side != position.side_to_move());
+        let index = role * MATING_TARGET_COUNT + goal.target.index().unwrap();
+        let weights = &self.goal_hidden[index * self.hidden_size..(index + 1) * self.hidden_size];
         scratch.goal_hidden.resize(self.hidden_size, 0.0);
         for (channel, hidden) in scratch.goal_hidden.iter_mut().enumerate() {
-            *hidden = (scratch.hidden[channel]
-                + features
-                    .iter()
-                    .enumerate()
-                    .map(|(index, feature)| {
-                        feature * self.goal_hidden[index * self.hidden_size + channel]
-                    })
-                    .sum::<f32>())
-            .max(0.0);
+            *hidden = (scratch.hidden[channel] + goal.strength * weights[channel]).max(0.0);
         }
         let logit = self.goal_bias[0] + dot_product(&scratch.goal_hidden, &self.goal_output);
         if logit >= 0.0 {

@@ -25,6 +25,8 @@
 
 中文名称、连字符键、下划线键可用于 CLI/UCI；“铁门闩”“侧面虎”作为对应别名。TOML 使用下划线枚举名，例如 `high_angler_horse`。`none` 表示普通争胜。
 
+GUI 的 `MatingTarget` 为 UCI `combo` 下拉框：普通争胜及 14 种中文杀法名，一次选一种。默认铁门栓、强度 0.8，开箱启用；手动发送英文键仍可用。更新引擎后需让 GUI 重新读取选项列表；若 GUI 保存了旧的关闭设置，可恢复默认。
+
 标签可以重叠，例如双马饮泉与卧槽马、钓鱼马；不用互斥 softmax 强行分桶。“实际封逃”通过执行敌将的伪合法宫内走子后，检查是否仅该支持子阻止此着来认定；重复控制可能不计，属于明确的保守子集。铁门栓中炮另需验证真实牵制作用。未命中不代表没有其他杀法。
 
 困毙单独记录为 `Stalemate`，不算 14 类目标成功。长将、规则判负、缺将、步数截断、仅有搜索证明都不冒充真实将死。
@@ -34,16 +36,13 @@
 ```text
 uci
 setoption name EvalFile value multi-v55.safetensors
-setoption name MatingTarget value horse-cannon
-setoption name MatingStrength value 0.8
-setoption name MatingSide value red
 isready
 ucinewgame
 position startpos
 go nodes 800
 ```
 
-收到 `readyok` 后搜索。三个选项跨 `position`、回合及 `ucinewgame` 保留；黑方执行设置 `MatingSide=black`。强度为 `0..1`，默认 0，须调高才启用。CLI 示例：
+收到 `readyok` 后搜索，默认已经执行铁门栓目标。切换杀法只需 `setoption name MatingTarget value 马后炮`。`MatingSide` 默认 `auto`：首次 `go` 绑定本盘引擎执子方，之后换根不换执行方，`ucinewgame` 后重新绑定；也可显式指定 `red`/`black`。目标与强度跨 `position`、回合及 `ucinewgame` 保留。强度为 `0..1`，默认 0.8，设 0 或选普通争胜均关闭目标。CLI 的 `az-search` 同样默认铁门栓、0.8，可显式用 `--mating-target none` 做普通对照。CLI 示例：
 
 ```text
 chineseai az-search multi-v55.safetensors 800 1.0 --mating-target 高钓马 --mating-strength 0.8 --mating-side red startpos
@@ -58,11 +57,11 @@ chineseai mate-classify "3aka3/9/9/4C4/9/4C4/9/9/9/4K4 b"
 
 ## 自博弈采样
 
-顶层字段必须放在 `[mating_goal]` 之前：
+新生成的配置已默认启用目标混合与 0.8 强度；下面为显式写法。顶层字段必须放在 `[mating_goal]` 之前：
 
 ```toml
 format_version = 34
-selfplay_opening_book = ""
+selfplay_opening_book = "book.pgn.gz"
 mating_goal_mix = true
 train_value_weight = 1.0
 train_policy_weight = 1.0
@@ -70,15 +69,19 @@ mating_loss_weight = 0.1
 goal_loss_weight = 0.1
 
 [mating_goal]
-target = "none"
+target = "iron_bolt"
 side = "red"
 strength = 0.8
 ```
 
-- `mating_goal_mix=true`：约 1/3 对局普通争胜，其余 2/3 从确认的 14 种中均匀选目标；不另设目标列表参数。
+- `mating_goal_mix=true`：约 10% 对局普通争胜，其余 90% 在当前起局仍有必要子力的确认目标中均匀采样；不按网络预测成功率筛选，避免困难目标失去训练机会。若全部目标都已缺必要资源，则恢复普通争胜。
 - `mating_goal_mix=false`：固定使用 `[mating_goal].target`。
 - 执行方固定用 `[mating_goal].side`，不随机红黑、不增加随机选方开关。canonical 编码共享双方参数，固定执行方的整盘数据也含执行方及对手两种回合。
 - 每盘只指定一方执行目标，目标、执行方和强度盘内不变。对手正常争胜。空开局库从标准初始局面开始。
+
+GUI 自动绑定本盘执子方与自博弈固定执行方是入口层约定；都不随机选红黑，也不在搜索子节点中切换执行方。显式保存的配置值优先于新默认，不擅自覆盖用户选择的普通争胜或强度 0。
+
+开局库是既有的可选 FEN 起局来源，不是新增的残局模式。沿用已有开局库即可从所选局面开始执行目标；FEN 之前的着法不属于该盘目标训练样本。这里的混合采样检查只避免为缺炮、缺马等局面分配已明确不可达的目标；不改变开局库配置。手动固定指定目标不被重新随机分配，仍按原规则在不可达时正常下。
 
 自博弈把带指令的 MCTS 策略训练回条件策略，尚无终局标签时也可以学习策略。最终真实完成指定杀法则固定执行方目标标签为 1，其他已观察结果为 0；双方此前局面使用相同执行方视角。截断、未知或样本时刻已无必要子力时，目标价值监督权重为 0。不能把旧策略标签事后重标成另一条指令。
 
@@ -106,7 +109,7 @@ TensorBoard：`mating/goal/{名称}/{attempts,successes,unknown,success_rate}`�
 
 ## 验证与来源
 
-完整回归 380 项通过、3 项原有跳过，全部 14 类条件策略的 CPU/CUDA 一致性检查通过。真实 v54 文件已完成命令行迁移，高钓马命令行搜索、UCI 14 类选项及黑方执行配置均已检查。以上验证管线和局部行为，不表示开局完整对局达成率已经通过实验。
+完整回归 384 项通过、4 项跳过（含手动性能基准），全部 14 类条件策略的 CPU/CUDA 一致性检查通过。真实 v54 文件已完成命令行迁移，高钓马命令行搜索、UCI 中文下拉选项、默认启用及黑方自动绑定均已检查。以上验证管线和局部行为，不表示开局完整对局达成率已经通过实验。
 
 ```text
 cargo test --profile fast --offline --all-targets --quiet
@@ -115,6 +118,12 @@ cargo test --profile fast --offline --features slow-tests --lib goal_conditionin
 
 检查真实命中、无杀反例、无关子反例、左右镜像、红黑翻转；CPU/CUDA 条件编码及策略一致性；回放指令读写；目标采样；模型迁移保留参数。开局测试核对指令对布局先验、MCTS 访问分布和训练标签的影响，并检查不使用终局价值标签时策略监督仍能训练目标编码。局部用例不替代服务器完整对局的命中率实验。
 
+性能检查（64 宽随机模型、标准起局、14 种目标、固定 128 次模拟、深度 4）：三次运行中位数，1400 次目标推理从 22.263 ms 降到 12.433 ms；56 次搜索共 7168 次模拟，从 70.324 ms 降到 50.990 ms，结果校验和相同。主要改动为共享布局先验的基准分和可撤销工作棋盘、目标条件输入直接取唯一非零编码行、移除根策略候选中重复的目标资源扫描。此为本地小模型基准，服务器完整自博弈收益须另测。
+
+```text
+cargo test --profile fast --offline --lib goal_hot_path_benchmark -- --ignored --nocapture
+```
+
 ## 当前设计取舍与待验证项
 
 - 红黑执行方随机不是正确编码的必要条件，已移除该功能。固定选方可能存在先后手分布差异，评价目标效果时使用同执行方、同开局的配对对照。
@@ -122,6 +131,7 @@ cargo test --profile fast --offline --features slow-tests --lib goal_conditionin
 - 远期目标的成功监督稀疏，失败预测准确也能降低 BCE。支持 14 类不表示同时均匀训练 14 类就有足够正例；应看正例覆盖、常数频率基线及同开局指令增益，区分手写布局先验与学到的长程控制。
 - 目标损失当前按整批样本数平均，有效监督占比变化会改变其有效贡献。报告中的有效样本平均 CE 与优化目标中的实际权重需分开理解。
 - 已证普通必胜时，当前最终策略按目标概率最高值筛选；真实目标成功与网络估计的置信度不同，该筛选可能放大未校准估计的噪声。强度连续性、保留探索的软偏好应作为单独对照，不把估计当作杀法证明。
+- Arena 当前评估普通争胜，`best` 的选取不衡量杀法指令命中率；自博弈使用最新训练模型，不受 Promote/Reject 阻断。验证控制效果时应使用目标指标配对评估训练检查点，不能仅以 Arena 的 Promote 判定目标能力更好。
 
 - [世界象联：基础杀法教学资料](https://www.wxf-xiangqi.org/images/hangzhou-chess/2022_47_guo_baocheng_.pdf)。
 - [XQinEnglish：马类杀法及马位](https://www.xqinenglish.com/index.php?Itemid=522&catid=166&id=138:bk05horse00&lang=en&option=com_content&view=article)，包括马位名称差异与八角马对角关系。

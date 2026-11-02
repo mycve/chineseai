@@ -172,6 +172,11 @@ impl AzNnue {
             &self.policy_repetition_hidden,
         ) + self.policy_repetition_bias[0];
         let goal = scratch.mating_goal.effective(position);
+        let mut goal_prior = if scratch.goal_policy_active {
+            goal.policy_prior(position)
+        } else {
+            None
+        };
         {
             crate::scope_profile!("az.eval.policy_logits");
             {
@@ -224,8 +229,8 @@ impl AzNnue {
                         + prior
                         + f32::from(repetition_flags.get(index).copied().unwrap_or(0))
                             * repetition_logit;
-                    if scratch.goal_policy_active {
-                        scratch.logits[index] += goal.policy_bias(position, *mv);
+                    if let Some(prior) = &mut goal_prior {
+                        scratch.logits[index] += prior.bias(*mv);
                     }
                 }
             }
