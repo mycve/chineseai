@@ -27,9 +27,8 @@ impl AzTree<'_> {
         }) {
             return true;
         }
-        // 不证明指定杀法。普通必胜后只留一小段探索，且不突破调用方总预算。
-        self.goal_search_until
-            .is_none_or(|until| self.nodes[node].visits >= until)
+        // 普通必胜不终止指定杀法探索；仍服从原 simulations、KLD 和时间预算。
+        false
     }
 
     pub(super) fn node_goal_value(&self, node: usize) -> f32 {
@@ -77,47 +76,46 @@ impl AzTree<'_> {
         }
     }
 
-    pub(super) fn goal_bonus_weight(&self, node: usize) -> f32 {
-        if self.goal_turn(node) {
-            0.25 * self.mating_goal.strength
+    /// 目标成功为 +1，非目标终局为 -1；WDL 作为强度之外的争胜分量。
+    pub(super) fn goal_utility(&self, q: f32, probability: f32) -> f32 {
+        let strength = self.mating_goal.strength;
+        (1.0 - strength) * q + strength * (2.0 * probability - 1.0)
+    }
+
+    pub(super) fn goal_child_priority(&self, child: &AzChild, solved: Option<i8>) -> u8 {
+        if solved == Some(1)
+            && child
+                .child_node()
+                .is_some_and(|index| self.nodes[index].goal_outcome == Some(true))
+        {
+            2 // 真实完成目标；不能由网络预测冒充。
         } else {
-            0.0
+            u8::from(solved != Some(-1))
         }
     }
 
     pub(super) fn best_goal_root_child(&self, node: usize) -> Option<usize> {
-        let children = self.node_children(node);
         let draw_score = self.node_draw_score(node);
-        let goal_weight = self.goal_bonus_weight(node);
-        children
+        self.node_children(node)
             .iter()
             .enumerate()
             .max_by(|(_, left), (_, right)| {
-                self.child_priority(left)
-                    .cmp(&self.child_priority(right))
+                self.goal_child_priority(left, self.child_solved(left))
+                    .cmp(&self.goal_child_priority(right, self.child_solved(right)))
+                    .then_with(|| left.visits.cmp(&right.visits))
                     .then_with(|| {
-                        if self.child_solved(left) == Some(1) {
-                            self.child_goal_value(left)
-                                .total_cmp(&self.child_goal_value(right))
-                                .then_with(|| {
-                                    let distance = |child: &AzChild| {
-                                        child
-                                            .child_node()
-                                            .and_then(|index| self.nodes[index].proven_moves_left)
-                                            .unwrap_or(usize::MAX)
-                                    };
-                                    distance(right).cmp(&distance(left))
-                                })
-                        } else {
-                            left.visits.cmp(&right.visits).then_with(|| {
-                                (self.child_q(left, draw_score)
-                                    + goal_weight * self.child_goal_value(left))
-                                .total_cmp(
-                                    &(self.child_q(right, draw_score)
-                                        + goal_weight * self.child_goal_value(right)),
-                                )
-                            })
-                        }
+                        self.goal_utility(
+                            self.child_q(left, draw_score),
+                            self.child_goal_value(left),
+                        )
+                        .total_cmp(&self.goal_utility(
+                            self.child_q(right, draw_score),
+                            self.child_goal_value(right),
+                        ))
+                    })
+                    .then_with(|| {
+                        self.child_q(left, draw_score)
+                            .total_cmp(&self.child_q(right, draw_score))
                     })
                     .then_with(|| left.prior.total_cmp(&right.prior))
             })
@@ -533,7 +531,7 @@ mod tests {
                 [8.0, 2.0, 0.0]
             };
         }
-        assert_eq!(tree.goal_bonus_weight(0), 0.0);
+        assert!(!tree.goal_turn(0));
         assert_eq!(tree.select_child(0), 1);
         assert_eq!(tree.best_root_child(0), Some(1));
     }
@@ -592,19 +590,16 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_win_has_bounded_goal_exploration_and_kld_works_with_goals() {
+    fn ordinary_win_respects_original_search_budget_and_kld_still_works() {
         let model = AzNnue::random(8, 100);
         let mut tree = two_move_tree(&Position::startpos(), &model, Color::Red);
         tree.set_proven(0, 1);
-        let until = tree.goal_search_until.unwrap();
-        assert_eq!(until, 64);
-        tree.nodes[0].visits = until - 1;
-        assert!(!tree.search_finished(0));
-        tree.nodes[0].visits = until;
-        assert!(tree.search_finished(0));
-        // 重复胜负更新不能重置额外预算。
+        for visits in [0, 63, 64, 1000] {
+            tree.nodes[0].visits = visits;
+            assert!(!tree.search_finished(0), "普通必胜不能截断目标探索");
+        }
         tree.set_proven(0, 1);
-        assert_eq!(tree.goal_search_until, Some(until));
+        assert!(!tree.search_finished(0));
 
         let position = Position::startpos();
         let history = position.initial_rule_history();
@@ -686,7 +681,7 @@ mod tests {
         assert_eq!(result.best_move, Some(setup));
         assert_eq!(result.value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(result.proven_moves_left, Some(3));
-        assert!(result.simulations > 1 && result.simulations <= 65);
+        assert!(result.simulations > 1 && result.simulations <= 4096);
         let target = result
             .candidates
             .iter()
@@ -699,7 +694,86 @@ mod tests {
             .unwrap();
         assert_eq!(target.solved, Some(1));
         assert!(target.goal_value > generic.goal_value);
-        assert_eq!(target.policy, 1.0);
-        assert_eq!(generic.policy, 0.0);
+        assert!(target.policy > generic.policy);
+    }
+    #[test]
+    fn strong_goal_can_choose_an_unproven_route_over_a_proven_ordinary_win() {
+        let model = AzNnue::random(8, 1910);
+        let mut tree = two_move_tree(&Position::startpos(), &model, Color::Red);
+        tree.simulate_child(0, 0, 1);
+        tree.simulate_child(0, 1, 1);
+        let ordinary = tree.node_children(0)[0].child_node().unwrap();
+        tree.nodes[ordinary].solved = Some(-1);
+        tree.nodes[ordinary].goal_outcome = Some(false);
+        tree.nodes[0].visits = 300;
+        for (index, child) in tree.node_children_mut(0).iter_mut().enumerate() {
+            child.visits = if index == 0 { 100 } else { 200 };
+            child.prior = 0.5;
+            child.value_wdl_sum = if index == 0 {
+                [100.0, 0.0, 0.0]
+            } else {
+                [120.0, 0.0, 80.0]
+            };
+            child.goal_value_sum = if index == 0 { 0.0 } else { 120.0 };
+        }
+        tree.mating_goal.strength = 0.1;
+        assert_eq!(tree.select_child(0), 0, "弱偏好仍偏向普通必胜");
+        tree.mating_goal.strength = 0.8;
+        assert_eq!(tree.select_child(0), 1, "强偏好必须改变搜索效用");
+        assert_eq!(
+            tree.best_root_child(0),
+            Some(1),
+            "普通胜负证明不能覆盖目标路线"
+        );
+        let policy = tree.root_policy(0);
+        assert!((policy[1] - 2.0 / 3.0).abs() < 1e-6);
+        tree.nodes[ordinary].proven_moves_left = Some(0);
+        tree.set_proven(0, 1);
+        let report = tree.search_result(300);
+        assert_eq!(
+            report.proven_moves_left, None,
+            "不能把放弃的普通一手杀距离报告为目标路线的证明"
+        );
+        assert_eq!(report.best_move, Some(tree.node_children(0)[1].mv));
+        assert!(
+            policy[0] > 0.0,
+            "预测不能伪装成确定的目标证明并压成单点标签"
+        );
+    }
+
+    #[test]
+    fn tiny_goal_prediction_differences_do_not_erase_root_visit_evidence() {
+        let model = AzNnue::random(8, 1911);
+        let mut tree = two_move_tree(&Position::startpos(), &model, Color::Red);
+        for index in 0..2 {
+            tree.simulate_child(0, index, 1);
+            let node = tree.node_children(0)[index].child_node().unwrap();
+            tree.nodes[node].solved = Some(-1);
+        }
+        for (index, child) in tree.node_children_mut(0).iter_mut().enumerate() {
+            child.visits = if index == 0 { 10 } else { 100 };
+            child.goal_value_sum = child.visits as f32 * if index == 0 { 0.501 } else { 0.5 };
+        }
+        assert_eq!(tree.best_root_child(0), Some(1));
+        let policy = tree.root_policy(0);
+        assert!(policy[0] > 0.0 && policy[1] > policy[0]);
+    }
+    #[test]
+    fn all_confirmed_failed_goal_routes_restore_ordinary_winning_selection() {
+        let model = AzNnue::random(8, 1914);
+        let mut tree = two_move_tree(&Position::startpos(), &model, Color::Red);
+        for index in 0..2 {
+            tree.simulate_child(0, index, 1);
+            let node = tree.node_children(0)[index].child_node().unwrap();
+            tree.nodes[node].goal_outcome = Some(false);
+            tree.nodes[node].solved = Some(if index == 0 { -1 } else { 0 });
+            tree.node_children_mut(0)[index].visits = if index == 0 { 10 } else { 100 };
+        }
+        tree.update_solved(0);
+        assert_eq!(tree.nodes[0].goal_outcome, Some(false));
+        assert!(!tree.goal_turn(0));
+        assert_eq!(tree.best_root_child(0), Some(0));
+        assert_eq!(tree.root_policy(0), vec![1.0, 0.0]);
+        assert!(tree.search_finished(0));
     }
 }

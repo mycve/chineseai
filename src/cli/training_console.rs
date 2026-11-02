@@ -128,7 +128,7 @@ impl TrainingConsole {
             format!("WDL={:.4} RMSE={:.4}", check.value_loss, check.value_rmse)
         };
         let line = format!(
-            "test: step={} samples={} value_samples={} loss={:.4} policy_KL={:.4} {value} MLH_RMSE={:.1}/{} MLH_pair={:.1}%/{} 杀法CE={}/{} 目标CE={}/{}",
+            "test: step={} samples={} value_samples={} loss={:.4} policy_KL={:.4} {value} MLH_RMSE={:.1}/{} MLH_pair={:.1}%/{} 杀法CE={}/{} 目标CE={}/{} 轨迹CE={:.4}/{}",
             check.step,
             check.samples,
             check.value_samples,
@@ -149,7 +149,9 @@ impl TrainingConsole {
             } else {
                 "NA".into()
             },
-            check.goal_samples
+            check.goal_samples,
+            check.goal_imitation_loss,
+            check.goal_imitation_samples
         );
         if self.interactive {
             self.test.set_message(line);
@@ -245,7 +247,7 @@ fn mating_line(report: &AzLoopReport) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "本批杀法：实际将死={} 困毙={} 未知={} 覆盖={} CE={}/{} 目标CE={}/{} 目标执行红/黑={}/{} {} 计数(批内全部%/批内将死%)：{}",
+        "本批杀法：实际将死={} 困毙={} 未知={} 覆盖={} CE={}/{} 目标CE={}/{} 轨迹CE={:.4}/{} 目标执行红/黑={}/{} {} 计数(批内全部%/批内将死%)：{}",
         stats.checkmates,
         stats.stalemates,
         stats.unknown_games,
@@ -254,6 +256,8 @@ fn mating_line(report: &AzLoopReport) -> String {
         report.mating_samples,
         goal_loss,
         report.goal_samples,
+        report.goal_imitation_loss,
+        report.goal_imitation_samples,
         stats.goal_side_attempts[0],
         stats.goal_side_attempts[1],
         goal_counts,

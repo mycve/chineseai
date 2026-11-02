@@ -87,6 +87,8 @@ pub struct AzLoopReport {
     pub goal_target_sum: f32,
     pub goal_pred_sum: f32,
     pub goal_brier_sum: f32,
+    pub goal_imitation_loss: f32,
+    pub goal_imitation_samples: usize,
     pub value_mse: f32,
     pub value_pred_mean: f32,
     pub value_target_mean: f32,
@@ -476,6 +478,8 @@ pub struct AzTrainStats {
     pub goal_target_sum: f32,
     pub goal_pred_sum: f32,
     pub goal_brier_sum: f32,
+    pub goal_imitation_loss: f32,
+    pub goal_imitation_samples: usize,
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
@@ -504,6 +508,8 @@ pub struct AzHoldoutReport {
     pub goal_target_sum: f32,
     pub goal_pred_sum: f32,
     pub goal_brier_sum: f32,
+    pub goal_imitation_loss: f32,
+    pub goal_imitation_samples: usize,
     pub moves_left_rmse: f32,
     pub moves_left_samples: usize,
     pub moves_left_pairs: usize,
@@ -559,6 +565,8 @@ impl AzTrainStats {
         self.goal_target_sum += other.goal_target_sum;
         self.goal_pred_sum += other.goal_pred_sum;
         self.goal_brier_sum += other.goal_brier_sum;
+        self.goal_imitation_loss += other.goal_imitation_loss;
+        self.goal_imitation_samples += other.goal_imitation_samples;
         for i in 0..MATING_HEAD_SIZE {
             self.mating_target_sum[i] += other.mating_target_sum[i];
             self.mating_pred_sum[i] += other.mating_pred_sum[i];

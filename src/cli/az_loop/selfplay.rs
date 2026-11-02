@@ -154,6 +154,8 @@ pub(crate) fn build_async_training_report(
         goal_target_sum: stats.goal_target_sum,
         goal_pred_sum: stats.goal_pred_sum,
         goal_brier_sum: stats.goal_brier_sum,
+        goal_imitation_loss: stats.goal_imitation_loss / stats.goal_imitation_samples.max(1) as f32,
+        goal_imitation_samples: stats.goal_imitation_samples,
         moves_left_loss: stats.moves_left_loss,
         moves_left_samples: stats.moves_left_samples,
         moves_left_pairs: stats.moves_left_pairs,
@@ -252,6 +254,11 @@ pub(crate) fn mating_metrics(report: &AzLoopReport) -> Vec<(String, f32)> {
             ),
             ("train/goal_pred_mean".into(), report.goal_pred_sum / count),
             ("train/goal_brier".into(), report.goal_brier_sum / count),
+            ("train/goal_imitation_ce".into(), report.goal_imitation_loss),
+            (
+                "train/goal_imitation_samples".into(),
+                report.goal_imitation_samples as f32,
+            ),
         ]);
     }
     if report.mating_samples > 0 {

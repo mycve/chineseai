@@ -279,6 +279,8 @@ pub(super) struct PackedBatch {
     pub goal_policy_bias: Vec<f32>,
     pub goal_targets: Vec<f32>,
     pub goal_weights: Vec<f32>,
+    pub goal_imitation_indices: Vec<u32>,
+    pub goal_imitation_weights: Vec<f32>,
     pub moves_left_pair_from: Vec<u32>,
     pub moves_left_pair_to: Vec<u32>,
     pub moves_left_pair_weights: Vec<f32>,
@@ -380,6 +382,8 @@ impl PackedBatch {
             goal_policy_bias: vec![0.0; batch_size * max_policy_moves],
             goal_targets: vec![0.0; batch_size],
             goal_weights: vec![0.0; batch_size],
+            goal_imitation_indices: vec![0; batch_size],
+            goal_imitation_weights: vec![0.0; batch_size],
             moves_left_pair_from: Vec::new(),
             moves_left_pair_to: Vec::new(),
             moves_left_pair_weights: Vec::new(),
@@ -446,6 +450,23 @@ impl PackedBatch {
             packed.value_phase_masks[row * 3 + phase] = 1.0;
             packed.value_source_phase_masks
                 [row * 9 + sample.meta.start_source.index() * 3 + phase] = 1.0;
+        }
+        // 每个有成功轨迹的目标贡献相等，避免常见杀法淹没稀有杀法；不改变 WDL/BCE 分布。
+        let mut counts = [0usize; super::MATING_TARGET_COUNT];
+        for (row, &index) in batch.iter().enumerate() {
+            if packed.goal_imitation_weights[row] > 0.0 {
+                counts[samples[index].mating_goal.target.index().unwrap()] += 1;
+            }
+        }
+        let targets = counts.iter().filter(|&&count| count > 0).count();
+        if targets > 0 {
+            for (row, &index) in batch.iter().enumerate() {
+                if packed.goal_imitation_weights[row] > 0.0 {
+                    let count = counts[samples[index].mating_goal.target.index().unwrap()];
+                    packed.goal_imitation_weights[row] *=
+                        batch_size as f32 / (targets * count) as f32;
+                }
+            }
         }
         packed.pack_moves_left_pairs(samples, batch);
         packed
@@ -566,6 +587,16 @@ impl PackedBatch {
             if move_index < DENSE_MOVE_SPACE {
                 self.policy_targets[policy_base + policy_offset] = target.max(0.0);
                 self.policy_mask[policy_base + policy_offset] = 0.0;
+                if self.goal_policy_mask[row] > 0.0
+                    && self.goal_weights[row] > 0.0
+                    && self.goal_targets[row] == 1.0
+                    && sample.meta.played_visits > 0
+                    && sample_offset == usize::from(sample.meta.played_index)
+                    && sample.policy_weight > 0.0
+                {
+                    self.goal_imitation_indices[row] = policy_offset as u32;
+                    self.goal_imitation_weights[row] = goal.strength * sample.policy_weight;
+                }
                 if let Some(prior) = &mut goal_prior {
                     if let Some((from, to)) = dense_move_squares(move_index) {
                         self.goal_policy_bias[policy_base + policy_offset] =
@@ -1069,5 +1100,75 @@ mod tests {
         }
         loader.join().unwrap();
         assert_eq!(sizes, vec![2, 2, 2, 1]);
+    }
+    #[test]
+    fn successful_goal_actions_are_balanced_by_target_without_relabeling_value_tasks() {
+        use crate::az::{AzMatingGoal, MatingTarget};
+        let position = Position::startpos();
+        let mut good = sample(0);
+        good.features = crate::az::nnue::extract_sparse_features_az(&position);
+        good.move_indices = position
+            .legal_moves()
+            .iter()
+            .map(|&mv| crate::az::dense_move_index(mv))
+            .collect();
+        good.policy = vec![1.0 / good.move_indices.len() as f32; good.move_indices.len()];
+        good.mating_goal = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 1.0,
+        };
+        good.goal_weight = 1.0;
+        good.goal_target = 1.0;
+        good.meta.played_index = 1;
+        good.meta.played_visits = 10;
+        let mut rare = good.clone();
+        rare.mating_goal.target = MatingTarget::IronBolt;
+        let mut rows = vec![good.clone(), good.clone(), rare];
+        for kind in 0..7 {
+            let mut excluded = good.clone();
+            match kind {
+                0 => excluded.mating_goal.side = Color::Black,
+                1 => excluded.goal_weight = 0.0,
+                2 => excluded.goal_target = 0.0,
+                3 => excluded.meta.played_visits = 0,
+                4 => excluded.meta.played_index = u16::MAX,
+                5 => excluded.mating_goal.strength = 0.0,
+                _ => excluded.policy_weight = 0.0,
+            }
+            rows.push(excluded);
+        }
+        let packed = PackedBatch::from_indices(&rows, &(0..rows.len()).collect::<Vec<_>>());
+        assert_eq!(&packed.goal_imitation_indices[..3], &[1, 1, 1]);
+        assert!(
+            packed.goal_imitation_weights[3..]
+                .iter()
+                .all(|&weight| weight == 0.0)
+        );
+        let common = packed.goal_imitation_weights[0] + packed.goal_imitation_weights[1];
+        assert!((common - packed.goal_imitation_weights[2]).abs() < 1e-6);
+        assert!(
+            (packed.goal_imitation_weights.iter().sum::<f32>() - rows.len() as f32).abs() < 1e-6
+        );
+        assert_eq!(packed.goal_weights[0], 1.0);
+        assert_eq!(packed.goal_targets[0], 1.0);
+        let mut baseline = good.clone();
+        baseline.meta.played_visits = 0;
+        let baseline = PackedBatch::from_indices(&[baseline], &[0]);
+        assert_eq!(
+            &packed.policy_targets[..good.policy.len()],
+            &baseline.policy_targets
+        );
+        assert_eq!(&packed.value_wdl[..3], &good.value_wdl);
+        let mut black = good.clone();
+        black.side_sign = -1.0;
+        black.mating_goal.side = Color::Black;
+        let black = PackedBatch::from_indices(&[black], &[0]);
+        assert_eq!(black.goal_imitation_indices, [1]);
+        assert_eq!(
+            black.goal_imitation_weights,
+            [1.0],
+            "黑方执行目标使用同一套轨迹监督"
+        );
     }
 }

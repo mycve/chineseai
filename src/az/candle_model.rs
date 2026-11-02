@@ -234,6 +234,7 @@ pub(super) struct BatchTensors {
     pub(super) has_mating_targets: bool,
     pub(super) has_goal_targets: bool,
     pub(super) has_goals: bool,
+    pub(super) goal_imitation_samples: usize,
     pub(super) has_policy_goals: bool,
     pub(super) value_buckets: Tensor,
     pub(super) feature_items: Tensor,
@@ -262,6 +263,8 @@ pub(super) struct BatchTensors {
     pub(super) goal_targets: Tensor,
     pub(super) goal_weights: Tensor,
     pub(super) goal_weight_sum: f32,
+    pub(super) goal_imitation_indices: Tensor,
+    pub(super) goal_imitation_weights: Tensor,
     pub(super) moves_left_pairs: Option<MovesLeftPairs>,
     pub(super) value_phase_masks: Tensor,
     pub(super) value_source_phase_masks: Tensor,
@@ -273,6 +276,11 @@ impl BatchTensors {
         let has_mating_targets = packed.mating_weights.iter().any(|&weight| weight > 0.0);
         let has_goal_targets = packed.goal_weights.iter().any(|&weight| weight > 0.0);
         let goal_weight_sum = packed.goal_weights.iter().sum();
+        let goal_imitation_samples = packed
+            .goal_imitation_weights
+            .iter()
+            .filter(|&&weight| weight > 0.0)
+            .count();
         let has_goals = packed.goal_features.iter().any(|&value| value != 0.0);
         let has_policy_goals = packed.goal_policy_mask.iter().any(|&weight| weight > 0.0);
         let max_features = packed.max_features;
@@ -313,6 +321,7 @@ impl BatchTensors {
             has_mating_targets,
             has_goal_targets,
             has_goals,
+            goal_imitation_samples,
             has_policy_goals,
             moves_left_pairs,
             value_buckets: Tensor::from_vec(packed.value_buckets, batch_size, device)?,
@@ -398,6 +407,16 @@ impl BatchTensors {
             goal_targets: Tensor::from_vec(packed.goal_targets, (batch_size, 1), device)?,
             goal_weights: Tensor::from_vec(packed.goal_weights, batch_size, device)?,
             goal_weight_sum,
+            goal_imitation_indices: Tensor::from_vec(
+                packed.goal_imitation_indices,
+                (batch_size, 1),
+                device,
+            )?,
+            goal_imitation_weights: Tensor::from_vec(
+                packed.goal_imitation_weights,
+                batch_size,
+                device,
+            )?,
             value_phase_masks: Tensor::from_vec(packed.value_phase_masks, (batch_size, 3), device)?,
             value_source_phase_masks: Tensor::from_vec(
                 packed.value_source_phase_masks,

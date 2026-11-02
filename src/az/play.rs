@@ -1110,9 +1110,10 @@ fn finalize_value_targets(
         }
     }
     for (sample, proof) in samples.iter_mut().zip(proofs) {
-        if let Some(value) = proof {
-            // 使用显式证明，不能从网络饱和的单点 WDL 推断。
-            sample.value = f32::from(*value);
+        if let Some(value) = proof.filter(|_| !sample.mating_goal.enabled()) {
+            // 指定目标可能主动放弃普通必胜着，只能用实际结果监督该条件策略。
+            // 普通争胜继续使用显式证明。
+            sample.value = f32::from(value);
             sample.value_wdl = scalar_value_to_wdl_target(sample.value);
             sample.value_weight = 1.0;
         }
@@ -1158,13 +1159,23 @@ fn choose_selfplay_move(
             .iter()
             .filter(|candidate| selfplay_candidate_eligible(candidate, priority, goal_active))
             .max_by(|left, right| {
-                left.proof_priority()
-                    .cmp(&right.proof_priority())
-                    .then_with(|| {
-                        left.policy
-                            .total_cmp(&right.policy)
-                            .then_with(|| left.visits.cmp(&right.visits))
-                    })
+                (if goal_active {
+                    0
+                } else {
+                    left.proof_priority()
+                })
+                .cmp(
+                    &(if goal_active {
+                        0
+                    } else {
+                        right.proof_priority()
+                    }),
+                )
+                .then_with(|| {
+                    left.policy
+                        .total_cmp(&right.policy)
+                        .then_with(|| left.visits.cmp(&right.visits))
+                })
             })
             .map(|candidate| candidate.mv);
     }
@@ -1192,7 +1203,12 @@ fn choose_selfplay_move(
 fn selfplay_candidate_eligible(candidate: &AzCandidate, priority: u8, goal_active: bool) -> bool {
     // 目标根策略已排除的普通胜法，不能被 visits 温度或零质量回退重新采入。
     // 只在目标执行方的有效目标回合启用，普通模式保留既有采样语义。
-    candidate.proof_priority() == priority && (!goal_active || candidate.policy > 0.0)
+    if goal_active {
+        // 搜索已按目标效用筛选；普通必胜不能再次覆盖尚未证明的目标路线。
+        candidate.policy > 0.0 && (priority == 0 || candidate.solved != Some(-1))
+    } else {
+        candidate.proof_priority() == priority
+    }
 }
 
 fn temperature_move_weights(
@@ -2862,5 +2878,49 @@ mod tests {
             choose_selfplay_move(&moves, 0.9, -0.8, &mut rng, false),
             Some(moves[1].mv)
         );
+    }
+    #[test]
+    fn goal_temperature_does_not_reapply_ordinary_win_priority() {
+        let mut ordinary = candidate_q(Move::new(0, 1), 20, 1.0);
+        ordinary.solved = Some(1);
+        ordinary.policy = 0.1;
+        let mut target = candidate_q(Move::new(0, 2), 180, 0.2);
+        target.policy = 0.9;
+        let mut loss = candidate_q(Move::new(0, 3), 1000, -1.0);
+        loss.solved = Some(-1);
+        loss.policy = 0.99;
+        let candidates = [ordinary, target, loss];
+        for temperature in [0.0, 0.3, 1.0] {
+            let mut rng = SplitMix64::new(1912);
+            let mut chosen = 0;
+            for _ in 0..100 {
+                let mv =
+                    choose_selfplay_move(&candidates, temperature, 0.0, &mut rng, true).unwrap();
+                assert_ne!(mv, candidates[2].mv);
+                chosen += usize::from(mv == candidates[1].mv);
+                assert_eq!(
+                    choose_selfplay_move(&candidates, temperature, 0.0, &mut rng, false),
+                    Some(candidates[0].mv)
+                );
+            }
+            assert!(chosen > 70);
+        }
+    }
+
+    #[test]
+    fn goal_wdl_uses_the_played_result_instead_of_an_abandoned_ordinary_proof() {
+        let mut directed = sample(0.0, 1.0);
+        directed.mating_goal = AzMatingGoal {
+            target: super::super::MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 0.8,
+        };
+        let mut rows = [directed, sample(0.0, 1.0)];
+        finalize_value_targets(&mut rows, &[Some(1), Some(1)], Some(-1.0));
+        assert_eq!(rows[0].value, -1.0);
+        assert_eq!(rows[1].value, 1.0);
+        finalize_value_targets(&mut rows, &[Some(1), Some(1)], None);
+        assert_eq!(rows[0].value_weight, 0.0);
+        assert_eq!(rows[1].value_weight, 1.0);
     }
 }

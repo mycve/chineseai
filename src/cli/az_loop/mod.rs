@@ -794,6 +794,10 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 ("test/value_samples", check.value_samples as f32),
                 ("test/mating_samples", check.mating_samples as f32),
                 ("test/goal_samples", check.goal_samples as f32),
+                (
+                    "test/goal_imitation_samples",
+                    check.goal_imitation_samples as f32,
+                ),
             ] {
                 log_scalar(&mut tb, tag, check.step, value);
             }
@@ -806,6 +810,14 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             }
             if check.goal_samples > 0 {
                 log_scalar(&mut tb, "test/goal_bce", check.step, check.goal_loss);
+            }
+            if check.goal_imitation_samples > 0 {
+                log_scalar(
+                    &mut tb,
+                    "test/goal_imitation_ce",
+                    check.step,
+                    check.goal_imitation_loss,
+                );
             }
             if check.moves_left_samples > 0 {
                 log_scalar(

@@ -220,6 +220,9 @@ impl GpuTrainer {
             goal_target_sum: stats.goal_target_sum,
             goal_pred_sum: stats.goal_pred_sum,
             goal_brier_sum: stats.goal_brier_sum,
+            goal_imitation_loss: stats.goal_imitation_loss
+                / stats.goal_imitation_samples.max(1) as f32,
+            goal_imitation_samples: stats.goal_imitation_samples,
             moves_left_rmse: (stats.moves_left_loss / stats.moves_left_samples.max(1) as f32)
                 .sqrt()
                 * super::MOVES_LEFT_SCALE,
@@ -369,6 +372,32 @@ impl GpuReplica {
             .broadcast_mul(&batch_tensors.policy_weights)?
             .sum_all()?
             .affine(policy_weight.max(0.0) as f64, 0.0)?;
+        let (weighted_policy_ce, goal_imitation_ce) = if batch_tensors.goal_imitation_samples > 0 {
+            let nll = log_policy
+                .gather(&batch_tensors.goal_imitation_indices, 1)?
+                .squeeze(1)?
+                .neg()?;
+            let imitation = (&nll * &batch_tensors.goal_imitation_weights)?
+                .sum_all()?
+                .affine(policy_weight as f64, 0.0)?;
+            let valid = batch_tensors
+                .goal_imitation_weights
+                .gt(0.0)?
+                .to_dtype(candle_core::DType::F32)?;
+            let ce = (&nll * valid)?.sum_all()?;
+            // 常规 MCTS 策略与按目标平衡的真实成功轨迹各半，不新增训练参数。
+            let policy = if policy_weight > 0.0 {
+                ((weighted_policy_ce + imitation)? * 0.5)?
+            } else {
+                weighted_policy_ce
+            };
+            (policy, ce)
+        } else {
+            (
+                weighted_policy_ce,
+                Tensor::zeros((), candle_core::DType::F32, &self.device)?,
+            )
+        };
         let mating_ce_per_sample =
             mating_bce_per_sample(&forward.mating_logits, &batch_tensors.mating_targets)?;
         let valid_mating = batch_tensors
@@ -477,6 +506,7 @@ impl GpuReplica {
                 (&goal_targets * &valid_goal)?.sum_all()?,
                 (&goal_probs * &valid_goal)?.sum_all()?,
                 ((&goal_probs - &goal_targets)?.sqr()? * &valid_goal)?.sum_all()?,
+                goal_imitation_ce.detach(),
             ],
             0,
         )?
@@ -499,6 +529,8 @@ impl GpuReplica {
             goal_target_sum: metrics[9],
             goal_pred_sum: metrics[10],
             goal_brier_sum: metrics[11],
+            goal_imitation_loss: metrics[12],
+            goal_imitation_samples: batch_tensors.goal_imitation_samples,
             value_pred_sum: global.pred_sum,
             value_pred_sq_sum: global.pred_sq_sum,
             value_target_sum: global.target_sum,
@@ -1593,5 +1625,77 @@ mod monitoring_tests {
                 }
             }
         }
+    }
+    fn check_goal_trajectory_imitation_learns_executed_actions(device: &Device) {
+        let model = AzNnue::random(8, 1913);
+        let mut successful = goal_sample();
+        successful.mating_goal.side = crate::xiangqi::Color::Red;
+        successful.policy.fill(0.0);
+        successful.policy[0] = 1.0; // 旧搜索标签偏向另一手，不能替代实际成功动作。
+        successful.meta.played_index = 1;
+        successful.meta.played_visits = 10;
+        let mut failed = successful.clone();
+        failed.goal_target = 0.0;
+        let mut opponent = successful.clone();
+        opponent.mating_goal.side = crate::xiangqi::Color::Black;
+        let samples = [successful, failed, opponent];
+        let replica = GpuReplica {
+            device: device.clone(),
+            model: AzCandleModel::from_model(&model, device).unwrap(),
+        };
+        let batch =
+            BatchTensors::from_packed(PackedBatch::from_indices(&samples, &[0, 1, 2]), device)
+                .unwrap();
+        assert_eq!(batch.goal_imitation_samples, 1);
+        let probability = || {
+            let output = replica.model.forward(&batch).unwrap();
+            let logits = (&output.policy_logits + &batch.policy_mask).unwrap();
+            candle_nn::ops::softmax(&logits, 1)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap()[0][1]
+        };
+        let before = probability();
+        let (vars, decay) = replica.model.all_vars_with_decay();
+        let mut optimizer = AzAdamW::new(vars, decay, 0.03).unwrap();
+        let initial = replica
+            .compute_batch_loss(&batch, 3, 0.0, 1.0, 0.0, 0.0)
+            .unwrap();
+        let initial_ce = initial.stats.goal_imitation_loss;
+        assert_eq!(initial.stats.goal_imitation_samples, 1);
+        for _ in 0..8 {
+            let output = replica
+                .compute_batch_loss(&batch, 3, 0.0, 1.0, 0.0, 0.0)
+                .unwrap();
+            optimizer
+                .step(&output.loss_tensor.backward().unwrap())
+                .unwrap();
+        }
+        let after = probability();
+        let learned = replica
+            .compute_batch_loss(&batch, 3, 0.0, 1.0, 0.0, 0.0)
+            .unwrap();
+        assert!(
+            after > before + 1e-3,
+            "成功动作应被学入策略：{before} -> {after}"
+        );
+        assert!(learned.stats.goal_imitation_loss < initial_ce);
+        assert_eq!(
+            learned.stats.goal_samples, 3,
+            "目标价值监督保持真实样本分布"
+        );
+    }
+
+    #[test]
+    fn goal_trajectory_imitation_learns_executed_actions_on_cpu() {
+        check_goal_trajectory_imitation_learns_executed_actions(&Device::Cpu);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn goal_trajectory_imitation_learns_executed_actions_on_cuda() {
+        check_goal_trajectory_imitation_learns_executed_actions(
+            crate::az::cuda_test_device::shared_cuda_device().expect("CUDA device required"),
+        );
     }
 }
