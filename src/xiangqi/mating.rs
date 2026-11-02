@@ -11,49 +11,41 @@ pub enum MateKind {
     Stalemate,
 }
 
-/// 标签可以重叠；基础将军子标签与具名杀法也可以同时出现。
+/// 仅保留已确认的 14 种具名杀法；同一终局可以命中多种。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum MatingPattern {
     DoubleCannon,
-    HorseCannon,
     IronBolt,
-    SmotheredCannon,
+    HorseCannon,
     HeavenEarthCannon,
-    TwoSoldiers,
+    SmotheredCannon,
     WhiteFacedGeneral,
     ElbowHorse,
     PalaceCornerHorse,
     AnglerHorse,
     OctagonalHorse,
-    DoubleRook,
-    SmotheredMate,
-    DoubleCheck,
-    HorseCheck,
-    RookCheck,
-    CannonCheck,
-    SoldierCheck,
+    HighAnglerHorse,
+    DoubleHorse,
+    CrossRooks,
+    TwoGhosts,
 }
 
 impl MatingPattern {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 14] = [
         Self::DoubleCannon,
-        Self::HorseCannon,
         Self::IronBolt,
-        Self::SmotheredCannon,
+        Self::HorseCannon,
         Self::HeavenEarthCannon,
-        Self::TwoSoldiers,
+        Self::SmotheredCannon,
         Self::WhiteFacedGeneral,
         Self::ElbowHorse,
         Self::PalaceCornerHorse,
         Self::AnglerHorse,
         Self::OctagonalHorse,
-        Self::DoubleRook,
-        Self::SmotheredMate,
-        Self::DoubleCheck,
-        Self::HorseCheck,
-        Self::RookCheck,
-        Self::CannonCheck,
-        Self::SoldierCheck,
+        Self::HighAnglerHorse,
+        Self::DoubleHorse,
+        Self::CrossRooks,
+        Self::TwoGhosts,
     ];
 
     pub fn name(self) -> &'static str {
@@ -63,19 +55,15 @@ impl MatingPattern {
             Self::IronBolt => "铁门栓",
             Self::SmotheredCannon => "闷宫",
             Self::HeavenEarthCannon => "天地炮",
-            Self::TwoSoldiers => "二鬼拍门",
+            Self::TwoGhosts => "二鬼拍门",
             Self::WhiteFacedGeneral => "白脸将",
             Self::ElbowHorse => "卧槽马",
             Self::PalaceCornerHorse => "挂角马",
             Self::AnglerHorse => "钓鱼马",
             Self::OctagonalHorse => "八角马",
-            Self::DoubleRook => "双车配合",
-            Self::SmotheredMate => "闷杀（终局形）",
-            Self::DoubleCheck => "双将",
-            Self::HorseCheck => "马将死",
-            Self::RookCheck => "车将死",
-            Self::CannonCheck => "炮将死",
-            Self::SoldierCheck => "兵卒将死",
+            Self::HighAnglerHorse => "高钓马",
+            Self::DoubleHorse => "双马饮泉",
+            Self::CrossRooks => "双车错",
         }
     }
 }
@@ -293,15 +281,24 @@ impl MateContext<'_> {
                         .pieces(PieceKind::Cannon)
                         .any(|sq| self.central_pin(sq))
             }
-            TwoSoldiers => self.checking(PieceKind::Soldier).any(|checker| {
-                matches!(file_of(checker), 3 | 5)
-                    && self.rank(checker) <= 1
-                    && self.pieces(PieceKind::Soldier).any(|support| {
-                        file_of(support) == 8 - file_of(checker)
-                            && self.rank(support) <= 1
-                            && self.denies_escape(support)
-                    })
-            }),
+            TwoGhosts => {
+                let door_piece = |sq| {
+                    self.position.piece_at(sq).is_some_and(|p| {
+                        p.color == self.winner
+                            && matches!(p.kind, PieceKind::Rook | PieceKind::Soldier)
+                    }) && self.rank(sq) <= 1
+                };
+                let active = |sq| self.checkers.contains(&sq) || self.denies_escape(sq);
+                self.position.occupied_squares().any(|left| {
+                    file_of(left) == 3
+                        && door_piece(left)
+                        && active(left)
+                        && self
+                            .position
+                            .occupied_squares()
+                            .any(|right| file_of(right) == 5 && door_piece(right) && active(right))
+                })
+            }
             WhiteFacedGeneral => {
                 self.denies_escape(self.position.general_square(self.winner).unwrap())
             }
@@ -319,31 +316,33 @@ impl MateContext<'_> {
             }),
             OctagonalHorse => self.pieces(PieceKind::Horse).any(|sq| {
                 matches!(file_of(sq), 3 | 5)
-                    && self.rank(sq) == 2
+                    && matches!(self.rank(sq), 0 | 2)
+                    && self.rank(self.king) == 2 - self.rank(sq)
+                    && file_of(self.king) == 8 - file_of(sq)
                     && !self.checkers.contains(&sq)
                     && self.denies_escape(sq)
             }),
-            DoubleRook => {
-                self.checking(PieceKind::Rook).next().is_some()
-                    && self
-                        .pieces(PieceKind::Rook)
-                        .any(|sq| !self.checkers.contains(&sq) && self.denies_escape(sq))
-            }
-            SmotheredMate => super::ORTHOGONAL_STEPS.into_iter().all(|(df, dr)| {
-                let f = file_of(self.king) as i32 + df;
-                let r = rank_of(self.king) as i32 + dr;
-                !super::inside_board(f, r)
-                    || !inside_palace(self.winner.opposite(), f as usize, r as usize)
-                    || self
-                        .position
-                        .piece_at(index(f as usize, r as usize))
-                        .is_some_and(|p| p.color == self.winner.opposite())
+            HighAnglerHorse => self.pieces(PieceKind::Horse).any(|sq| {
+                matches!(file_of(sq), 2 | 6)
+                    && self.rank(sq) == 3
+                    && !self.checkers.contains(&sq)
+                    && self.denies_escape(sq)
             }),
-            DoubleCheck => self.checkers.len() >= 2,
-            HorseCheck => self.checking(PieceKind::Horse).next().is_some(),
-            RookCheck => self.checking(PieceKind::Rook).next().is_some(),
-            CannonCheck => self.checking(PieceKind::Cannon).next().is_some(),
-            SoldierCheck => self.checking(PieceKind::Soldier).next().is_some(),
+            DoubleHorse => self.checking(PieceKind::Horse).any(|checker| {
+                self.pieces(PieceKind::Horse).any(|support| {
+                    support != checker
+                        && (self.checkers.contains(&support) || self.denies_escape(support))
+                })
+            }),
+            // 识别双车交错两线的最终杀形，不声称证明此前反复交替将军的过程。
+            CrossRooks => self.checking(PieceKind::Rook).any(|checker| {
+                self.pieces(PieceKind::Rook).any(|support| {
+                    !self.checkers.contains(&support)
+                        && file_of(checker) != file_of(support)
+                        && rank_of(checker) != rank_of(support)
+                        && self.denies_escape(support)
+                })
+            }),
         }
     }
 }

@@ -24,6 +24,7 @@ mod inference;
 mod mate;
 mod mating_goal;
 mod mating_stats;
+mod mating_upgrade;
 mod mlh;
 pub mod nnue;
 mod node_threat;
@@ -102,7 +103,7 @@ pub use mate::{
     MateSearchLimits, MateSearchOutcome, MateSearchReport, MateSolution, search_root_mate,
     search_root_mate_profiled,
 };
-pub use mating_goal::{AzMatingGoal, GOAL_CONTEXT_SIZE, MatingTarget};
+pub use mating_goal::{AzMatingGoal, GOAL_CONTEXT_SIZE, MATING_TARGET_COUNT, MatingTarget};
 pub use mating_stats::AzMatingStats;
 pub use sample::{
     AzHoldoutReport, AzLoopConfig, AzLoopReport, AzPhaseValueReport, AzPolicyGroupStats,

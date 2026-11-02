@@ -651,20 +651,46 @@ mod tests {
         let start = Position::startpos();
         let mut black_turn = start.clone();
         black_turn.make_move(black_turn.parse_uci_move("h2e2").unwrap());
-        let samples = vec![
+        let mut samples = vec![
             goal_sample(&start, owner),
             goal_sample(&start, opponent),
             goal_sample(&black_turn, owner),
             goal_sample(&black_turn.mirror_files(), owner),
             goal_sample(&start, AzMatingGoal::NONE),
         ];
-        let packed = PackedBatch::from_indices(&samples, &[0, 1, 2, 3, 4]);
-        assert_eq!(&packed.goal_features[..4], &[0.7, 0.0, 0.0, 0.0]);
-        assert_eq!(&packed.goal_features[4..8], &[0.0, 0.0, 0.0, 0.7]);
-        assert_eq!(&packed.goal_features[8..12], &[0.0, 0.0, 0.7, 0.0]);
-        assert_eq!(&packed.goal_features[8..12], &packed.goal_features[12..16]);
-        assert_eq!(packed.goal_policy_mask, [1.0, 0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(packed.goal_targets, [1.0, 1.0, 1.0, 1.0, 0.0]);
+        for target in MatingTarget::ALL {
+            for side in [Color::Red, Color::Black] {
+                samples.push(goal_sample(
+                    &start,
+                    AzMatingGoal {
+                        target,
+                        side,
+                        strength: 0.7,
+                    },
+                ));
+            }
+        }
+        let packed = PackedBatch::from_indices(&samples, &(0..samples.len()).collect::<Vec<_>>());
+        let size = super::super::GOAL_CONTEXT_SIZE;
+        let roles = [
+            0,
+            super::super::MATING_TARGET_COUNT + 1,
+            super::super::MATING_TARGET_COUNT,
+        ];
+        for (row, index) in roles.into_iter().enumerate() {
+            let mut expected = vec![0.0; size];
+            expected[index] = 0.7;
+            assert_eq!(
+                &packed.goal_features[row * size..(row + 1) * size],
+                &expected
+            );
+        }
+        assert_eq!(
+            &packed.goal_features[2 * size..3 * size],
+            &packed.goal_features[3 * size..4 * size]
+        );
+        assert_eq!(packed.goal_policy_mask[..5], [1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(packed.goal_targets[..5], [1.0, 1.0, 1.0, 1.0, 0.0]);
         let batch = BatchTensors::from_packed(packed, device).unwrap();
         let model = conditioned_model();
         let candle = AzCandleModel::from_model(&model, device).unwrap();
@@ -697,7 +723,12 @@ mod tests {
             for (base, conditioned) in base_wdl.iter().zip(candle_wdl) {
                 assert!((base - conditioned).abs() < 2e-5);
             }
-            if row == 0 {
+            let side = if sample.side_sign > 0.0 {
+                Color::Red
+            } else {
+                Color::Black
+            };
+            if sample.mating_goal.enabled() && sample.mating_goal.side == side {
                 assert!(
                     cpu_policy
                         .iter()

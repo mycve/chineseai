@@ -1,0 +1,219 @@
+//! v54 双目标检查点的显式一次性扩容；普通加载器只接受当前格式。
+use std::{fs, io, path::Path};
+
+use candle_core::{Device, Var};
+use candle_nn::VarMap;
+
+use super::inference::{candle_io_error, insert_candle_var, load_candle_f32_tensor};
+use super::{AzNnue, GOAL_CONTEXT_SIZE, MATING_HEAD_SIZE, MATING_TARGET_COUNT};
+
+// v54 的 18 个统计头映射到确认后的 14 类；新高钓马、双马饮泉从零初始化。
+const OLD_HEADS: [Option<usize>; MATING_HEAD_SIZE] = [
+    Some(0),
+    Some(2),
+    Some(1),
+    Some(4),
+    Some(3),
+    Some(6),
+    Some(7),
+    Some(8),
+    Some(9),
+    Some(10),
+    None,
+    None,
+    Some(11),
+    Some(5),
+];
+
+fn remap_heads(old: &[f32], width: usize, initial: f32) -> io::Result<Vec<f32>> {
+    if old.len() != 18 * width {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v54 杀法统计头应为 18 行",
+        ));
+    }
+    let mut result = vec![initial; MATING_HEAD_SIZE * width];
+    for (row, source) in OLD_HEADS.into_iter().enumerate() {
+        if let Some(source) = source {
+            result[row * width..(row + 1) * width]
+                .copy_from_slice(&old[source * width..(source + 1) * width]);
+        }
+    }
+    Ok(result)
+}
+
+impl AzNnue {
+    /// 保留全部旧权重，新目标的条件编码初始化为零。输出必须不存在。
+    pub fn upgrade_mating_targets(
+        input: impl AsRef<Path>,
+        output: impl AsRef<Path>,
+    ) -> io::Result<()> {
+        let tensors = unsafe {
+            candle_core::safetensors::MmapedSafetensors::new(input.as_ref())
+                .map_err(candle_io_error)?
+        };
+        if load_candle_f32_tensor(&tensors, "az_model_format_version")? != [54.0] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "杀法扩容仅接受 v54 模型",
+            ));
+        }
+        let old = tensors
+            .load("goal_hidden", &Device::Cpu)
+            .map_err(candle_io_error)?;
+        let (rows, hidden) = old.dims2().map_err(candle_io_error)?;
+        if rows != 4 || hidden == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v54 goal_hidden 应为 [4, hidden]",
+            ));
+        }
+        let old = old
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(candle_io_error)?;
+        let mut expanded = vec![0.0; GOAL_CONTEXT_SIZE * hidden];
+        for (source, destination) in [
+            (0, 0),
+            (1, 1),
+            (2, MATING_TARGET_COUNT),
+            (3, MATING_TARGET_COUNT + 1),
+        ] {
+            expanded[destination * hidden..(destination + 1) * hidden]
+                .copy_from_slice(&old[source * hidden..(source + 1) * hidden]);
+        }
+        let vars = VarMap::new();
+        for (name, _) in tensors.tensors() {
+            match name.as_str() {
+                "az_model_format_version" => insert_candle_var(
+                    &vars,
+                    &name,
+                    &[crate::infra::version::MODEL_FORMAT_VERSION],
+                    (1,),
+                )?,
+                "goal_hidden" => {
+                    insert_candle_var(&vars, &name, &expanded, (GOAL_CONTEXT_SIZE, hidden))?
+                }
+                "mating_output" => {
+                    let values =
+                        remap_heads(&load_candle_f32_tensor(&tensors, &name)?, hidden, 0.0)?;
+                    insert_candle_var(&vars, &name, &values, (MATING_HEAD_SIZE, hidden))?;
+                }
+                "mating_bias" => {
+                    let values = remap_heads(&load_candle_f32_tensor(&tensors, &name)?, 1, -4.0)?;
+                    insert_candle_var(&vars, &name, &values, (MATING_HEAD_SIZE,))?;
+                }
+                _ => {
+                    let tensor = tensors.load(&name, &Device::Cpu).map_err(candle_io_error)?;
+                    let var = Var::from_tensor(&tensor).map_err(candle_io_error)?;
+                    vars.data().lock().unwrap().insert(name, var);
+                }
+            }
+        }
+        // 先独占创建，拒绝覆盖输入、已有输出或其他检查点。
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output.as_ref())?;
+        let saved = vars.save(output.as_ref()).map_err(candle_io_error);
+        drop(vars);
+        drop(tensors);
+        if let Err(err) = saved.and_then(|()| Self::load(output.as_ref()).map(|_| ())) {
+            let _ = fs::remove_file(output.as_ref());
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::az::arch::az_weight_tensors;
+
+    #[test]
+    fn explicit_upgrade_preserves_all_weights_and_rejects_overwrites() {
+        let base =
+            std::env::temp_dir().join(format!("chineseai-goal-upgrade-{}", std::process::id()));
+        let current = base.with_extension("current.safetensors");
+        let old = base.with_extension("v54.safetensors");
+        let output = base.with_extension("v55.safetensors");
+        let mut model = AzNnue::random(8, 1900);
+        let rows = [0, 1, MATING_TARGET_COUNT, MATING_TARGET_COUNT + 1];
+        for (i, &row) in rows.iter().enumerate() {
+            model.goal_hidden[row * 8..(row + 1) * 8].fill((i + 1) as f32 * 0.2);
+        }
+        for (row, source) in OLD_HEADS.iter().enumerate() {
+            if source.is_some() {
+                model.mating_output[row * 8..(row + 1) * 8].fill((row + 1) as f32 * 0.02);
+                model.mating_bias[row] = (row + 1) as f32 * 0.03;
+            }
+        }
+        model.save(&current).unwrap();
+        let tensors =
+            unsafe { candle_core::safetensors::MmapedSafetensors::new(&current).unwrap() };
+        let vars = VarMap::new();
+        for (name, _) in tensors.tensors() {
+            match name.as_str() {
+                "az_model_format_version" => {
+                    insert_candle_var(&vars, &name, &[54.0], (1,)).unwrap()
+                }
+                "goal_hidden" => {
+                    let values = rows
+                        .iter()
+                        .flat_map(|&row| model.goal_hidden[row * 8..(row + 1) * 8].iter().copied())
+                        .collect::<Vec<_>>();
+                    insert_candle_var(&vars, &name, &values, (4, 8)).unwrap();
+                }
+                "mating_output" | "mating_bias" => {
+                    let width = if name == "mating_output" { 8 } else { 1 };
+                    let values = if width == 8 {
+                        &model.mating_output
+                    } else {
+                        &model.mating_bias
+                    };
+                    let mut legacy = vec![-0.4; 18 * width];
+                    for (row, source) in OLD_HEADS.into_iter().enumerate() {
+                        if let Some(source) = source {
+                            legacy[source * width..(source + 1) * width]
+                                .copy_from_slice(&values[row * width..(row + 1) * width]);
+                        }
+                    }
+                    if width == 8 {
+                        insert_candle_var(&vars, &name, &legacy, (18, 8)).unwrap();
+                    } else {
+                        insert_candle_var(&vars, &name, &legacy, (18,)).unwrap();
+                    }
+                }
+                _ => {
+                    vars.data().lock().unwrap().insert(
+                        name.clone(),
+                        Var::from_tensor(&tensors.load(&name, &Device::Cpu).unwrap()).unwrap(),
+                    );
+                }
+            }
+        }
+        vars.save(&old).unwrap();
+        drop(vars);
+        drop(tensors);
+        assert!(AzNnue::load(&old).is_err(), "旧模型须显式转换");
+        AzNnue::upgrade_mating_targets(&old, &output).unwrap();
+        let upgraded = AzNnue::load(&output).unwrap();
+        macro_rules! unchanged {
+            ($field:ident, [$($dim:expr),+], $decay:expr) => {
+                assert_eq!(model.$field, upgraded.$field, "{}", stringify!($field));
+            };
+        }
+        az_weight_tensors!(unchanged, 8);
+        assert_eq!(
+            AzNnue::upgrade_mating_targets(&old, &output)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(AzNnue::upgrade_mating_targets(&current, base.with_extension("invalid")).is_err());
+        for path in [current, old, output] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+}

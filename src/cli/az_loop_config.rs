@@ -448,11 +448,9 @@ mod tests {
         let defaults = AzLoopFileConfig::default();
         assert!(!defaults.mating_goal.enabled());
         assert!(!defaults.mating_goal_mix);
-        for target in [
-            chineseai::az::MatingTarget::None,
-            chineseai::az::MatingTarget::DoubleCannon,
-            chineseai::az::MatingTarget::IronBolt,
-        ] {
+        for target in std::iter::once(chineseai::az::MatingTarget::None)
+            .chain(chineseai::az::MatingTarget::ALL)
+        {
             let config = AzLoopFileConfig {
                 mating_goal: AzMatingGoal {
                     target,

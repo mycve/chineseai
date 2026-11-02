@@ -14,6 +14,7 @@ pub(crate) fn run() {
             std::process::exit(0);
         }
         Some(CliCommand::AzInit(cmd)) => az_init::run(cmd),
+        Some(CliCommand::AzUpgradeMatingTargets(cmd)) => az_init::upgrade_mating_targets(cmd),
         Some(CliCommand::AzPolicyScale(cmd)) => az_policy_scale::run(cmd),
         Some(CliCommand::AzCalibratePolicy(cmd)) => az_calibrate_policy::run(cmd),
         Some(CliCommand::AzSearch(cmd)) => az_search::run(cmd),

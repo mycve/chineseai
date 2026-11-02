@@ -307,7 +307,8 @@ pub(crate) fn mating_count_metrics(
             stats.unknown_games as f32,
         ),
     ];
-    for (i, name) in ["重炮", "铁门栓"].into_iter().enumerate() {
+    for (i, target) in chineseai::az::MatingTarget::ALL.into_iter().enumerate() {
+        let name = target.name();
         let attempts = stats.goal_attempts[i] as f32;
         metrics.extend([
             (format!("{prefix}/goal/{name}/attempts"), attempts),
@@ -326,6 +327,12 @@ pub(crate) fn mating_count_metrics(
                 stats.goal_successes[i] as f32 / attempts,
             ));
         }
+    }
+    for (i, side) in ["red", "black"].into_iter().enumerate() {
+        metrics.push((
+            format!("{prefix}/goal_side/{side}/attempts"),
+            stats.goal_side_attempts[i] as f32,
+        ));
     }
     if stats.games > 0 {
         metrics.extend([
@@ -378,7 +385,11 @@ mod tests {
                 ..Default::default()
             };
             batch.pattern_counts[0] = count;
-            batch.pattern_counts[1] = count;
+            let horse = chineseai::xiangqi::MatingPattern::ALL
+                .iter()
+                .position(|p| *p == chineseai::xiangqi::MatingPattern::HorseCannon)
+                .unwrap();
+            batch.pattern_counts[horse] = count;
             total.add_assign(&batch);
         }
         let metrics = mating_count_metrics(&total, "mating_total")
@@ -449,7 +460,11 @@ mod tests {
         report.mating.labeled_games = 3;
         report.mating.unknown_games = 1;
         report.mating.pattern_counts[0] = 2;
-        report.mating.pattern_counts[1] = 2;
+        let horse = chineseai::xiangqi::MatingPattern::ALL
+            .iter()
+            .position(|p| *p == chineseai::xiangqi::MatingPattern::HorseCannon)
+            .unwrap();
+        report.mating.pattern_counts[horse] = 2;
         report.mating_samples = 5;
         report.mating_target_sum[0] = 2.0;
         report.mating_pred_sum[0] = 3.0;

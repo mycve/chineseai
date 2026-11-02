@@ -45,7 +45,7 @@ pub struct AzLoopConfig {
     pub moves_left_params: AzMovesLeftParams,
     pub mate_search_plies: usize,
     pub mating_goal: AzMatingGoal,
-    /// 训练时按盘混合普通争胜、重炮和铁门栓，具体指令仍在盘内保持不变。
+    /// 每盘约 1/3 普通争胜，其余在固定 14 种目标中均匀采样，执行方与强度不变。
     pub mating_goal_mix: bool,
 }
 

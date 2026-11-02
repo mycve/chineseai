@@ -201,7 +201,11 @@ fn print_uci_id() {
     println!("option name OpeningTemperature type string default {DEFAULT_OPENING_TEMPERATURE}");
     println!("option name DrawScore type string default 0.0");
     println!(
-        "option name MatingTarget type combo default none var none var double-cannon var iron-bolt"
+        "option name MatingTarget type combo default none var none{}",
+        MatingTarget::ALL
+            .iter()
+            .map(|t| format!(" var {}", t.key().replace('_', "-")))
+            .collect::<String>()
     );
     println!("option name MatingStrength type string default 0.0");
     println!("option name MatingSide type combo default red var red var black");

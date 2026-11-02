@@ -226,10 +226,11 @@ fn mating_line(report: &AzLoopReport) -> String {
     } else {
         "NA".into()
     };
-    let goal_counts = ["重炮", "铁门栓"]
+    let goal_counts = chineseai::az::MatingTarget::ALL
         .into_iter()
         .enumerate()
-        .filter_map(|(i, name)| {
+        .filter_map(|(i, target)| {
+            let name = target.name();
             let attempts = stats.goal_attempts[i];
             (attempts > 0).then(|| {
                 format!(
@@ -244,7 +245,7 @@ fn mating_line(report: &AzLoopReport) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "本批杀法：实际将死={} 困毙={} 未知={} 覆盖={} CE={}/{} 目标CE={}/{} {} 计数(批内全部%/批内将死%)：{}",
+        "本批杀法：实际将死={} 困毙={} 未知={} 覆盖={} CE={}/{} 目标CE={}/{} 目标执行红/黑={}/{} {} 计数(批内全部%/批内将死%)：{}",
         stats.checkmates,
         stats.stalemates,
         stats.unknown_games,
@@ -253,6 +254,8 @@ fn mating_line(report: &AzLoopReport) -> String {
         report.mating_samples,
         goal_loss,
         report.goal_samples,
+        stats.goal_side_attempts[0],
+        stats.goal_side_attempts[1],
         goal_counts,
         if counts.is_empty() {
             "无匹配标签"
@@ -274,7 +277,11 @@ mod tests {
         report.mating.unknown_games = 2;
         report.mating.labeled_games = 2;
         report.mating.pattern_counts[0] = 2;
-        report.mating.pattern_counts[1] = 2;
+        let horse = chineseai::xiangqi::MatingPattern::ALL
+            .iter()
+            .position(|p| *p == chineseai::xiangqi::MatingPattern::HorseCannon)
+            .unwrap();
+        report.mating.pattern_counts[horse] = 2;
         let line = mating_line(&report);
         assert!(line.contains("实际将死=2 困毙=0 未知=2 覆盖=50.0%"));
         assert!(line.contains("重炮=2(50.0%/100.0%)"));

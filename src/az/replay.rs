@@ -159,11 +159,7 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
         replay_push_f32(out, target);
     }
     replay_push_f32(out, sample.mating_weight);
-    out.push(match sample.mating_goal.target {
-        MatingTarget::None => 0,
-        MatingTarget::DoubleCannon => 1,
-        MatingTarget::IronBolt => 2,
-    });
+    out.push(sample.mating_goal.target as u8);
     out.push(match sample.mating_goal.side {
         crate::xiangqi::Color::Red => 0,
         crate::xiangqi::Color::Black => 1,
@@ -328,17 +324,8 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
             "invalid mating target",
         ));
     }
-    let target = match reader.read_u8()? {
-        0 => MatingTarget::None,
-        1 => MatingTarget::DoubleCannon,
-        2 => MatingTarget::IronBolt,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid goal target code",
-            ));
-        }
-    };
+    let target = MatingTarget::from_code(reader.read_u8()?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid goal target code"))?;
     let side = match reader.read_u8()? {
         0 => crate::xiangqi::Color::Red,
         1 => crate::xiangqi::Color::Black,
@@ -990,6 +977,27 @@ mod tests {
                 start_source: source,
                 ..AzSampleMeta::default()
             },
+        }
+    }
+
+    #[test]
+    fn every_mating_target_roundtrips_in_replay_with_stable_old_codes() {
+        assert_eq!(MatingTarget::DoubleCannon as u8, 1);
+        assert_eq!(MatingTarget::IronBolt as u8, 2);
+        for target in MatingTarget::ALL {
+            let mut original = sample(AzStartSource::OpeningBook, 1, 77);
+            original.mating_goal = AzMatingGoal {
+                target,
+                side: crate::xiangqi::Color::Black,
+                strength: 0.8,
+            };
+            original.goal_target = 1.0;
+            original.goal_weight = 1.0;
+            let mut bytes = Vec::new();
+            encode_az_training_sample(&mut bytes, &original).unwrap();
+            let decoded = decode_az_training_sample(&mut Cursor::new(bytes)).unwrap();
+            assert_eq!(decoded.mating_goal, original.mating_goal);
+            assert_eq!((decoded.goal_target, decoded.goal_weight), (1.0, 1.0));
         }
     }
 

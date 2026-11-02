@@ -1,6 +1,15 @@
 use crate::cli::args::*;
 use chineseai::az::AzNnue;
 
+pub(crate) fn upgrade_mating_targets(cmd: AzUpgradeMatingTargetsArgs) {
+    AzNnue::upgrade_mating_targets(&cmd.input, &cmd.output)
+        .unwrap_or_else(|err| panic!("杀法目标扩容失败: {err}"));
+    println!(
+        "模型已转换至 v55、14 种具名杀法：{} -> {}。保留主干、WDL、策略和原目标权重，重排杀法统计头；请使用新配置路径重建优化器及经验池。",
+        cmd.input, cmd.output
+    );
+}
+
 pub(crate) fn run(cmd: AzInitArgs) {
     let arch = cmd.arch();
     let output = cmd.output;

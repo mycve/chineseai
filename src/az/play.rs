@@ -380,10 +380,10 @@ fn choose_selfplay_goal(config: &AzLoopConfig, rng: &mut SplitMix64) -> AzMating
         return config.mating_goal;
     }
     AzMatingGoal {
-        target: match rng.next_u64() % 3 {
-            0 => MatingTarget::None,
-            1 => MatingTarget::DoubleCannon,
-            _ => MatingTarget::IronBolt,
+        target: if rng.next_u64() % 3 == 0 {
+            MatingTarget::None
+        } else {
+            MatingTarget::ALL[rng.next_u64() as usize % MatingTarget::ALL.len()]
         },
         ..config.mating_goal
     }
@@ -1600,8 +1600,8 @@ mod tests {
                 .iter()
                 .all(|s| s.goal_weight == 0.0 && s.goal_target == 0.0)
         );
-        assert_eq!(data.mating.goal_attempts, [1, 0]);
-        assert_eq!(data.mating.goal_unknown, [1, 0]);
+        assert_eq!(data.mating.goal_attempts[..2], [1, 0]);
+        assert_eq!(data.mating.goal_unknown[..2], [1, 0]);
     }
 
     #[test]
@@ -1614,14 +1614,21 @@ mod tests {
         };
         config.mating_goal_mix = true;
         let mut rng = SplitMix64::new(17);
-        let mut counts = [0; 3];
-        for _ in 0..300 {
+        let mut counts = [0; crate::az::MATING_TARGET_COUNT + 1];
+        for _ in 0..3000 {
             let goal = choose_selfplay_goal(&config, &mut rng);
             assert_eq!(goal.side, Color::Black);
             assert_eq!(goal.strength, 0.6);
             counts[goal.target.index().map_or(0, |index| index + 1)] += 1;
         }
-        assert!(counts.iter().all(|&count| count > 0));
+        assert!((850..1150).contains(&counts[0]));
+        assert!(counts[1..].iter().all(|&count| (50..250).contains(&count)));
+        config.mating_goal_mix = false;
+        config.mating_goal.target = MatingTarget::HorseCannon;
+        for _ in 0..100 {
+            let goal = choose_selfplay_goal(&config, &mut rng);
+            assert_eq!(goal, config.mating_goal);
+        }
     }
 
     #[test]
@@ -1645,13 +1652,72 @@ mod tests {
         .into();
         let data = generate_selfplay_data(&AzNnue::random(8, 532), &config);
         assert_eq!(data.mating.checkmates, 1);
-        assert_eq!(data.mating.goal_attempts, [1, 0]);
-        assert_eq!(data.mating.goal_successes, [1, 0]);
-        assert_eq!(data.mating.goal_unknown, [0, 0]);
+        assert_eq!(data.mating.goal_attempts[..2], [1, 0]);
+        assert_eq!(data.mating.goal_successes[..2], [1, 0]);
+        assert_eq!(data.mating.goal_unknown[..2], [0, 0]);
         assert!(!data.samples.is_empty());
         assert!(data.samples.iter().all(|s| s.goal_target == 1.0
             && s.goal_weight == 1.0
             && s.mating_goal == config.mating_goal));
+    }
+
+    #[test]
+    fn new_named_goals_complete_selfplay_and_supervise_the_correct_owner() {
+        for (fen, target, side) in [
+            (
+                "3k5/1R7/9/2N6/9/9/9/9/9/4K4 w",
+                MatingTarget::HighAnglerHorse,
+                Color::Red,
+            ),
+            (
+                "4k4/9/9/9/9/9/6n2/9/7r1/5K3 b",
+                MatingTarget::HighAnglerHorse,
+                Color::Black,
+            ),
+            (
+                "4ka3/9/2N6/7N1/9/9/9/9/9/3K5 w",
+                MatingTarget::DoubleHorse,
+                Color::Red,
+            ),
+            (
+                "4k4/R6R1/9/9/9/9/9/9/9/3K5 w",
+                MatingTarget::CrossRooks,
+                Color::Red,
+            ),
+        ] {
+            let position = Position::from_fen(fen).unwrap();
+            let mut config = selfplay_test_config(1);
+            config.max_plies = 1;
+            config.simulations = 32;
+            config.mating_goal = AzMatingGoal {
+                target,
+                side,
+                strength: 0.8,
+            };
+            config.opening_positions = vec![AzStartSnapshot {
+                rule_history: position.initial_rule_history(),
+                position,
+                phase_ply: 0,
+                generation: 0,
+            }]
+            .into();
+            let data = generate_selfplay_data(&AzNnue::random(8, 1901), &config);
+            let index = target.index().unwrap();
+            assert_eq!(data.mating.goal_successes[index], 1, "{target:?} {side:?}");
+            assert_eq!(
+                data.mating.goal_side_attempts[usize::from(side == Color::Black)],
+                1
+            );
+            assert!(!data.samples.is_empty());
+            assert!(
+                data.samples
+                    .iter()
+                    .all(|s| s.mating_goal == config.mating_goal
+                        && s.goal_target == 1.0
+                        && s.goal_weight == 1.0
+                        && s.mating_targets[index] == 1.0)
+            );
+        }
     }
 
     #[test]
@@ -1981,11 +2047,11 @@ mod tests {
         assert_eq!(data.samples.len(), 1);
         let sample = &data.samples[0];
         assert_eq!(sample.mating_weight, 1.0);
-        let rook_index = MatingPattern::ALL
+        let iron_bolt_index = MatingPattern::ALL
             .iter()
-            .position(|&p| p == MatingPattern::RookCheck)
+            .position(|&p| p == MatingPattern::IronBolt)
             .unwrap();
-        assert_eq!(sample.mating_targets[rook_index], 1.0);
+        assert_eq!(sample.mating_targets[iron_bolt_index], 1.0);
         assert_eq!(sample.value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(sample.value_weight, 1.0);
         let policy = sample
@@ -2348,12 +2414,12 @@ mod tests {
 
     #[test]
     fn mating_targets_use_the_winning_side_and_preserve_overlapping_patterns() {
-        let position = Position::from_fen("2bakab2/9/9/4C4/9/4C4/9/9/9/4K4 b").unwrap();
+        let position = Position::from_fen("4ka3/6N2/2N6/9/9/9/9/9/9/3K5 b").unwrap();
         let classification = position.classify_mate().unwrap();
         let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
         finalize_mating_targets(&mut samples, Some(&classification), true);
         assert!(samples.iter().all(|sample| sample.mating_weight == 1.0));
-        for pattern in [MatingPattern::DoubleCannon, MatingPattern::CannonCheck] {
+        for pattern in [MatingPattern::DoubleHorse, MatingPattern::ElbowHorse] {
             let index = MatingPattern::ALL
                 .iter()
                 .position(|&p| p == pattern)

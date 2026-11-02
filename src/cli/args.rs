@@ -21,6 +21,8 @@ pub(crate) struct Cli {
 pub(crate) enum CliCommand {
     /// Create a random AZ-NNUE model.
     AzInit(AzInitArgs),
+    /// 将 v54 双杀法模型扩容为多目标模型，保留原有权重。
+    AzUpgradeMatingTargets(AzUpgradeMatingTargetsArgs),
     /// Scale one policy component for structural ablation.
     AzPolicyScale(AzPolicyScaleArgs),
     /// 冻结网络，校准已有策略因子并保存新模型。
@@ -37,6 +39,12 @@ pub(crate) enum CliCommand {
     MateClassify(MateClassifyArgs),
     /// 冻结模型共享主干，拟合杀法线性探针并在整盘留出集评估。
     AzMatingProbe(AzMatingProbeArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct AzUpgradeMatingTargetsArgs {
+    pub(crate) input: String,
+    pub(crate) output: String,
 }
 
 #[derive(Args, Debug)]
@@ -187,7 +195,7 @@ pub(crate) struct AzSearchArgs {
     /// Scale non-terminal network values during search; 0 isolates policy priors.
     #[arg(long, default_value_t = 1.0)]
     pub(crate) value_scale: f32,
-    /// 指定杀法：none、double-cannon（重炮）、iron-bolt（铁门栓）。
+    /// 指定杀法，例如 double-cannon、iron-bolt、horse-cannon、elbow-horse；none 关闭。
     #[arg(long, default_value = "none")]
     pub(crate) mating_target: chineseai::az::MatingTarget,
     /// 杀法偏好强度，范围 0..1；0 关闭偏好。
