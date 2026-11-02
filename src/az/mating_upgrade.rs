@@ -1,4 +1,4 @@
-//! v54 双目标检查点的显式一次性扩容；普通加载器只接受当前格式。
+//! v54/v55 检查点的显式一次性升级；普通加载器只接受当前格式。
 use std::{fs, io, path::Path};
 
 use candle_core::{Device, Var};
@@ -52,20 +52,22 @@ impl AzNnue {
             candle_core::safetensors::MmapedSafetensors::new(input.as_ref())
                 .map_err(candle_io_error)?
         };
-        if load_candle_f32_tensor(&tensors, "az_model_format_version")? != [54.0] {
+        let version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
+        let legacy = version == [54.0];
+        if !legacy && version != [55.0] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "杀法扩容仅接受 v54 模型",
+                "杀法升级仅接受 v54/v55 模型",
             ));
         }
         let old = tensors
             .load("goal_hidden", &Device::Cpu)
             .map_err(candle_io_error)?;
         let (rows, hidden) = old.dims2().map_err(candle_io_error)?;
-        if rows != 4 || hidden == 0 {
+        if rows != if legacy { 4 } else { GOAL_CONTEXT_SIZE } || hidden == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "v54 goal_hidden 应为 [4, hidden]",
+                "旧模型 goal_hidden 形状无效",
             ));
         }
         let old = old
@@ -73,12 +75,17 @@ impl AzNnue {
             .and_then(|t| t.to_vec1::<f32>())
             .map_err(candle_io_error)?;
         let mut expanded = vec![0.0; GOAL_CONTEXT_SIZE * hidden];
-        for (source, destination) in [
-            (0, 0),
-            (1, 1),
-            (2, MATING_TARGET_COUNT),
-            (3, MATING_TARGET_COUNT + 1),
-        ] {
+        let mapping = if legacy {
+            vec![
+                (0, 0),
+                (1, 1),
+                (2, MATING_TARGET_COUNT),
+                (3, MATING_TARGET_COUNT + 1),
+            ]
+        } else {
+            (0..GOAL_CONTEXT_SIZE).map(|row| (row, row)).collect()
+        };
+        for (source, destination) in mapping {
             expanded[destination * hidden..(destination + 1) * hidden]
                 .copy_from_slice(&old[source * hidden..(source + 1) * hidden]);
         }
@@ -94,12 +101,12 @@ impl AzNnue {
                 "goal_hidden" => {
                     insert_candle_var(&vars, &name, &expanded, (GOAL_CONTEXT_SIZE, hidden))?
                 }
-                "mating_output" => {
+                "mating_output" if legacy => {
                     let values =
                         remap_heads(&load_candle_f32_tensor(&tensors, &name)?, hidden, 0.0)?;
                     insert_candle_var(&vars, &name, &values, (MATING_HEAD_SIZE, hidden))?;
                 }
-                "mating_bias" => {
+                "mating_bias" if legacy => {
                     let values = remap_heads(&load_candle_f32_tensor(&tensors, &name)?, 1, -4.0)?;
                     insert_candle_var(&vars, &name, &values, (MATING_HEAD_SIZE,))?;
                 }
@@ -110,6 +117,12 @@ impl AzNnue {
                 }
             }
         }
+        insert_candle_var(
+            &vars,
+            "goal_scale",
+            &vec![0.0; GOAL_CONTEXT_SIZE * hidden],
+            (GOAL_CONTEXT_SIZE, hidden),
+        )?;
         // 先独占创建，拒绝覆盖输入、已有输出或其他检查点。
         fs::OpenOptions::new()
             .write(true)
@@ -137,7 +150,7 @@ mod tests {
             std::env::temp_dir().join(format!("chineseai-goal-upgrade-{}", std::process::id()));
         let current = base.with_extension("current.safetensors");
         let old = base.with_extension("v54.safetensors");
-        let output = base.with_extension("v55.safetensors");
+        let output = base.with_extension("v56.safetensors");
         let mut model = AzNnue::random(8, 1900);
         let rows = [0, 1, MATING_TARGET_COUNT, MATING_TARGET_COUNT + 1];
         for (i, &row) in rows.iter().enumerate() {
@@ -158,6 +171,7 @@ mod tests {
                 "az_model_format_version" => {
                     insert_candle_var(&vars, &name, &[54.0], (1,)).unwrap()
                 }
+                "goal_scale" => {}
                 "goal_hidden" => {
                     let values = rows
                         .iter()
@@ -212,6 +226,58 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert!(AzNnue::upgrade_mating_targets(&current, base.with_extension("invalid")).is_err());
+        for path in [current, old, output] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    #[test]
+    fn v55_upgrade_keeps_all_learned_weights_and_initializes_an_identity_gate() {
+        let base =
+            std::env::temp_dir().join(format!("chineseai-v55-gate-upgrade-{}", std::process::id()));
+        let current = base.with_extension("current.safetensors");
+        let old = base.with_extension("v55.safetensors");
+        let output = base.with_extension("v56.safetensors");
+        let mut model = AzNnue::random(8, 1903);
+        for (i, value) in model.goal_hidden.iter_mut().enumerate() {
+            *value = (i + 1) as f32 * 0.003;
+        }
+        model.goal_output.fill(0.2);
+        model.save(&current).unwrap();
+        let tensors =
+            unsafe { candle_core::safetensors::MmapedSafetensors::new(&current).unwrap() };
+        let vars = VarMap::new();
+        for (name, _) in tensors.tensors() {
+            match name.as_str() {
+                "goal_scale" => {}
+                "az_model_format_version" => {
+                    insert_candle_var(&vars, &name, &[55.0], (1,)).unwrap()
+                }
+                _ => {
+                    vars.data().lock().unwrap().insert(
+                        name.clone(),
+                        Var::from_tensor(&tensors.load(&name, &Device::Cpu).unwrap()).unwrap(),
+                    );
+                }
+            }
+        }
+        vars.save(&old).unwrap();
+        drop(vars);
+        drop(tensors);
+        assert!(AzNnue::load(&old).is_err());
+        AzNnue::upgrade_mating_targets(&old, &output).unwrap();
+        let upgraded = AzNnue::load(&output).unwrap();
+        macro_rules! unchanged {
+            ($field:ident, [$($dim:expr),+], $decay:expr) => {
+                assert_eq!(model.$field, upgraded.$field, "{}", stringify!($field));
+            };
+        }
+        az_weight_tensors!(unchanged, 8);
+        assert!(
+            upgraded
+                .goal_scale_activation
+                .iter()
+                .all(|value| *value == 0.0)
+        );
         for path in [current, old, output] {
             fs::remove_file(path).unwrap();
         }

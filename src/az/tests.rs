@@ -1218,11 +1218,12 @@ fn nonfinite_goal_heads_are_rejected_when_loading() {
         "chineseai-invalid-goal-{}.safetensors",
         std::process::id()
     ));
-    for field in 0..3 {
+    for field in 0..4 {
         let mut model = AzNnue::random(8, 54);
         match field {
             0 => model.goal_hidden[0] = f32::NAN,
             1 => model.goal_output[0] = f32::INFINITY,
+            2 => model.goal_scale[0] = f32::NAN,
             _ => model.goal_bias[0] = f32::NEG_INFINITY,
         }
         model.save(&path).unwrap();

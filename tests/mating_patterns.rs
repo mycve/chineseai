@@ -464,3 +464,283 @@ fn attacker_in_check_is_not_a_valid_mating_position() {
     assert!(position.in_check(Color::Black));
     assert!(position.classify_mate().is_none());
 }
+
+// 每类独立核对关键参与子：删掉它后，原终局不能继续被标为该杀法。
+// 同时核对目标头/识别器的全排列对应、执行方和资源屏蔽，防止只覆盖常见类别。
+#[test]
+fn every_named_goal_has_a_causal_piece_and_correct_owner_in_all_orientations() {
+    use chineseai::az::{AzMatingGoal, MatingTarget};
+    let cases = [
+        (
+            MatingTarget::DoubleCannon,
+            "2bakab2/9/9/4C4/9/4C4/9/9/9/4K4 b",
+            "e6",
+        ),
+        (
+            MatingTarget::IronBolt,
+            "2bakR3/4a4/4b4/4C4/9/9/9/9/9/5K3 b",
+            "e6",
+        ),
+        (
+            MatingTarget::HorseCannon,
+            "4k4/9/4N4/9/9/9/4C4/9/9/4K4 b",
+            "e7",
+        ),
+        (
+            MatingTarget::HeavenEarthCannon,
+            "C1b1k4/1P2a4/4b4/9/4C4/9/9/9/9/4K4 b",
+            "e5",
+        ),
+        (
+            MatingTarget::SmotheredCannon,
+            "4kaC2/4a4/9/9/9/9/9/9/9/5K3 b",
+            "f9",
+        ),
+        (
+            MatingTarget::WhiteFacedGeneral,
+            "3k2b2/3P5/1N7/9/9/9/9/9/9/4K4 b",
+            "e0",
+        ),
+        (
+            MatingTarget::ElbowHorse,
+            "3ak1b2/4a1N2/9/9/9/5R3/9/9/9/4K4 b",
+            "g8",
+        ),
+        (
+            MatingTarget::PalaceCornerHorse,
+            "3aka3/3P5/5N3/9/9/9/9/9/9/3K5 b",
+            "f7",
+        ),
+        (
+            MatingTarget::AnglerHorse,
+            "3Rk4/9/6N2/9/9/9/9/9/9/3K5 b",
+            "g7",
+        ),
+        (
+            MatingTarget::OctagonalHorse,
+            "3k5/9/5N3/9/9/9/9/9/3R5/5K3 b",
+            "f7",
+        ),
+        (
+            MatingTarget::HighAnglerHorse,
+            "1R1k5/9/9/2N6/9/9/9/9/9/4K4 b",
+            "c6",
+        ),
+        (
+            MatingTarget::DoubleHorse,
+            "4ka3/6N2/2N6/9/9/9/9/9/9/3K5 b",
+            "c7",
+        ),
+        (
+            MatingTarget::CrossRooks,
+            "R3k4/7R1/9/9/9/9/9/9/9/3K5 b",
+            "h8",
+        ),
+        (
+            MatingTarget::TwoGhosts,
+            "2b1kPb2/3P5/9/9/9/9/9/9/9/5K3 b",
+            "d8",
+        ),
+    ];
+    assert_eq!(cases.map(|case| case.0), MatingTarget::ALL);
+    for (target, fen, critical) in cases {
+        let position = Position::from_fen(fen).unwrap();
+        assert_scene(fen, &[], &[target.pattern().unwrap()]);
+        let sq = (9 - usize::from(critical.as_bytes()[1] - b'0')) * 9
+            + usize::from(critical.as_bytes()[0] - b'a');
+        let mut altered = String::new();
+        for rank in 0..10 {
+            if rank > 0 {
+                altered.push('/');
+            }
+            let mut empty = 0;
+            for file in 0..9 {
+                let index = rank * 9 + file;
+                let piece = if index == sq {
+                    None
+                } else {
+                    position.piece_at(index)
+                };
+                // 白脸将保留双将合法性，把帅从 e0 移到 f0，解除对 e 路的控制。
+                let symbol = if target == MatingTarget::WhiteFacedGeneral && index == 86 {
+                    Some('K')
+                } else {
+                    piece.map(|piece| {
+                        let c = match piece.kind {
+                            PieceKind::General => 'k',
+                            PieceKind::Advisor => 'a',
+                            PieceKind::Elephant => 'b',
+                            PieceKind::Horse => 'n',
+                            PieceKind::Rook => 'r',
+                            PieceKind::Cannon => 'c',
+                            PieceKind::Soldier => 'p',
+                        };
+                        if piece.color == Color::Red {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c
+                        }
+                    })
+                };
+                if let Some(symbol) = symbol {
+                    if empty > 0 {
+                        altered.push(char::from(b'0' + empty));
+                        empty = 0;
+                    }
+                    altered.push(symbol);
+                } else {
+                    empty += 1;
+                }
+            }
+            if empty > 0 {
+                altered.push(char::from(b'0' + empty));
+            }
+        }
+        altered.push_str(" b");
+        let altered = Position::from_fen(&altered).unwrap();
+        for (board, counterexample) in [
+            (position.clone(), altered.clone()),
+            (position.mirror_files(), altered.mirror_files()),
+            (rotate_and_swap(&position), rotate_and_swap(&altered)),
+            (
+                rotate_and_swap(&position.mirror_files()),
+                rotate_and_swap(&altered.mirror_files()),
+            ),
+        ] {
+            assert!(
+                !counterexample.in_check(board.side_to_move().opposite()),
+                "illegal counterexample: {target:?}"
+            );
+            let before = board.clone();
+            let report = board.classify_mate().unwrap();
+            assert_eq!(before, board, "识别不能修改状态");
+            for selected in MatingTarget::ALL {
+                let goal = AzMatingGoal {
+                    target: selected,
+                    side: report.winner,
+                    strength: 0.8,
+                };
+                assert_eq!(
+                    goal.matches_mate(&report),
+                    report.patterns.contains(&selected.pattern().unwrap())
+                );
+                assert!(
+                    !AzMatingGoal {
+                        side: report.winner.opposite(),
+                        ..goal
+                    }
+                    .matches_mate(&report)
+                );
+                if goal.matches_mate(&report) {
+                    assert!(goal.effective(&board).enabled());
+                }
+            }
+            assert!(
+                !counterexample
+                    .classify_mate()
+                    .is_some_and(|report| report.patterns.contains(&target.pattern().unwrap())),
+                "{target:?}: {}",
+                counterexample.to_fen()
+            );
+        }
+    }
+}
+
+#[test]
+fn reported_rook_protected_by_g7_horse_is_angler_not_high_angler() {
+    use chineseai::az::{AzMatingGoal, MatingTarget};
+    // 用户实战反馈：另一 App 称“列马车”；g7 马保 f9 车并封 e8，不在 g6 高钓位。
+    let fen = "4kR3/9/6N2/9/2b1P1b2/9/9/9/4K4/2B2A3 b - - 0 1";
+    assert_scene(fen, &[], &[MatingPattern::AnglerHorse]);
+    let position = Position::from_fen(fen).unwrap();
+    let report = position.classify_mate().unwrap();
+    assert_eq!(report.patterns, [MatingPattern::AnglerHorse]);
+    let goal = AzMatingGoal {
+        target: MatingTarget::HighAnglerHorse,
+        side: Color::Red,
+        strength: 0.8,
+    };
+    assert!(
+        !goal.matches_mate(&report),
+        "指定高钓马不能把普通钓鱼马算成功"
+    );
+    assert!(
+        AzMatingGoal {
+            target: MatingTarget::AnglerHorse,
+            ..goal
+        }
+        .matches_mate(&report)
+    );
+}
+
+#[test]
+fn capturing_the_checking_cannon_is_a_defense_even_if_the_king_has_no_escape() {
+    let position = Position::from_fen("2bakab2/9/9/4C4/9/4C2r1/9/9/9/4K4 b").unwrap();
+    for position in [
+        position.clone(),
+        position.mirror_files(),
+        rotate_and_swap(&position),
+    ] {
+        assert!(position.in_check(position.side_to_move()));
+        assert!(position.classify_mate().is_none());
+    }
+    let capture = position
+        .parse_uci_move("h4e4")
+        .expect("可以吃掉将军炮解除将军");
+    let mut defended = position;
+    defended.make_move(capture);
+    assert!(!defended.in_check(Color::Black));
+}
+
+#[test]
+fn an_unrelated_second_cannon_does_not_turn_smothered_mate_into_double_cannon() {
+    let fen = "4kaC2/4a4/9/9/9/7C1/9/9/9/5K3 b";
+    assert_scene(fen, &[], &[MatingPattern::SmotheredCannon]);
+    let position = Position::from_fen(fen).unwrap();
+    for position in [
+        position.clone(),
+        position.mirror_files(),
+        rotate_and_swap(&position),
+    ] {
+        let report = position.classify_mate().unwrap();
+        assert!(!report.patterns.contains(&MatingPattern::DoubleCannon));
+        assert!(!report.patterns.contains(&MatingPattern::HeavenEarthCannon));
+    }
+}
+
+#[test]
+fn a_distant_horse_screen_is_not_the_horse_cannon_killing_mechanism() {
+    let fen = "4k4/9/9/9/4N4/9/9/4C4/3R1R3/4K4 b";
+    assert_scene(fen, &[], &[]);
+    let position = Position::from_fen(fen).unwrap();
+    for position in [
+        position.clone(),
+        position.mirror_files(),
+        rotate_and_swap(&position),
+    ] {
+        assert!(
+            !position
+                .classify_mate()
+                .unwrap()
+                .patterns
+                .contains(&MatingPattern::HorseCannon)
+        );
+    }
+}
+
+#[test]
+fn a_blocked_high_angler_horse_cannot_close_the_king_escape() {
+    let position = Position::from_fen("1R1k5/9/2p6/2N6/9/9/9/9/9/4K4 b").unwrap();
+    assert!(position.in_check(Color::Black));
+    assert!(
+        position.parse_uci_move("d9d8").is_some(),
+        "c7 卒堵住 c6 马腿，d8 可逃"
+    );
+    for position in [
+        position.clone(),
+        position.mirror_files(),
+        rotate_and_swap(&position),
+    ] {
+        assert!(position.classify_mate().is_none());
+    }
+}

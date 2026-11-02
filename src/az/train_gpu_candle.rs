@@ -403,9 +403,15 @@ impl GpuReplica {
             .gt(0.0)?
             .to_dtype(candle_core::DType::F32)?;
         let goal_ce = (&goal_ce_per_sample * &valid_goal)?.sum_all()?;
+        // 总损失最后除以 batch_len；这里抵消无目标/未知样本造成的任务权重稀释。
+        let goal_normalizer = if batch_tensors.goal_weight_sum > 0.0 {
+            batch_len as f64 / batch_tensors.goal_weight_sum as f64
+        } else {
+            0.0
+        };
         let weighted_goal_ce = (&goal_ce_per_sample * &batch_tensors.goal_weights)?
             .sum_all()?
-            .affine(goal_weight.max(0.0) as f64, 0.0)?;
+            .affine(goal_weight.max(0.0) as f64 * goal_normalizer, 0.0)?;
         let goal_probs = candle_nn::ops::sigmoid(&forward.goal_logits.detach())?.squeeze(1)?;
         let goal_targets = batch_tensors.goal_targets.squeeze(1)?;
         let moves_left_prediction = forward.moves_left.squeeze(1)?;
@@ -726,6 +732,56 @@ mod monitoring_tests {
             goal_weight: 1.0,
             search_simulations: 0,
             meta: Default::default(),
+        }
+    }
+
+    #[test]
+    fn masked_rows_do_not_dilute_goal_learning_strength_or_gradients() {
+        let mut model = AzNnue::random(8, 1902);
+        model.goal_output.fill(0.1);
+        let replica = GpuReplica::new_cpu(&model).unwrap();
+        let sample = goal_sample();
+        let mut unknown = sample.clone();
+        unknown.goal_weight = 0.0;
+        unknown.goal_target = f32::NAN;
+        let mut reference: Option<(f32, Vec<Vec<f32>>)> = None;
+        for samples in [
+            vec![sample.clone()],
+            vec![sample.clone(), unknown.clone(), unknown],
+        ] {
+            let batch = BatchTensors::from_packed(
+                PackedBatch::from_indices(&samples, &(0..samples.len()).collect::<Vec<_>>()),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let output = replica
+                .compute_batch_loss(&batch, samples.len(), 0.0, 0.0, 0.0, 0.1)
+                .unwrap();
+            let loss = output.loss_tensor.to_scalar::<f32>().unwrap();
+            let grads = output.loss_tensor.backward().unwrap();
+            let gradients = replica
+                .model
+                .all_vars()
+                .iter()
+                .map(|var| {
+                    grads.get(var).map_or_else(
+                        || vec![0.0; var.elem_count()],
+                        |grad| grad.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some((previous_loss, previous_gradients)) = &reference {
+                assert!((loss - previous_loss).abs() < 1e-6);
+                for (actual, previous) in gradients
+                    .iter()
+                    .flatten()
+                    .zip(previous_gradients.iter().flatten())
+                {
+                    assert!((actual - previous).abs() < 1e-6);
+                }
+            } else {
+                reference = Some((loss, gradients));
+            }
         }
     }
 

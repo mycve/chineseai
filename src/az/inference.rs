@@ -465,6 +465,8 @@ pub struct AzNnue {
     pub mating_output: Vec<f32>,
     pub mating_bias: Vec<f32>,
     pub goal_hidden: Vec<f32>,
+    pub goal_scale: Vec<f32>,
+    pub(crate) goal_scale_activation: Vec<f32>,
     pub goal_output: Vec<f32>,
     pub goal_bias: Vec<f32>,
     pub(crate) moves_left_active: bool,
@@ -539,6 +541,8 @@ impl Clone for AzNnue {
             mating_output: self.mating_output.clone(),
             mating_bias: self.mating_bias.clone(),
             goal_hidden: self.goal_hidden.clone(),
+            goal_scale: self.goal_scale.clone(),
+            goal_scale_activation: self.goal_scale_activation.clone(),
             goal_output: self.goal_output.clone(),
             goal_bias: self.goal_bias.clone(),
             moves_left_active: self.moves_left_active,
@@ -646,6 +650,8 @@ impl AzNnue {
             mating_output: vec![0.0; MATING_HEAD_SIZE * hidden_size],
             mating_bias: vec![-4.0; MATING_HEAD_SIZE],
             goal_hidden: vec![0.0; GOAL_CONTEXT_SIZE * hidden_size],
+            goal_scale: vec![0.0; GOAL_CONTEXT_SIZE * hidden_size],
+            goal_scale_activation: Vec::new(),
             goal_output: vec![0.0; hidden_size],
             goal_bias: vec![-4.0],
             moves_left_active: false,
@@ -850,6 +856,8 @@ impl AzNnue {
             mating_output: load_candle_f32_tensor(&tensors, "mating_output")?,
             mating_bias: load_candle_f32_tensor(&tensors, "mating_bias")?,
             goal_hidden: load_candle_f32_tensor(&tensors, "goal_hidden")?,
+            goal_scale: load_candle_f32_tensor(&tensors, "goal_scale")?,
+            goal_scale_activation: Vec::new(),
             goal_output: load_candle_f32_tensor(&tensors, "goal_output")?,
             goal_bias: load_candle_f32_tensor(&tensors, "goal_bias")?,
             moves_left_active: false,
@@ -1163,38 +1171,55 @@ impl AzNnue {
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
         self.encode_shared_position(position, moves, rules, history, scratch);
+        let (goal_value, goal_active) = self.prepare_goal_encoding(position, scratch);
+        if goal_active {
+            std::mem::swap(&mut scratch.hidden, &mut scratch.goal_value_hidden);
+        }
         let (value_wdl, value) = self.evaluate_value_head(position, scratch);
-        let goal_value = self.prepare_goal_encoding(position, scratch);
+        let moves_left = self.moves_left_from_hidden(&scratch.hidden);
+        if goal_active {
+            std::mem::swap(&mut scratch.hidden, &mut scratch.goal_value_hidden);
+        }
         self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
         AzEvalOutput {
             value_wdl,
             value,
-            moves_left: self.moves_left_from_hidden(&scratch.hidden),
+            moves_left,
             goal_value,
         }
     }
 
-    fn prepare_goal_encoding(&self, position: &Position, scratch: &mut AzEvalScratch) -> f32 {
+    fn prepare_goal_encoding(
+        &self,
+        position: &Position,
+        scratch: &mut AzEvalScratch,
+    ) -> (f32, bool) {
         let goal = scratch.mating_goal.effective(position);
         scratch.goal_policy_active = goal.enabled() && goal.side == position.side_to_move();
         if !goal.enabled() {
-            return 0.0;
+            return (0.0, false);
         }
         // 指令编码只有一个非零项，直接读取对应行，避免每通道扫描全部 28 项。
         let role = usize::from(goal.side != position.side_to_move());
         let index = role * MATING_TARGET_COUNT + goal.target.index().unwrap();
         let weights = &self.goal_hidden[index * self.hidden_size..(index + 1) * self.hidden_size];
+        let scales =
+            &self.goal_scale_activation[index * self.hidden_size..(index + 1) * self.hidden_size];
         scratch.goal_hidden.resize(self.hidden_size, 0.0);
+        scratch.goal_value_hidden.resize(self.hidden_size, 0.0);
         for (channel, hidden) in scratch.goal_hidden.iter_mut().enumerate() {
-            *hidden = (scratch.hidden[channel] + goal.strength * weights[channel]).max(0.0);
+            let value_hidden = scratch.hidden[channel] * (1.0 + goal.strength * scales[channel]);
+            scratch.goal_value_hidden[channel] = value_hidden;
+            *hidden = (value_hidden + goal.strength * weights[channel]).max(0.0);
         }
         let logit = self.goal_bias[0] + dot_product(&scratch.goal_hidden, &self.goal_output);
-        if logit >= 0.0 {
+        let probability = if logit >= 0.0 {
             1.0 / (1.0 + (-logit).exp())
         } else {
             let exp = logit.exp();
             exp / (1.0 + exp)
-        }
+        };
+        (probability, true)
     }
 
     pub(crate) fn input_embedding_linear_into_slice(&self, features: &[usize], hidden: &mut [f32]) {
@@ -1270,6 +1295,7 @@ impl AzNnue {
         if self
             .goal_hidden
             .iter()
+            .chain(&self.goal_scale)
             .chain(&self.goal_output)
             .chain(&self.goal_bias)
             .any(|x| !x.is_finite())
@@ -1364,7 +1390,7 @@ pub fn goal_outputs_for_training_sample(
     Some((output.goal_value, scratch.logits))
 }
 
-fn evaluate_training_sample(
+pub(super) fn evaluate_training_sample(
     model: &AzNnue,
     sample: &AzTrainingSample,
 ) -> Option<(AzEvalOutput, AzEvalScratch)> {
@@ -1557,5 +1583,41 @@ mod pair_compaction_tests {
             }
         }
         assert!(duplicated > 100);
+    }
+}
+
+#[cfg(test)]
+mod goal_gate_tests {
+    use super::*;
+
+    #[test]
+    fn multiplicative_goals_select_board_features_instead_of_only_a_goal_bias() {
+        let position = Position::startpos();
+        let mut model = AzNnue::random(8, 1901);
+        model.goal_output.fill(0.0);
+        model.goal_output[..2].fill(1.0);
+        model.goal_bias[0] = -3.0;
+        let mut scratch = AzEvalScratch::new(model.arch);
+        let mut probability = |model: &AzNnue, target, a, b| {
+            scratch.hidden.fill(0.0);
+            scratch.hidden[..2].copy_from_slice(&[a, b]);
+            scratch.mating_goal = AzMatingGoal {
+                target,
+                side: Color::Red,
+                strength: 0.8,
+            };
+            model.prepare_goal_encoding(&position, &mut scratch).0
+        };
+        let dc = MatingTarget::DoubleCannon;
+        let ib = MatingTarget::IronBolt;
+        assert_eq!(
+            probability(&model, dc, 2.0, 1.0),
+            probability(&model, ib, 2.0, 1.0)
+        );
+        model.goal_scale[..2].copy_from_slice(&[0.8, -0.8]);
+        model.goal_scale[8..10].copy_from_slice(&[-0.8, 0.8]);
+        model.rebuild_context();
+        assert!(probability(&model, dc, 2.0, 1.0) > probability(&model, ib, 2.0, 1.0));
+        assert!(probability(&model, dc, 1.0, 2.0) < probability(&model, ib, 1.0, 2.0));
     }
 }

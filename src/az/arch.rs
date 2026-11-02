@@ -548,6 +548,8 @@ macro_rules! az_weight_tensors {
         $visit!(policy_tactical, [POLICY_TACTICAL_SIZE], false);
         $visit!(policy_repetition_hidden, [$h], true);
         $visit!(policy_repetition_bias, [1], false);
+        // 追加参数以保持既有优化器参数索引。
+        $visit!(goal_scale, [$crate::az::GOAL_CONTEXT_SIZE, $h], true);
     };
 }
 

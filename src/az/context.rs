@@ -152,6 +152,7 @@ impl AzNnue {
 
     pub(crate) fn rebuild_context(&mut self) {
         self.context_active = self.context_hidden.iter().any(|&weight| weight != 0.0);
+        self.goal_scale_activation = self.goal_scale.iter().map(|value| value.tanh()).collect();
     }
 }
 

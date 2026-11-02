@@ -33,6 +33,7 @@ pub(super) struct AzCandleModel {
     mating_output: Var,
     mating_bias: Var,
     goal_hidden: Var,
+    goal_scale: Var,
     goal_output: Var,
     goal_bias: Var,
     threat_embedding: Var,
@@ -58,9 +59,24 @@ struct SharedEncoding {
 impl AzCandleModel {
     pub(super) fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
         let encoded = self.encode_shared(batch)?;
-        let value_logits = self.value_head(batch, &encoded)?;
+        // 乘性条件允许每种目标选择不同局面特征；零初始化保留旧模型行为。
+        let value_hidden = if batch.has_goals {
+            let scale = batch
+                .goal_features
+                .matmul(&self.goal_scale.tanh()?)?
+                .affine(1.0, 1.0)?;
+            (&encoded.hidden * scale)?
+        } else {
+            encoded.hidden.clone()
+        };
+        let value_encoded = SharedEncoding {
+            hidden: value_hidden,
+            board: encoded.board.clone(),
+            threat: encoded.threat.clone(),
+        };
+        let value_logits = self.value_head(batch, &value_encoded)?;
         let goal_hidden =
-            (&encoded.hidden + batch.goal_features.matmul(&self.goal_hidden)?)?.relu()?;
+            (&value_encoded.hidden + batch.goal_features.matmul(&self.goal_hidden)?)?.relu()?;
         let policy_hidden = if batch.has_policy_goals {
             batch
                 .goal_policy_mask
@@ -74,7 +90,7 @@ impl AzCandleModel {
         let goal_logits = goal_hidden
             .matmul(&self.goal_output.t()?)?
             .broadcast_add(&self.goal_bias)?;
-        let moves_left_raw = encoded
+        let moves_left_raw = value_encoded
             .hidden
             .matmul(&self.moves_left_output.t()?)?
             .broadcast_add(&self.moves_left_bias)?
@@ -217,6 +233,7 @@ pub(super) struct BatchTensors {
     pub(super) batch_size: usize,
     pub(super) has_mating_targets: bool,
     pub(super) has_goal_targets: bool,
+    pub(super) has_goals: bool,
     pub(super) has_policy_goals: bool,
     pub(super) value_buckets: Tensor,
     pub(super) feature_items: Tensor,
@@ -244,6 +261,7 @@ pub(super) struct BatchTensors {
     pub(super) goal_policy_bias: Tensor,
     pub(super) goal_targets: Tensor,
     pub(super) goal_weights: Tensor,
+    pub(super) goal_weight_sum: f32,
     pub(super) moves_left_pairs: Option<MovesLeftPairs>,
     pub(super) value_phase_masks: Tensor,
     pub(super) value_source_phase_masks: Tensor,
@@ -254,6 +272,8 @@ impl BatchTensors {
         let batch_size = packed.batch_size;
         let has_mating_targets = packed.mating_weights.iter().any(|&weight| weight > 0.0);
         let has_goal_targets = packed.goal_weights.iter().any(|&weight| weight > 0.0);
+        let goal_weight_sum = packed.goal_weights.iter().sum();
+        let has_goals = packed.goal_features.iter().any(|&value| value != 0.0);
         let has_policy_goals = packed.goal_policy_mask.iter().any(|&weight| weight > 0.0);
         let max_features = packed.max_features;
         let max_policy_moves = packed.max_policy_moves;
@@ -292,6 +312,7 @@ impl BatchTensors {
             batch_size,
             has_mating_targets,
             has_goal_targets,
+            has_goals,
             has_policy_goals,
             moves_left_pairs,
             value_buckets: Tensor::from_vec(packed.value_buckets, batch_size, device)?,
@@ -376,6 +397,7 @@ impl BatchTensors {
             )?,
             goal_targets: Tensor::from_vec(packed.goal_targets, (batch_size, 1), device)?,
             goal_weights: Tensor::from_vec(packed.goal_weights, batch_size, device)?,
+            goal_weight_sum,
             value_phase_masks: Tensor::from_vec(packed.value_phase_masks, (batch_size, 3), device)?,
             value_source_phase_masks: Tensor::from_vec(
                 packed.value_source_phase_masks,
@@ -436,6 +458,11 @@ impl AzCandleModel {
             mating_bias: var_from_slice(&model.mating_bias, super::MATING_HEAD_SIZE, device)?,
             goal_hidden: var_from_slice(
                 &model.goal_hidden,
+                (super::GOAL_CONTEXT_SIZE, hidden),
+                device,
+            )?,
+            goal_scale: var_from_slice(
+                &model.goal_scale,
                 (super::GOAL_CONTEXT_SIZE, hidden),
                 device,
             )?,
@@ -633,7 +660,7 @@ mod tests {
         model
     }
 
-    fn check_goal_conditioning_matches_cpu(device: &Device) {
+    fn check_goal_conditioning_matches_cpu(device: &Device, gated: bool) {
         use crate::{
             az::{AzMatingGoal, MatingTarget},
             xiangqi::Color,
@@ -692,7 +719,20 @@ mod tests {
         assert_eq!(packed.goal_policy_mask[..5], [1.0, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(packed.goal_targets[..5], [1.0, 1.0, 1.0, 1.0, 0.0]);
         let batch = BatchTensors::from_packed(packed, device).unwrap();
-        let model = conditioned_model();
+        let mut model = conditioned_model();
+        if gated {
+            model.value_head_hidden.fill(0.04);
+            model.value_head_bias.fill(0.5);
+            for (i, value) in model.value_head_output.iter_mut().enumerate() {
+                *value = ((i / super::super::VALUE_HEAD_SIZE) % 3) as f32 * 0.02;
+            }
+            model.moves_left_output.fill(0.01);
+            model.rebuild_moves_left();
+            for (i, value) in model.goal_scale.iter_mut().enumerate() {
+                *value = ((i % 7) as f32 - 3.0) * 0.2;
+            }
+            model.rebuild_context();
+        }
         let candle = AzCandleModel::from_model(&model, device).unwrap();
         let forward = candle.forward(&batch).unwrap();
         let goal_probs = candle_nn::ops::sigmoid(&forward.goal_logits)
@@ -720,9 +760,31 @@ mod tests {
             let (base_wdl, base_policy) =
                 crate::az::outputs_for_training_sample(&model, &ordinary).unwrap();
             let candle_wdl = crate::az::softmax_fixed3(wdl[row].clone().try_into().unwrap());
-            for (base, conditioned) in base_wdl.iter().zip(candle_wdl) {
-                assert!((base - conditioned).abs() < 2e-5);
+            let (cpu_wdl, _) = crate::az::outputs_for_training_sample(&model, sample).unwrap();
+            for (cpu, conditioned) in cpu_wdl.iter().zip(candle_wdl) {
+                assert!((cpu - conditioned).abs() < 2e-5, "gated={gated} row={row}");
             }
+            if !gated {
+                assert_eq!(cpu_wdl, base_wdl, "零门控精确保留旧 WDL");
+            } else if row == 0 {
+                assert!(
+                    cpu_wdl
+                        .iter()
+                        .zip(base_wdl)
+                        .any(|(a, b)| (a - b).abs() > 1e-7),
+                    "WDL 必须读到非零门控"
+                );
+            }
+            let (aux, hidden) =
+                crate::az::mating_outputs_for_training_sample(&model, sample).unwrap();
+            let (base_aux, base_hidden) =
+                crate::az::mating_outputs_for_training_sample(&model, &ordinary).unwrap();
+            assert_eq!(aux, base_aux);
+            assert_eq!(hidden, base_hidden);
+            let (cpu_eval, _) =
+                super::super::inference::evaluate_training_sample(&model, sample).unwrap();
+            let gpu_mlh = forward.moves_left.to_vec2::<f32>().unwrap()[row][0];
+            assert!((cpu_eval.moves_left / crate::az::MOVES_LEFT_SCALE - gpu_mlh).abs() < 2e-5);
             let side = if sample.side_sign > 0.0 {
                 Color::Red
             } else {
@@ -743,7 +805,12 @@ mod tests {
 
     #[test]
     fn goal_conditioning_matches_cpu_and_preserves_wdl_and_opponent_policy() {
-        check_goal_conditioning_matches_cpu(&Device::Cpu);
+        check_goal_conditioning_matches_cpu(&Device::Cpu, false);
+    }
+
+    #[test]
+    fn multiplicative_goal_conditioning_matches_cpu_on_all_targets_and_roles() {
+        check_goal_conditioning_matches_cpu(&Device::Cpu, true);
     }
 
     #[cfg(feature = "slow-tests")]
@@ -751,7 +818,8 @@ mod tests {
     fn goal_conditioning_matches_cpu_on_cuda() {
         let device =
             crate::az::cuda_test_device::shared_cuda_device().expect("CUDA device required");
-        check_goal_conditioning_matches_cpu(device);
+        check_goal_conditioning_matches_cpu(device, false);
+        check_goal_conditioning_matches_cpu(device, true);
     }
 
     #[test]
@@ -784,7 +852,9 @@ mod tests {
             az::{AzMatingGoal, MatingTarget},
             xiangqi::Color,
         };
-        let model = conditioned_model();
+        let mut model = conditioned_model();
+        model.goal_scale.fill(0.6);
+        model.rebuild_context();
         let active = AzMatingGoal {
             target: MatingTarget::DoubleCannon,
             side: Color::Red,
@@ -809,8 +879,13 @@ mod tests {
             ordinary.mating_goal = AzMatingGoal::NONE;
             let (goal_value, goal_policy) =
                 crate::az::goal_outputs_for_training_sample(&model, &sample).unwrap();
-            let (_, ordinary_policy) =
+            let ordinary_outputs =
                 crate::az::outputs_for_training_sample(&model, &ordinary).unwrap();
+            assert_eq!(
+                crate::az::outputs_for_training_sample(&model, &sample).unwrap(),
+                ordinary_outputs
+            );
+            let (_, ordinary_policy) = ordinary_outputs;
             assert_eq!(goal_value, 0.0);
             assert_eq!(goal_policy, ordinary_policy);
             assert_eq!(
@@ -829,7 +904,9 @@ mod tests {
             az::{AzEvalAccumulator, AzMatingGoal, MatingTarget},
             xiangqi::Color,
         };
-        let model = conditioned_model();
+        let mut model = conditioned_model();
+        model.goal_scale.fill(0.3);
+        model.rebuild_context();
         let position = Position::startpos();
         let moves = position.legal_moves();
         let goal = AzMatingGoal {
@@ -930,10 +1007,22 @@ mod tests {
                 .iter()
                 .any(|&x| x != 0.0)
         );
+        assert!(
+            grads
+                .get(&candle.goal_scale)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .any(|&x| x != 0.0)
+        );
         assert!(grads.get(&candle.goal_output).is_none());
         assert!(grads.get(&candle.value_head_output).is_none());
+        // 只训练乘性门控：尚无终局标签，也必须能学入 MCTS 的目标策略。
         let mut optimizer =
-            crate::az::adamw::AzAdamW::new(vec![candle.goal_hidden.clone()], vec![false], 0.1)
+            crate::az::adamw::AzAdamW::new(vec![candle.goal_scale.clone()], vec![false], 0.1)
                 .unwrap();
         for _ in 0..12 {
             optimizer.step(&objective().backward().unwrap()).unwrap();
@@ -1002,7 +1091,11 @@ mod tests {
             .unwrap();
             optimizer.step(&first).unwrap();
             let second = objective().0.backward().unwrap();
-            for var in [&candle.goal_hidden, &candle.shared_hidden] {
+            for var in [
+                &candle.goal_hidden,
+                &candle.goal_scale,
+                &candle.shared_hidden,
+            ] {
                 assert!(
                     second
                         .get(var)
