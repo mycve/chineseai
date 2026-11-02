@@ -43,6 +43,11 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta {
                 generation_update: update,
@@ -181,6 +186,11 @@ fn repetition_policy_metrics_separate_opportunities_and_model_mass() {
         value_weight: 1.0,
         moves_left: 0.0,
         moves_left_weight: 0.0,
+        mating_targets: [0.0; super::MATING_HEAD_SIZE],
+        mating_weight: 0.0,
+        mating_goal: crate::az::AzMatingGoal::NONE,
+        goal_target: 0.0,
+        goal_weight: 0.0,
         search_simulations: 1,
         meta: AzSampleMeta::default(),
     };
@@ -752,6 +762,11 @@ fn value_head_can_overfit_tiny_fixed_dataset() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -770,6 +785,11 @@ fn value_head_can_overfit_tiny_fixed_dataset() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -788,6 +808,11 @@ fn value_head_can_overfit_tiny_fixed_dataset() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -806,6 +831,11 @@ fn value_head_can_overfit_tiny_fixed_dataset() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -843,6 +873,11 @@ fn batched_training_is_deterministic() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -861,6 +896,11 @@ fn batched_training_is_deterministic() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -879,6 +919,11 @@ fn batched_training_is_deterministic() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -897,6 +942,11 @@ fn batched_training_is_deterministic() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -945,6 +995,11 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -963,6 +1018,11 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -981,6 +1041,11 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -999,6 +1064,11 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -1012,6 +1082,8 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
     let weights = AzTrainLossWeights {
         value: 1.0,
         policy: 0.0,
+        mating: 0.0,
+        goal: 0.0,
     };
     train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights).unwrap();
 
@@ -1035,6 +1107,17 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
     model.moves_left_output.fill(0.03);
     model.moves_left_bias[0] = 0.2;
     model.shared_bias.fill(0.1);
+    for (index, weight) in model.mating_output.iter_mut().enumerate() {
+        *weight = (index % 11) as f32 * 0.007 - 0.035;
+    }
+    for (index, bias) in model.mating_bias.iter_mut().enumerate() {
+        *bias = index as f32 * 0.1 - 1.0;
+    }
+    for (index, weight) in model.goal_hidden.iter_mut().enumerate() {
+        *weight = (index / model.hidden_size + 1) as f32 * 0.02;
+    }
+    model.goal_output.fill(0.03);
+    model.goal_bias[0] = -0.5;
     model.rebuild_moves_left();
     let path = std::env::temp_dir().join("chineseai_test_aznnue_roundtrip.safetensors");
     let _ = fs::remove_file(&path);
@@ -1059,6 +1142,39 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
     );
     assert_eq!(model.moves_left_output, loaded.moves_left_output);
     assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
+    assert_eq!(model.mating_output, loaded.mating_output);
+    assert_eq!(model.mating_bias, loaded.mating_bias);
+    assert_eq!(model.goal_hidden, loaded.goal_hidden);
+    assert_eq!(model.goal_output, loaded.goal_output);
+    assert_eq!(model.goal_bias, loaded.goal_bias);
+    let position = Position::startpos();
+    let probabilities = model.mating_probabilities(&position, &[]);
+    assert_eq!(probabilities, loaded.mating_probabilities(&position, &[]));
+    let goal = super::AzMatingGoal {
+        target: super::MatingTarget::DoubleCannon,
+        side: Color::Red,
+        strength: 0.7,
+    };
+    let moves = position.legal_moves();
+    let conditioned = model.evaluate_with_goal(&position, &[], &moves, goal);
+    assert_eq!(
+        conditioned,
+        loaded.evaluate_with_goal(&position, &[], &moves, goal)
+    );
+    assert_eq!(
+        conditioned,
+        model
+            .clone()
+            .evaluate_with_goal(&position, &[], &moves, goal)
+    );
+    assert_eq!(
+        conditioned.1,
+        model.evaluate_wdl_with_rules(&position, &[], &moves)
+    );
+    assert_eq!(
+        probabilities,
+        model.clone().mating_probabilities(&position, &[])
+    );
     assert!(loaded.moves_left_active);
     assert_eq!(model.policy_context_hidden, loaded.policy_context_hidden);
     assert_eq!(model.policy_move_context, loaded.policy_move_context);
@@ -1070,6 +1186,54 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
         model.policy_accumulator_move,
         loaded.policy_accumulator_move
     );
+}
+
+#[test]
+fn nonfinite_mating_heads_are_rejected_when_loading() {
+    let path = std::env::temp_dir().join(format!(
+        "chineseai-invalid-mating-{}.safetensors",
+        std::process::id()
+    ));
+    for bias in [false, true] {
+        let mut model = AzNnue::random(8, 1202);
+        if bias {
+            model.mating_bias[0] = f32::NAN;
+        } else {
+            model.mating_output[0] = f32::INFINITY;
+        }
+        model.save(&path).unwrap();
+        let error = AzNnue::load(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mating head has invalid parameters")
+        );
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn nonfinite_goal_heads_are_rejected_when_loading() {
+    let path = std::env::temp_dir().join(format!(
+        "chineseai-invalid-goal-{}.safetensors",
+        std::process::id()
+    ));
+    for field in 0..3 {
+        let mut model = AzNnue::random(8, 54);
+        match field {
+            0 => model.goal_hidden[0] = f32::NAN,
+            1 => model.goal_output[0] = f32::INFINITY,
+            _ => model.goal_bias[0] = f32::NEG_INFINITY,
+        }
+        model.save(&path).unwrap();
+        assert!(
+            AzNnue::load(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("goal head has invalid parameters")
+        );
+    }
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -1115,6 +1279,11 @@ fn replay_pool_prunes_whole_game_chunks() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta {
                 generation_update: update,
@@ -1160,6 +1329,11 @@ fn replay_pool_mixed_recent_sampling_uses_requested_recent_fraction() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta {
                 generation_update: update,
@@ -1205,6 +1379,11 @@ fn replay_recent_games_counts_complete_games_not_generation_batches() {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta {
                 generation_update: 7,

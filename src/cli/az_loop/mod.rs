@@ -28,9 +28,9 @@ use std::{
 };
 use tensorboard_rs::summary_writer::SummaryWriter;
 
-/// 自博弈使用正常开局库起点。
+/// 配置空开局库路径时从标准初始局面开始，否则沿用开局库供给。
 pub(crate) struct SelfplaySupply {
-    openings: chineseai::pikafish::opening_book::Px0OpeningBook,
+    openings: Option<chineseai::pikafish::opening_book::Px0OpeningBook>,
 }
 
 impl SelfplaySupply {
@@ -39,7 +39,19 @@ impl SelfplaySupply {
         count: usize,
         generation: u32,
     ) -> std::io::Result<Vec<chineseai::az::AzStartSnapshot>> {
-        self.openings.next_batch(count, generation)
+        if let Some(openings) = &mut self.openings {
+            return openings.next_batch(count, generation);
+        }
+        let position = Position::startpos();
+        let rule_history = position.initial_rule_history();
+        Ok((0..count)
+            .map(|_| chineseai::az::AzStartSnapshot {
+                position: position.clone(),
+                rule_history: rule_history.clone(),
+                phase_ply: 0,
+                generation,
+            })
+            .collect())
     }
 }
 
@@ -47,16 +59,45 @@ pub(crate) fn build_selfplay_supply(
     config: &crate::cli::az_loop_config::AzLoopFileConfig,
 ) -> SelfplaySupply {
     SelfplaySupply {
-        openings: chineseai::pikafish::opening_book::Px0OpeningBook::load(
-            &config.selfplay_opening_book,
-            config.seed,
-        )
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to load Px0 opening book `{}`: {err}",
-                config.selfplay_opening_book
+        openings: (!config.selfplay_opening_book.is_empty()).then(|| {
+            chineseai::pikafish::opening_book::Px0OpeningBook::load(
+                &config.selfplay_opening_book,
+                config.seed,
             )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to load Px0 opening book `{}`: {err}",
+                    config.selfplay_opening_book
+                )
+            })
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_book_supplies_standard_openings_with_requested_count_and_generation() {
+        let config = crate::cli::az_loop_config::AzLoopFileConfig {
+            selfplay_opening_book: String::new(),
+            ..Default::default()
+        };
+        let mut supply = build_selfplay_supply(&config);
+        assert!(supply.openings.is_none());
+        assert!(supply.next_batch(0, 99).unwrap().is_empty());
+        let expected = Position::startpos();
+        for generation in [17, 18] {
+            let starts = supply.next_batch(3, generation).unwrap();
+            assert_eq!(starts.len(), 3);
+            for start in starts {
+                assert_eq!(start.position.to_fen(), expected.to_fen());
+                assert_eq!(start.rule_history, expected.initial_rule_history());
+                assert_eq!(start.phase_ply, 0);
+                assert_eq!(start.generation, generation);
+            }
+        }
     }
 }
 
@@ -462,6 +503,8 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 AzTrainLossWeights {
                     value: trainer_config.train_value_weight,
                     policy: trainer_config.train_policy_weight,
+                    mating: trainer_config.mating_loss_weight,
+                    goal: trainer_config.goal_loss_weight,
                 },
                 trainer_config.train_optimizer,
             )
@@ -543,6 +586,8 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     let mut exited_after_ctrl_c = false;
     let mut exited_after_target_update = false;
     let mut update = start_update;
+    // 仅累计本进程已报告批次；不写 progress，重启清零。
+    let mut mating_total = chineseai::az::AzMatingStats::default();
     let mut interrupt_save_model: Option<AzNnue> = None;
     let mut interrupt_save_next_update = start_update;
     loop {
@@ -706,6 +751,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         }
         generated_games_total = generated_games_total.saturating_add(report.games as u64);
         generated_samples_total = generated_samples_total.saturating_add(report.samples as u64);
+        mating_total.add_assign(&report.mating);
         let deployed_model = candidate_model.clone();
         interrupt_save_model = Some(candidate_model.clone());
         interrupt_save_next_update = update.saturating_add(1);
@@ -746,12 +792,20 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 ("test/policy_kl", check.policy_kl),
                 ("test/samples", check.samples as f32),
                 ("test/value_samples", check.value_samples as f32),
+                ("test/mating_samples", check.mating_samples as f32),
+                ("test/goal_samples", check.goal_samples as f32),
             ] {
                 log_scalar(&mut tb, tag, check.step, value);
             }
             if check.value_samples > 0 {
                 log_scalar(&mut tb, "test/wdl_ce", check.step, check.value_loss);
                 log_scalar(&mut tb, "test/value_rmse", check.step, check.value_rmse);
+            }
+            if check.mating_samples > 0 {
+                log_scalar(&mut tb, "test/mating_bce", check.step, check.mating_loss);
+            }
+            if check.goal_samples > 0 {
+                log_scalar(&mut tb, "test/goal_bce", check.step, check.goal_loss);
             }
             if check.moves_left_samples > 0 {
                 log_scalar(
@@ -873,6 +927,12 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             ),
         ] {
             log_scalar(&mut tb, tag, report.training_steps, value);
+        }
+        for (tag, value) in mating_metrics(&report) {
+            log_scalar(&mut tb, &tag, report.training_steps, value);
+        }
+        for (tag, value) in mating_count_metrics(&mating_total, "mating_total") {
+            log_scalar(&mut tb, &tag, report.training_steps, value);
         }
         if completed > 0 {
             log_scalar(
@@ -1128,6 +1188,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                             policy_softmax_temp: config.pikafish_label_eval_policy_softmax_temp,
                             draw_score: config.draw_score,
                             value_scale: 1.0,
+                            mating_goal: chineseai::az::AzMatingGoal::default(),
                         },
                         config.arena_processes,
                     )

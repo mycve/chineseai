@@ -534,6 +534,11 @@ fn decode_game(
             value_weight: 1.0,
             moves_left: plies_left,
             moves_left_weight,
+            mating_targets: [0.0; super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: visits,
             meta: AzSampleMeta {
                 game_id,

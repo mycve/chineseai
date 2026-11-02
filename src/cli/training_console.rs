@@ -9,6 +9,7 @@ pub struct TrainingConsole {
     production: ProgressBar,
     loss: ProgressBar,
     value: ProgressBar,
+    mating: ProgressBar,
     test: ProgressBar,
     arena: ProgressBar,
 }
@@ -33,6 +34,7 @@ impl TrainingConsole {
         let production = row();
         let loss = row();
         let value = row();
+        let mating = row();
         let test = row();
         let arena = row();
         let cycle_number = steps / PX0_CYCLE_STEPS + 1;
@@ -48,6 +50,7 @@ impl TrainingConsole {
             production,
             loss,
             value,
+            mating,
             test,
             arena,
         }
@@ -96,6 +99,7 @@ impl TrainingConsole {
             report.avg_search_simulations,
             report.train_seconds
         );
+        let mating = mating_line(report);
         let cycle_number = report.training_steps.saturating_sub(1) / PX0_CYCLE_STEPS + 1;
         if self.interactive {
             self.cycle.set_prefix(format!("cycle {cycle_number}"));
@@ -107,11 +111,13 @@ impl TrainingConsole {
             self.production.set_message(production);
             self.loss.set_message(loss);
             self.value.set_message(value);
+            self.mating.set_message(mating);
         } else {
             println!(
                 "cycle={} step={} {production} {loss} {value}",
                 cycle_number, report.training_steps
             );
+            println!("{mating}");
         }
     }
 
@@ -122,7 +128,7 @@ impl TrainingConsole {
             format!("WDL={:.4} RMSE={:.4}", check.value_loss, check.value_rmse)
         };
         let line = format!(
-            "test: step={} samples={} value_samples={} loss={:.4} policy_KL={:.4} {value} MLH_RMSE={:.1}/{} MLH_pair={:.1}%/{}",
+            "test: step={} samples={} value_samples={} loss={:.4} policy_KL={:.4} {value} MLH_RMSE={:.1}/{} MLH_pair={:.1}%/{} 杀法CE={}/{} 目标CE={}/{}",
             check.step,
             check.samples,
             check.value_samples,
@@ -131,7 +137,19 @@ impl TrainingConsole {
             check.moves_left_rmse,
             check.moves_left_samples,
             check.moves_left_pair_accuracy * 100.0,
-            check.moves_left_pairs
+            check.moves_left_pairs,
+            if check.mating_samples > 0 {
+                format!("{:.4}", check.mating_loss)
+            } else {
+                "NA".into()
+            },
+            check.mating_samples,
+            if check.goal_samples > 0 {
+                format!("{:.4}", check.goal_loss)
+            } else {
+                "NA".into()
+            },
+            check.goal_samples
         );
         if self.interactive {
             self.test.set_message(line);
@@ -162,10 +180,105 @@ impl TrainingConsole {
             &self.production,
             &self.loss,
             &self.value,
+            &self.mating,
             &self.test,
             &self.arena,
         ] {
             row.abandon();
         }
+    }
+}
+
+fn mating_line(report: &AzLoopReport) -> String {
+    let stats = &report.mating;
+    let counts = chineseai::xiangqi::MatingPattern::ALL
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, pattern)| {
+            let count = stats.pattern_counts[i];
+            (count > 0).then(|| {
+                format!(
+                    "{}={}({:.1}%/{:.1}%)",
+                    pattern.name(),
+                    count,
+                    count as f32 * 100.0 / stats.games.max(1) as f32,
+                    count as f32 * 100.0 / stats.checkmates.max(1) as f32,
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let coverage = if stats.games > 0 {
+        format!(
+            "{:.1}%",
+            stats.labeled_games as f32 * 100.0 / stats.games as f32
+        )
+    } else {
+        "NA".into()
+    };
+    let loss = if report.mating_samples > 0 {
+        format!("{:.4}", report.mating_loss)
+    } else {
+        "NA".into()
+    };
+    let goal_loss = if report.goal_samples > 0 {
+        format!("{:.4}", report.goal_loss)
+    } else {
+        "NA".into()
+    };
+    let goal_counts = ["重炮", "铁门栓"]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, name)| {
+            let attempts = stats.goal_attempts[i];
+            (attempts > 0).then(|| {
+                format!(
+                    "{name}目标={}/{}({:.1}%)未知={}",
+                    stats.goal_successes[i],
+                    attempts,
+                    stats.goal_successes[i] as f32 * 100.0 / attempts as f32,
+                    stats.goal_unknown[i]
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "本批杀法：实际将死={} 困毙={} 未知={} 覆盖={} CE={}/{} 目标CE={}/{} {} 计数(批内全部%/批内将死%)：{}",
+        stats.checkmates,
+        stats.stalemates,
+        stats.unknown_games,
+        coverage,
+        loss,
+        report.mating_samples,
+        goal_loss,
+        report.goal_samples,
+        goal_counts,
+        if counts.is_empty() {
+            "无匹配标签"
+        } else {
+            &counts
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mating_console_distinguishes_unknown_and_overlapping_pattern_rates() {
+        let mut report = AzLoopReport::default();
+        report.mating.games = 4;
+        report.mating.checkmates = 2;
+        report.mating.unknown_games = 2;
+        report.mating.labeled_games = 2;
+        report.mating.pattern_counts[0] = 2;
+        report.mating.pattern_counts[1] = 2;
+        let line = mating_line(&report);
+        assert!(line.contains("实际将死=2 困毙=0 未知=2 覆盖=50.0%"));
+        assert!(line.contains("重炮=2(50.0%/100.0%)"));
+        assert!(line.contains("马后炮=2(50.0%/100.0%)"));
+        assert!(line.contains("CE=NA/0"));
     }
 }

@@ -56,6 +56,8 @@ pub(crate) const VALUE_THREAT_MAX_ACTIVE: usize = 192;
 /// 炮的四条射线，每方向最多首阻挡、次阻挡及炮架三项。
 pub(crate) const THREAT_SOURCE_MAX_ACTIVE: usize = 12;
 pub(crate) const WDL_HEAD_SIZE: usize = 3;
+/// 索引与 MatingPattern::ALL 固定顺序一致，各头为行棋方最终以该杀法获胜的概率。
+pub const MATING_HEAD_SIZE: usize = crate::xiangqi::MatingPattern::ALL.len();
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -506,6 +508,11 @@ macro_rules! az_weight_tensors {
         );
         $visit!(moves_left_output, [1, $h], true);
         $visit!(moves_left_bias, [1], false);
+        $visit!(mating_output, [MATING_HEAD_SIZE, $h], true);
+        $visit!(mating_bias, [MATING_HEAD_SIZE], false);
+        $visit!(goal_hidden, [$crate::az::GOAL_CONTEXT_SIZE, $h], true);
+        $visit!(goal_output, [1, $h], true);
+        $visit!(goal_bias, [1], false);
         $visit!(
             threat_embedding,
             [VALUE_THREAT_VOCAB, VALUE_THREAT_RANK],

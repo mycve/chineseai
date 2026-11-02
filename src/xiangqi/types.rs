@@ -2,7 +2,8 @@ use std::fmt;
 
 use super::{BOARD_SIZE, parse_square, square_name};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Color {
     Red,
     Black,

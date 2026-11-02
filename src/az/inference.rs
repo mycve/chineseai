@@ -462,6 +462,11 @@ pub struct AzNnue {
     pub value_head_output: Vec<f32>,
     pub moves_left_output: Vec<f32>,
     pub moves_left_bias: Vec<f32>,
+    pub mating_output: Vec<f32>,
+    pub mating_bias: Vec<f32>,
+    pub goal_hidden: Vec<f32>,
+    pub goal_output: Vec<f32>,
+    pub goal_bias: Vec<f32>,
     pub(crate) moves_left_active: bool,
     pub moves_left_params: AzMovesLeftParams,
     pub threat_embedding: Vec<f32>,
@@ -531,6 +536,11 @@ impl Clone for AzNnue {
             value_head_output: self.value_head_output.clone(),
             moves_left_output: self.moves_left_output.clone(),
             moves_left_bias: self.moves_left_bias.clone(),
+            mating_output: self.mating_output.clone(),
+            mating_bias: self.mating_bias.clone(),
+            goal_hidden: self.goal_hidden.clone(),
+            goal_output: self.goal_output.clone(),
+            goal_bias: self.goal_bias.clone(),
             moves_left_active: self.moves_left_active,
             moves_left_params: self.moves_left_params,
             threat_embedding: self.threat_embedding.clone(),
@@ -562,6 +572,7 @@ pub(crate) struct AzEvalOutput {
     pub value_wdl: [f32; WDL_HEAD_SIZE],
     pub value: f32,
     pub moves_left: f32,
+    pub goal_value: f32,
 }
 
 impl AzNnue {
@@ -632,6 +643,11 @@ impl AzNnue {
             value_head_output,
             moves_left_output: vec![0.0; hidden_size],
             moves_left_bias: vec![0.0],
+            mating_output: vec![0.0; MATING_HEAD_SIZE * hidden_size],
+            mating_bias: vec![-4.0; MATING_HEAD_SIZE],
+            goal_hidden: vec![0.0; GOAL_CONTEXT_SIZE * hidden_size],
+            goal_output: vec![0.0; hidden_size],
+            goal_bias: vec![-4.0],
             moves_left_active: false,
             moves_left_params: AzMovesLeftParams::default(),
             threat_embedding,
@@ -831,6 +847,11 @@ impl AzNnue {
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
             moves_left_output: load_candle_f32_tensor(&tensors, "moves_left_output")?,
             moves_left_bias: load_candle_f32_tensor(&tensors, "moves_left_bias")?,
+            mating_output: load_candle_f32_tensor(&tensors, "mating_output")?,
+            mating_bias: load_candle_f32_tensor(&tensors, "mating_bias")?,
+            goal_hidden: load_candle_f32_tensor(&tensors, "goal_hidden")?,
+            goal_output: load_candle_f32_tensor(&tensors, "goal_output")?,
+            goal_bias: load_candle_f32_tensor(&tensors, "goal_bias")?,
             moves_left_active: false,
             moves_left_params: AzMovesLeftParams::default(),
             threat_embedding: load_candle_f32_tensor(&tensors, "threat_embedding")?,
@@ -902,6 +923,67 @@ impl AzNnue {
             &mut scratch,
         )
         .value_wdl
+    }
+
+    /// 只读诊断接口；杀法头不参与搜索的 WDL、Q 或胜负证明。
+    pub fn mating_probabilities(
+        &self,
+        position: &Position,
+        history: &[crate::xiangqi::RuleHistoryEntry],
+    ) -> [f32; MATING_HEAD_SIZE] {
+        let moves = position.legal_moves_with_rules(history);
+        let mut scratch = AzEvalScratch::new(self.arch);
+        self.evaluate_with_scratch_output_with_repetition_and_history(
+            position,
+            &moves,
+            &[],
+            &rule_context_features(position, history),
+            history,
+            &mut scratch,
+        );
+        self.mating_probabilities_from_hidden(&scratch.hidden)
+    }
+
+    /// 返回固定指令方的目标概率、原胜和负概率，以及给定候选着法的条件策略 logits。
+    pub fn evaluate_with_goal(
+        &self,
+        position: &Position,
+        history: &[crate::xiangqi::RuleHistoryEntry],
+        moves: &[Move],
+        goal: AzMatingGoal,
+    ) -> (f32, [f32; WDL_HEAD_SIZE], Vec<f32>) {
+        let mut scratch = AzEvalScratch::new(self.arch);
+        scratch.mating_goal = goal;
+        let output = self.evaluate_with_scratch_output_with_repetition_and_history(
+            position,
+            moves,
+            &[],
+            &rule_context_features(position, history),
+            history,
+            &mut scratch,
+        );
+        (output.goal_value, output.value_wdl, scratch.logits)
+    }
+
+    pub(crate) fn mating_probabilities_from_hidden(
+        &self,
+        hidden: &[f32],
+    ) -> [f32; MATING_HEAD_SIZE] {
+        std::array::from_fn(|head| {
+            let logit = self.mating_bias[head]
+                + self.mating_output[head * self.hidden_size..(head + 1) * self.hidden_size]
+                    .iter()
+                    .zip(hidden)
+                    .map(|(w, h)| w * h)
+                    .sum::<f32>();
+            // 避免大负 logit 的 exp 溢出。
+            if logit >= 0.0 {
+                1.0 / (1.0 + (-logit).exp())
+            } else {
+                let exp = logit.exp();
+                exp / (1.0 + exp)
+            }
+        })
     }
 
     pub(crate) fn evaluate_with_scratch(
@@ -1082,11 +1164,41 @@ impl AzNnue {
     ) -> AzEvalOutput {
         self.encode_shared_position(position, moves, rules, history, scratch);
         let (value_wdl, value) = self.evaluate_value_head(position, scratch);
+        let goal_value = self.prepare_goal_encoding(position, scratch);
         self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
         AzEvalOutput {
             value_wdl,
             value,
             moves_left: self.moves_left_from_hidden(&scratch.hidden),
+            goal_value,
+        }
+    }
+
+    fn prepare_goal_encoding(&self, position: &Position, scratch: &mut AzEvalScratch) -> f32 {
+        let goal = scratch.mating_goal.effective(position);
+        scratch.goal_policy_active = goal.enabled() && goal.side == position.side_to_move();
+        if !goal.enabled() {
+            return 0.0;
+        }
+        let features = goal.features(position);
+        scratch.goal_hidden.resize(self.hidden_size, 0.0);
+        for (channel, hidden) in scratch.goal_hidden.iter_mut().enumerate() {
+            *hidden = (scratch.hidden[channel]
+                + features
+                    .iter()
+                    .enumerate()
+                    .map(|(index, feature)| {
+                        feature * self.goal_hidden[index * self.hidden_size + channel]
+                    })
+                    .sum::<f32>())
+            .max(0.0);
+        }
+        let logit = self.goal_bias[0] + dot_product(&scratch.goal_hidden, &self.goal_output);
+        if logit >= 0.0 {
+            1.0 / (1.0 + (-logit).exp())
+        } else {
+            let exp = logit.exp();
+            exp / (1.0 + exp)
         }
     }
 
@@ -1161,6 +1273,29 @@ impl AzNnue {
         }
         az_weight_tensors!(validate_tensor, hidden);
         if self
+            .goal_hidden
+            .iter()
+            .chain(&self.goal_output)
+            .chain(&self.goal_bias)
+            .any(|x| !x.is_finite())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "az goal head has invalid parameters",
+            ));
+        }
+        if self
+            .mating_output
+            .iter()
+            .chain(&self.mating_bias)
+            .any(|x| !x.is_finite())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "az mating head has invalid parameters",
+            ));
+        }
+        if self
             .value_king_piece_hidden
             .iter()
             .chain(&self.value_king_piece_projection)
@@ -1208,6 +1343,36 @@ pub fn outputs_for_training_sample(
     model: &AzNnue,
     sample: &AzTrainingSample,
 ) -> Option<([f32; WDL_HEAD_SIZE], Vec<f32>)> {
+    let (evaluated, scratch) = evaluate_training_sample(model, sample)?;
+    Some((evaluated.value_wdl, scratch.logits))
+}
+
+/// 返回各杀法概率与共享主干表示，用于独立评估和冻结主干线性探针。
+/// 不把真实终局标签输入网络。
+pub fn mating_outputs_for_training_sample(
+    model: &AzNnue,
+    sample: &AzTrainingSample,
+) -> Option<([f32; MATING_HEAD_SIZE], Vec<f32>)> {
+    let (_, scratch) = evaluate_training_sample(model, sample)?;
+    Some((
+        model.mating_probabilities_from_hidden(&scratch.hidden),
+        scratch.hidden,
+    ))
+}
+
+/// 固定指令执行方视角的达成概率，不随样本当前行棋方翻转。
+pub fn goal_outputs_for_training_sample(
+    model: &AzNnue,
+    sample: &AzTrainingSample,
+) -> Option<(f32, Vec<f32>)> {
+    let (output, scratch) = evaluate_training_sample(model, sample)?;
+    Some((output.goal_value, scratch.logits))
+}
+
+fn evaluate_training_sample(
+    model: &AzNnue,
+    sample: &AzTrainingSample,
+) -> Option<(AzEvalOutput, AzEvalScratch)> {
     let position = position_for_training_sample(sample)?;
     let moves = sample
         .move_indices
@@ -1219,6 +1384,12 @@ pub fn outputs_for_training_sample(
         return None;
     }
     let mut scratch = AzEvalScratch::new(model.arch);
+    let original_side = if sample.side_sign > 0.0 {
+        Color::Red
+    } else {
+        Color::Black
+    };
+    scratch.mating_goal = sample.mating_goal.canonical_for(original_side);
     let evaluated = model.evaluate_with_scratch_output_with_repetition_and_history_features(
         &position,
         &moves,
@@ -1227,7 +1398,7 @@ pub fn outputs_for_training_sample(
         &sample.history_features,
         &mut scratch,
     );
-    Some((evaluated.value_wdl, scratch.logits))
+    Some((evaluated, scratch))
 }
 
 pub fn position_for_training_sample(sample: &AzTrainingSample) -> Option<Position> {

@@ -154,7 +154,7 @@ pub(crate) fn search_uci(
             }
             tree.simulate(0, 0);
             used += 1;
-            if tree.nodes[0].solved.is_some() {
+            if tree.search_finished(0) {
                 break;
             }
             if used % SEARCH_PROGRESS_POLL_SIMULATIONS == 0

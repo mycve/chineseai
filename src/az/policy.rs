@@ -132,7 +132,11 @@ impl AzNnue {
         for (context_index, context) in scratch.policy_context.iter_mut().enumerate() {
             let start = context_index * self.hidden_size;
             *context = dot_product(
-                &scratch.hidden,
+                if scratch.goal_policy_active {
+                    &scratch.goal_hidden
+                } else {
+                    &scratch.hidden
+                },
                 &self.policy_context_hidden[start..start + self.hidden_size],
             );
             if self.threat_active {
@@ -159,8 +163,15 @@ impl AzNnue {
         };
         let opponent_attacks = attack_masks[color_index(side.opposite())];
         let own_attacks = attack_masks[color_index(side)];
-        let repetition_logit = dot_product(&scratch.hidden, &self.policy_repetition_hidden)
-            + self.policy_repetition_bias[0];
+        let repetition_logit = dot_product(
+            if scratch.goal_policy_active {
+                &scratch.goal_hidden
+            } else {
+                &scratch.hidden
+            },
+            &self.policy_repetition_hidden,
+        ) + self.policy_repetition_bias[0];
+        let goal = scratch.mating_goal.effective(position);
         {
             crate::scope_profile!("az.eval.policy_logits");
             {
@@ -213,6 +224,9 @@ impl AzNnue {
                         + prior
                         + f32::from(repetition_flags.get(index).copied().unwrap_or(0))
                             * repetition_logit;
+                    if scratch.goal_policy_active {
+                        scratch.logits[index] += goal.policy_bias(position, *mv);
+                    }
                 }
             }
         }

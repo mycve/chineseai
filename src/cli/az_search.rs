@@ -1,6 +1,9 @@
 use crate::cli::args::*;
 use chineseai::{
-    az::{AzNnue, AzSearchLimits, alphazero_search_trace_with_rules, alphazero_search_with_rules},
+    az::{
+        AzMatingGoal, AzNnue, AzSearchLimits, alphazero_search_trace_with_rules,
+        alphazero_search_with_rules,
+    },
     xiangqi::{Move, Position},
 };
 use std::time::Instant;
@@ -32,6 +35,7 @@ pub(crate) fn fixed_az_search_limits(
         policy_softmax_temp: policy_softmax_temp.max(1.0e-3),
         draw_score: 0.0,
         value_scale: 1.0,
+        mating_goal: AzMatingGoal::default(),
     }
 }
 
@@ -54,7 +58,7 @@ pub(crate) fn print_az_search_candidates(result: &chineseai::az::AzSearchResult,
         candidates.len()
     );
     println!(
-        "    #  B  MOVE      VISITS  VISIT P       Q      CP       NET P      TREE P   MLH(ply)"
+        "    #  B  MOVE      VISITS  VISIT P       Q      CP       NET P      TREE P   MLH(ply)  GOAL(owner)"
     );
     println!(
         "  ---- --  -------  --------  -------  ------  ------  ----------  ----------  ---------"
@@ -66,7 +70,7 @@ pub(crate) fn print_az_search_candidates(result: &chineseai::az::AzSearchResult,
             " "
         };
         println!(
-            "  {:>4}  {}  {:<7}  {:>8}  {:>6.2}%  {:>+6.3}  {:>+6}  {:>9.5}  {:>9.5}  {:>9}",
+            "  {:>4}  {}  {:<7}  {:>8}  {:>6.2}%  {:>+6.3}  {:>+6}  {:>9.5}  {:>9.5}  {:>9}  {:>11.4}",
             rank + 1,
             best,
             candidate.mv,
@@ -80,6 +84,7 @@ pub(crate) fn print_az_search_candidates(result: &chineseai::az::AzSearchResult,
                 .moves_left
                 .map(|m| format!("{m:.1}"))
                 .unwrap_or_else(|| "-".into()),
+            candidate.goal_value,
         );
     }
 }
@@ -128,8 +133,27 @@ pub(crate) fn parse_position(text: &str) -> Position {
     }
 }
 
+fn search_mating_goal(cmd: &AzSearchArgs, position: &Position) -> AzMatingGoal {
+    let goal = AzMatingGoal {
+        target: cmd.mating_target,
+        side: cmd
+            .mating_side
+            .map(MatingSide::color)
+            .unwrap_or(position.side_to_move()),
+        strength: cmd.mating_strength,
+    };
+    goal.validate().expect("invalid mating goal");
+    goal
+}
+
+fn verification_limits(mut limits: AzSearchLimits, simulations: usize) -> AzSearchLimits {
+    limits.simulations = simulations.max(1);
+    limits.seed = 0;
+    limits
+}
+
 pub(crate) fn run(cmd: AzSearchArgs) {
-    let model_path = cmd.model;
+    let model_path = &cmd.model;
     let simulations = cmd.simulations.max(1);
     let cpuct = cmd.cpuct.max(0.0);
     let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
@@ -143,7 +167,8 @@ pub(crate) fn run(cmd: AzSearchArgs) {
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
     }
-    let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
+    let mating_goal = search_mating_goal(&cmd, &position);
+    let model = AzNnue::load(model_path).unwrap_or_else(|err| {
         panic!("failed to load `{model_path}`: {err}");
     });
     let search_limits = AzSearchLimits {
@@ -165,6 +190,7 @@ pub(crate) fn run(cmd: AzSearchArgs) {
         policy_softmax_temp: cmd.policy_softmax_temp.max(1.0e-3),
         draw_score: cmd.draw_score.clamp(-1.0, 1.0),
         value_scale: cmd.value_scale.clamp(0.0, 1.0),
+        mating_goal,
     };
     let root_moves = if cmd.root_moves.is_empty() {
         None
@@ -262,8 +288,19 @@ pub(crate) fn run(cmd: AzSearchArgs) {
     );
     println!("  Policy temp  {:.3}", search_limits.policy_softmax_temp);
     println!("  Draw score   {:.3}", search_limits.draw_score);
+    println!(
+        "  杀法目标     {} owner={:?} strength={:.3} 当前有效={}",
+        mating_goal.target.name(),
+        mating_goal.side,
+        mating_goal.strength,
+        mating_goal.effective(&position).enabled()
+    );
     println!("\nRESULT");
     println!("  Best move    {best_move}");
+    println!(
+        "  目标达成值   {:.4}（固定执行方 {:?} 视角）",
+        result.goal_value, mating_goal.side
+    );
     println!(
         "  Search value Q={:+.4}  CP={:+}  W/D/L={:.2}%/{:.2}%/{:.2}%",
         result.value_q,
@@ -333,7 +370,9 @@ pub(crate) fn run(cmd: AzSearchArgs) {
     }
     if !verify_moves.is_empty() {
         println!("\nCHILD VERIFICATION — {verify_sims} simulations each");
-        println!("  MOVE     VISITS   ROOT Q     NN Q   DEEP Q       ΔQ      CP  OPPONENT REPLY");
+        println!(
+            "  MOVE     VISITS   ROOT Q     NN Q   DEEP Q       ΔQ      CP  GOAL(owner) OPPONENT REPLY"
+        );
         println!("  -------  -------  -------  -------  -------  -------  ------  --------------");
     }
     for mv in verify_moves {
@@ -347,9 +386,7 @@ pub(crate) fn run(cmd: AzSearchArgs) {
         child.make_move(mv);
         let child_legal = child.legal_moves_with_rules(&child_rule_history);
         let child_nn_q = model.evaluate_value_with_rules(&child, &child_rule_history, &child_legal);
-        let mut verify_limits = search_limits;
-        verify_limits.simulations = verify_sims.max(1);
-        verify_limits.seed = 0;
+        let verify_limits = verification_limits(search_limits, verify_sims);
         let verified = alphazero_search_with_rules(
             &child,
             Some(child_rule_history),
@@ -360,7 +397,7 @@ pub(crate) fn run(cmd: AzSearchArgs) {
         let verified_root_q = -verified.value_q;
         let verified_root_cp = -verified.value_cp;
         println!(
-            "  {:<7}  {:>7}  {:>+7.3}  {:>+7.3}  {:>+7.3}  {:>+7.3}  {:>+6}  {}",
+            "  {:<7}  {:>7}  {:>+7.3}  {:>+7.3}  {:>+7.3}  {:>+7.3}  {:>+6}  {:>11.4} {}",
             mv,
             root_candidate.visits,
             root_candidate.q,
@@ -368,10 +405,96 @@ pub(crate) fn run(cmd: AzSearchArgs) {
             verified_root_q,
             verified_root_q - root_candidate.q,
             verified_root_cp,
+            verified.goal_value,
             verified
                 .best_move
                 .map(|best| best.to_string())
                 .unwrap_or_else(|| "(none)".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chineseai::{az::MatingTarget, xiangqi::Color};
+    use clap::Parser;
+
+    fn parse_args(extra: &[&str]) -> AzSearchArgs {
+        let cli = Cli::try_parse_from(
+            ["chineseai", "az-search", "model.safetensors"]
+                .into_iter()
+                .chain(extra.iter().copied()),
+        )
+        .unwrap();
+        let Some(CliCommand::AzSearch(args)) = cli.command else {
+            panic!("az-search args");
+        };
+        args
+    }
+
+    #[test]
+    fn mating_cli_validates_target_and_strength_bounds() {
+        for name in ["double-cannon", "double_cannon", "重炮"] {
+            assert_eq!(
+                parse_args(&["--mating-target", name]).mating_target,
+                MatingTarget::DoubleCannon
+            );
+        }
+        assert_eq!(
+            parse_args(&["--mating-target", "铁门栓"]).mating_target,
+            MatingTarget::IronBolt
+        );
+        for value in ["0", "1"] {
+            assert!(
+                parse_args(&["--mating-strength", value])
+                    .mating_strength
+                    .is_finite()
+            );
+        }
+        for value in ["NaN", "inf", "1.1", "-0.1"] {
+            assert!(
+                Cli::try_parse_from([
+                    "chineseai",
+                    "az-search",
+                    "model",
+                    "--mating-strength",
+                    value
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "chineseai",
+                "az-search",
+                "model",
+                "--mating-target",
+                "unknown"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn search_goal_owner_is_set_after_moves_and_inherited_by_child_search() {
+        let args = parse_args(&["--mating-target", "重炮", "--move", "b0c2"]);
+        let mut position = Position::startpos();
+        for text in &args.moves {
+            position.make_move(position.parse_uci_move(text).unwrap());
+        }
+        let goal = search_mating_goal(&args, &position);
+        assert_eq!(goal.side, Color::Black);
+        let limits = AzSearchLimits {
+            mating_goal: goal,
+            ..Default::default()
+        };
+        let child_limits = verification_limits(limits, 7);
+        position.make_move(position.legal_moves()[0]);
+        assert_eq!(position.side_to_move(), Color::Red);
+        assert_eq!(child_limits.mating_goal, goal);
+        assert_eq!(child_limits.simulations, 7);
+        let explicit = parse_args(&["--mating-target", "重炮", "--mating-side", "red"]);
+        assert_eq!(search_mating_goal(&explicit, &position).side, Color::Red);
     }
 }

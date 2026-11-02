@@ -33,6 +33,44 @@ pub(crate) enum CliCommand {
     AzLoop(AzLoopArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
+    /// 识别 FEN 终局中的象棋杀法，无需加载模型。
+    MateClassify(MateClassifyArgs),
+    /// 冻结模型共享主干，拟合杀法线性探针并在整盘留出集评估。
+    AzMatingProbe(AzMatingProbeArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct AzMatingProbeArgs {
+    #[arg(long)]
+    pub(crate) model: String,
+    #[arg(long)]
+    pub(crate) replay: String,
+    /// 必须与训练使用的 seed 相同，以复用整盘留出划分。
+    #[arg(long)]
+    pub(crate) split_seed: u64,
+    /// 可选对照模型；使用完全相同的训练和测试样本。
+    #[arg(long)]
+    pub(crate) baseline: Option<String>,
+    #[arg(long, default_value_t = 2048)]
+    pub(crate) train_samples: usize,
+    #[arg(long, default_value_t = 512)]
+    pub(crate) test_samples: usize,
+    #[arg(long, default_value_t = 200)]
+    pub(crate) steps: usize,
+    #[arg(long, default_value_t = 0.01)]
+    pub(crate) lr: f64,
+    #[arg(long, default_value_t = 1_000_000)]
+    pub(crate) capacity: usize,
+}
+
+#[derive(Args, Debug)]
+#[command(
+    after_long_help = "示例：\n  chineseai mate-classify \"3aka3/9/9/4C4/9/4C4/9/9/9/4K4 b\""
+)]
+pub(crate) struct MateClassifyArgs {
+    /// 完整 FEN；支持带引号的字符串或空格分隔字段。
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+    pub(crate) fen: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -149,6 +187,15 @@ pub(crate) struct AzSearchArgs {
     /// Scale non-terminal network values during search; 0 isolates policy priors.
     #[arg(long, default_value_t = 1.0)]
     pub(crate) value_scale: f32,
+    /// 指定杀法：none、double-cannon（重炮）、iron-bolt（铁门栓）。
+    #[arg(long, default_value = "none")]
+    pub(crate) mating_target: chineseai::az::MatingTarget,
+    /// 杀法偏好强度，范围 0..1；0 关闭偏好。
+    #[arg(long, default_value = "1", value_parser = parse_mating_strength)]
+    pub(crate) mating_strength: f32,
+    /// 执行目标的一方，默认应用 --move 后局面的行棋方；整次搜索固定。
+    #[arg(long, value_enum)]
+    pub(crate) mating_side: Option<MatingSide>,
     /// Independently re-search this many top-visited root moves after making each move.
     #[arg(long, default_value_t = 0)]
     pub(crate) verify_top: usize,
@@ -173,6 +220,32 @@ pub(crate) struct AzSearchArgs {
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(crate) fen: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum MatingSide {
+    Red,
+    Black,
+}
+
+impl MatingSide {
+    pub(crate) fn color(self) -> chineseai::xiangqi::Color {
+        match self {
+            Self::Red => chineseai::xiangqi::Color::Red,
+            Self::Black => chineseai::xiangqi::Color::Black,
+        }
+    }
+}
+
+fn parse_mating_strength(text: &str) -> Result<f32, String> {
+    let strength: f32 = text
+        .parse()
+        .map_err(|_| "杀法强度必须是 0..1 的有限数值".to_owned())?;
+    if strength.is_finite() && (0.0..=1.0).contains(&strength) {
+        Ok(strength)
+    } else {
+        Err("杀法强度必须是 0..1 的有限数值".into())
+    }
 }
 
 #[derive(Args, Debug)]

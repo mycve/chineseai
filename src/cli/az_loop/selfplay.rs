@@ -143,6 +143,17 @@ pub(crate) fn build_async_training_report(
         loss: stats.loss,
         learning_rate,
         value_loss: stats.value_loss,
+        mating: pending.selfplay.mating,
+        mating_loss: stats.mating_loss,
+        mating_samples: stats.mating_samples,
+        mating_target_sum: stats.mating_target_sum,
+        mating_pred_sum: stats.mating_pred_sum,
+        mating_brier_sum: stats.mating_brier_sum,
+        goal_loss: stats.goal_loss,
+        goal_samples: stats.goal_samples,
+        goal_target_sum: stats.goal_target_sum,
+        goal_pred_sum: stats.goal_pred_sum,
+        goal_brier_sum: stats.goal_brier_sum,
         moves_left_loss: stats.moves_left_loss,
         moves_left_samples: stats.moves_left_samples,
         moves_left_pairs: stats.moves_left_pairs,
@@ -223,5 +234,246 @@ pub(crate) fn build_async_training_report(
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
         terminal_search_proven: pending.selfplay.terminal.search_proven,
+    }
+}
+
+/// 标签允许重叠；分母分别为本批全部对局、实际将死与有效监督样本。
+pub(crate) fn mating_metrics(report: &AzLoopReport) -> Vec<(String, f32)> {
+    let mut metrics = mating_count_metrics(&report.mating, "mating");
+    metrics.push(("train/mating_samples".into(), report.mating_samples as f32));
+    metrics.push(("train/goal_samples".into(), report.goal_samples as f32));
+    if report.goal_samples > 0 {
+        let count = report.goal_samples as f32;
+        metrics.extend([
+            ("train/goal_bce".into(), report.goal_loss),
+            (
+                "train/goal_target_rate".into(),
+                report.goal_target_sum / count,
+            ),
+            ("train/goal_pred_mean".into(), report.goal_pred_sum / count),
+            ("train/goal_brier".into(), report.goal_brier_sum / count),
+        ]);
+    }
+    if report.mating_samples > 0 {
+        metrics.push(("train/mating_bce".into(), report.mating_loss));
+    }
+    if report.train_samples > 0 {
+        metrics.push((
+            "train/mating_supervision_coverage".into(),
+            report.mating_samples as f32 / report.train_samples as f32,
+        ));
+    }
+    for (i, pattern) in chineseai::xiangqi::MatingPattern::ALL
+        .into_iter()
+        .enumerate()
+    {
+        let name = pattern.name();
+        if report.mating_samples > 0 {
+            let samples = report.mating_samples as f32;
+            metrics.extend([
+                (
+                    format!("train/mating/{name}/target_rate"),
+                    report.mating_target_sum[i] / samples,
+                ),
+                (
+                    format!("train/mating/{name}/pred_mean"),
+                    report.mating_pred_sum[i] / samples,
+                ),
+                (
+                    format!("train/mating/{name}/brier"),
+                    report.mating_brier_sum[i] / samples,
+                ),
+            ]);
+        }
+    }
+    metrics
+}
+
+/// 同一口径用于本批 mating/* 和本进程累计 mating_total/*。
+pub(crate) fn mating_count_metrics(
+    stats: &chineseai::az::AzMatingStats,
+    prefix: &str,
+) -> Vec<(String, f32)> {
+    let mut metrics = vec![
+        (format!("{prefix}/games"), stats.games as f32),
+        (
+            format!("{prefix}/labeled_games"),
+            stats.labeled_games as f32,
+        ),
+        (format!("{prefix}/checkmates"), stats.checkmates as f32),
+        (format!("{prefix}/stalemates"), stats.stalemates as f32),
+        (
+            format!("{prefix}/unknown_games"),
+            stats.unknown_games as f32,
+        ),
+    ];
+    for (i, name) in ["重炮", "铁门栓"].into_iter().enumerate() {
+        let attempts = stats.goal_attempts[i] as f32;
+        metrics.extend([
+            (format!("{prefix}/goal/{name}/attempts"), attempts),
+            (
+                format!("{prefix}/goal/{name}/successes"),
+                stats.goal_successes[i] as f32,
+            ),
+            (
+                format!("{prefix}/goal/{name}/unknown"),
+                stats.goal_unknown[i] as f32,
+            ),
+        ]);
+        if attempts > 0.0 {
+            metrics.push((
+                format!("{prefix}/goal/{name}/success_rate"),
+                stats.goal_successes[i] as f32 / attempts,
+            ));
+        }
+    }
+    if stats.games > 0 {
+        metrics.extend([
+            (
+                format!("{prefix}/supervision_coverage"),
+                stats.labeled_games as f32 / stats.games as f32,
+            ),
+            (
+                format!("{prefix}/unknown_rate"),
+                stats.unknown_games as f32 / stats.games as f32,
+            ),
+        ]);
+    }
+    for (i, pattern) in chineseai::xiangqi::MatingPattern::ALL
+        .into_iter()
+        .enumerate()
+    {
+        let name = pattern.name();
+        let count = stats.pattern_counts[i] as f32;
+        metrics.push((format!("{prefix}/{name}/count"), count));
+        if stats.games > 0 {
+            metrics.push((
+                format!("{prefix}/{name}/all_games_rate"),
+                count / stats.games as f32,
+            ));
+        }
+        if stats.checkmates > 0 {
+            metrics.push((
+                format!("{prefix}/{name}/checkmates_rate"),
+                count / stats.checkmates as f32,
+            ));
+        }
+    }
+    metrics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_totals_use_combined_counts_instead_of_averaging_batch_rates() {
+        let mut total = chineseai::az::AzMatingStats::default();
+        for (games, checkmates, unknown, count) in [(4, 1, 2, 1), (6, 2, 3, 2)] {
+            let mut batch = chineseai::az::AzMatingStats {
+                games,
+                checkmates,
+                unknown_games: unknown,
+                labeled_games: games - unknown,
+                ..Default::default()
+            };
+            batch.pattern_counts[0] = count;
+            batch.pattern_counts[1] = count;
+            total.add_assign(&batch);
+        }
+        let metrics = mating_count_metrics(&total, "mating_total")
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(metrics["mating_total/games"], 10.0);
+        assert_eq!(metrics["mating_total/labeled_games"], 5.0);
+        assert_eq!(metrics["mating_total/unknown_games"], 5.0);
+        assert_eq!(metrics["mating_total/重炮/count"], 3.0);
+        assert_eq!(metrics["mating_total/重炮/all_games_rate"], 0.3);
+        assert_eq!(metrics["mating_total/重炮/checkmates_rate"], 1.0);
+        assert_eq!(metrics["mating_total/马后炮/checkmates_rate"], 1.0);
+    }
+
+    #[test]
+    fn training_report_preserves_mating_counts_and_prediction_moments() {
+        let mut pending = PendingTrainingData::default();
+        pending.selfplay.mating.games = 3;
+        pending.selfplay.mating.checkmates = 1;
+        pending.selfplay.mating.unknown_games = 2;
+        pending.selfplay.mating.pattern_counts[0] = 1;
+        let mut stats = chineseai::az::AzTrainStats {
+            mating_loss: 0.25,
+            mating_samples: 2,
+            ..Default::default()
+        };
+        stats.mating_target_sum[0] = 1.0;
+        stats.mating_pred_sum[0] = 1.2;
+        stats.mating_brier_sum[0] = 0.08;
+        stats.goal_loss = 0.3;
+        stats.goal_samples = 2;
+        stats.goal_target_sum = 1.0;
+        stats.goal_pred_sum = 1.2;
+        stats.goal_brier_sum = 0.08;
+        let report = build_async_training_report(
+            pending,
+            3,
+            stats,
+            0.001,
+            4,
+            0.1,
+            4,
+            100,
+            Default::default(),
+            0.0,
+        );
+        assert_eq!(report.mating.games, 3);
+        assert_eq!(report.mating.checkmates, 1);
+        assert_eq!(report.mating.unknown_games, 2);
+        assert_eq!(report.mating.pattern_counts[0], 1);
+        assert_eq!(report.mating_loss, 0.25);
+        assert_eq!(report.mating_samples, 2);
+        assert_eq!(report.mating_target_sum, stats.mating_target_sum);
+        assert_eq!(report.mating_pred_sum, stats.mating_pred_sum);
+        assert_eq!(report.mating_brier_sum, stats.mating_brier_sum);
+        assert_eq!(report.goal_loss, stats.goal_loss);
+        assert_eq!(report.goal_samples, stats.goal_samples);
+        assert_eq!(report.goal_target_sum, stats.goal_target_sum);
+        assert_eq!(report.goal_pred_sum, stats.goal_pred_sum);
+        assert_eq!(report.goal_brier_sum, stats.goal_brier_sum);
+    }
+
+    #[test]
+    fn mating_metrics_use_game_and_valid_sample_denominators() {
+        let mut report = AzLoopReport::default();
+        report.mating.games = 4;
+        report.mating.checkmates = 2;
+        report.mating.labeled_games = 3;
+        report.mating.unknown_games = 1;
+        report.mating.pattern_counts[0] = 2;
+        report.mating.pattern_counts[1] = 2;
+        report.mating_samples = 5;
+        report.mating_target_sum[0] = 2.0;
+        report.mating_pred_sum[0] = 3.0;
+        report.mating_brier_sum[0] = 0.5;
+        let metrics = mating_metrics(&report)
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(metrics["mating/重炮/all_games_rate"], 0.5);
+        assert_eq!(metrics["mating/重炮/checkmates_rate"], 1.0);
+        assert_eq!(metrics["mating/马后炮/checkmates_rate"], 1.0);
+        assert_eq!(metrics["mating/supervision_coverage"], 0.75);
+        assert_eq!(metrics["train/mating/重炮/target_rate"], 0.4);
+        assert_eq!(metrics["train/mating/重炮/pred_mean"], 0.6);
+        assert_eq!(metrics["train/mating/重炮/brier"], 0.1);
+    }
+
+    #[test]
+    fn unknown_batches_do_not_report_zero_loss_as_measured_supervision() {
+        let metrics = mating_metrics(&AzLoopReport::default());
+        assert!(metrics.iter().all(|(_, value)| value.is_finite()));
+        assert!(
+            !metrics
+                .iter()
+                .any(|(tag, _)| tag == "train/mating_bce" || tag.ends_with("/brier"))
+        );
     }
 }

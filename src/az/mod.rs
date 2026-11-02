@@ -22,6 +22,8 @@ mod fused_sparse_policy;
 mod history;
 mod inference;
 mod mate;
+mod mating_goal;
+mod mating_stats;
 mod mlh;
 pub mod nnue;
 mod node_threat;
@@ -62,7 +64,10 @@ pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
     play_arena_games_from_positions, play_arena_games_from_snapshots,
 };
-pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats, Px0ReplaySampler};
+pub use replay::{
+    AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats, Px0ReplaySampler,
+    replay_game_is_test,
+};
 pub use start::AzStartSnapshot;
 pub use train::{
     AzTrainOptimizer, train_samples, train_samples_weighted, train_samples_weighted_owned,
@@ -86,13 +91,19 @@ pub(crate) use simd::*;
 
 pub use arch::{
     AzMovesLeftParams, AzNnueArch, CHECK_CONTEXT_SIZE, DENSE_MOVE_SPACE, HISTORY_CONTEXT_SIZE,
-    POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE, RULE_CONTEXT_SIZE, dense_move_index,
+    MATING_HEAD_SIZE, POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE, RULE_CONTEXT_SIZE,
+    dense_move_index,
 };
-pub use inference::{AzNnue, outputs_for_training_sample, position_for_training_sample};
+pub use inference::{
+    AzNnue, goal_outputs_for_training_sample, mating_outputs_for_training_sample,
+    outputs_for_training_sample, position_for_training_sample,
+};
 pub use mate::{
     MateSearchLimits, MateSearchOutcome, MateSearchReport, MateSolution, search_root_mate,
     search_root_mate_profiled,
 };
+pub use mating_goal::{AzMatingGoal, GOAL_CONTEXT_SIZE, MatingTarget};
+pub use mating_stats::AzMatingStats;
 pub use sample::{
     AzHoldoutReport, AzLoopConfig, AzLoopReport, AzPhaseValueReport, AzPolicyGroupStats,
     AzSampleMeta, AzStartSource, AzTrainLossWeights, AzTrainStats, AzTrainingSample,

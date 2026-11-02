@@ -1,4 +1,4 @@
-use chineseai::az::{AzMovesLeftParams, AzNnueArch, AzTrainOptimizer};
+use chineseai::az::{AzMatingGoal, AzMovesLeftParams, AzNnueArch, AzTrainOptimizer};
 use chineseai::infra::version::AZ_LOOP_CONFIG_FORMAT_VERSION;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write, fs, path::Path};
@@ -75,6 +75,12 @@ pub struct AzLoopFileConfig {
     pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
+    /// 多标签杀法辅助头的损失权重，0 关闭其训练。
+    pub mating_loss_weight: f32,
+    pub mating_goal: AzMatingGoal,
+    pub mating_goal_mix: bool,
+    /// 指定杀法达成价值头的损失权重，0 关闭训练。
+    pub goal_loss_weight: f32,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -155,6 +161,10 @@ impl Default for AzLoopFileConfig {
             mirror_probability: 0.5,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
+            mating_loss_weight: 0.1,
+            mating_goal: AzMatingGoal::default(),
+            mating_goal_mix: false,
+            goal_loss_weight: 0.1,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
@@ -270,6 +280,9 @@ impl AzLoopFileConfig {
         line!("mirror_probability", f(self.mirror_probability));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
+        line!("mating_loss_weight", f(self.mating_loss_weight));
+        line!("mating_goal_mix", self.mating_goal_mix);
+        line!("goal_loss_weight", f(self.goal_loss_weight));
         line!("checkpoint_interval", self.checkpoint_interval);
         line!("checkpoint_dir", q(&self.checkpoint_dir));
         line!("max_checkpoints", self.max_checkpoints);
@@ -314,6 +327,8 @@ impl AzLoopFileConfig {
             f(self.pikafish_label_eval_policy_softmax_temp)
         );
         line!("tensorboard_logdir", q(&self.tensorboard_logdir));
+        writeln!(out, "\n[mating_goal]").unwrap();
+        out.push_str(&toml::to_string(&self.mating_goal).expect("serialize mating goal"));
         out
     }
 
@@ -349,6 +364,13 @@ impl AzLoopFileConfig {
     }
 
     fn normalize(mut self) -> Self {
+        self.mating_goal
+            .validate()
+            .expect("invalid az-loop mating_goal");
+        assert!(
+            self.goal_loss_weight.is_finite() && self.goal_loss_weight >= 0.0,
+            "goal_loss_weight must be finite and nonnegative"
+        );
         let moves_left = self.moves_left_params();
         self.moves_left_enabled = moves_left.enabled;
         self.moves_left_threshold = moves_left.threshold;
@@ -398,6 +420,11 @@ impl AzLoopFileConfig {
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
+        self.mating_loss_weight = if self.mating_loss_weight.is_finite() {
+            self.mating_loss_weight.max(0.0)
+        } else {
+            Self::default().mating_loss_weight
+        };
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
@@ -415,6 +442,74 @@ impl AzLoopFileConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mating_goal_config_roundtrips_mixing_and_keeps_none_strength() {
+        let defaults = AzLoopFileConfig::default();
+        assert!(!defaults.mating_goal.enabled());
+        assert!(!defaults.mating_goal_mix);
+        for target in [
+            chineseai::az::MatingTarget::None,
+            chineseai::az::MatingTarget::DoubleCannon,
+            chineseai::az::MatingTarget::IronBolt,
+        ] {
+            let config = AzLoopFileConfig {
+                mating_goal: AzMatingGoal {
+                    target,
+                    side: chineseai::xiangqi::Color::Black,
+                    strength: 0.6,
+                },
+                mating_goal_mix: true,
+                goal_loss_weight: 0.0,
+                ..Default::default()
+            };
+            let restored = AzLoopFileConfig::parse(&config.to_file_text());
+            assert_eq!(restored.mating_goal, config.mating_goal);
+            assert!(restored.mating_goal_mix);
+            assert_eq!(restored.goal_loss_weight, 0.0);
+        }
+        let invalid = AzLoopFileConfig {
+            mating_goal: AzMatingGoal {
+                strength: 1.1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            std::panic::catch_unwind(|| AzLoopFileConfig::parse(&invalid.to_file_text())).is_err()
+        );
+    }
+
+    #[test]
+    fn mating_loss_weight_roundtrips_and_allows_ablation() {
+        assert_eq!(AzLoopFileConfig::default().mating_loss_weight, 0.1);
+        for weight in [0.0, 0.25] {
+            let text = AzLoopFileConfig {
+                mating_loss_weight: weight,
+                ..Default::default()
+            }
+            .to_file_text();
+            assert_eq!(AzLoopFileConfig::parse(&text).mating_loss_weight, weight);
+        }
+        assert_eq!(
+            AzLoopFileConfig {
+                mating_loss_weight: -1.0,
+                ..Default::default()
+            }
+            .normalize()
+            .mating_loss_weight,
+            0.0
+        );
+        assert_eq!(
+            AzLoopFileConfig {
+                mating_loss_weight: f32::NAN,
+                ..Default::default()
+            }
+            .normalize()
+            .mating_loss_weight,
+            0.1
+        );
+    }
 
     #[test]
     fn embedded_defaults_match_public_px0_selfplay_settings() {
@@ -555,7 +650,9 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 32\n"));
+        assert!(text.starts_with(&format!(
+            "format_version = {AZ_LOOP_CONFIG_FORMAT_VERSION}\n"
+        )));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
@@ -642,9 +739,10 @@ mod tests {
 
     #[test]
     fn old_config_versions_are_rejected() {
-        let text = AzLoopFileConfig::default()
-            .to_file_text()
-            .replace("format_version = 32", "format_version = 27");
+        let text = AzLoopFileConfig::default().to_file_text().replace(
+            &format!("format_version = {AZ_LOOP_CONFIG_FORMAT_VERSION}"),
+            &format!("format_version = {}", AZ_LOOP_CONFIG_FORMAT_VERSION - 1),
+        );
         let error = std::panic::catch_unwind(|| AzLoopFileConfig::parse(&text));
         assert!(error.is_err());
     }

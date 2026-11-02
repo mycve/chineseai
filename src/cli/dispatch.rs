@@ -2,7 +2,8 @@ use clap::{CommandFactory, Parser};
 
 use crate::cli::args::{Cli, CliCommand};
 use crate::cli::{
-    az_bench, az_calibrate_policy, az_init, az_loop, az_policy_scale, az_search, vs_pikafish,
+    az_bench, az_calibrate_policy, az_init, az_loop, az_mating_probe, az_policy_scale, az_search,
+    mate_classify, vs_pikafish,
 };
 
 pub(crate) fn run() {
@@ -25,6 +26,8 @@ pub(crate) fn run() {
             }
         }
         Some(CliCommand::VsPikafish(cmd)) => vs_pikafish::run(cmd),
+        Some(CliCommand::MateClassify(cmd)) => mate_classify::run(cmd),
+        Some(CliCommand::AzMatingProbe(cmd)) => az_mating_probe::run(cmd),
     }
     chineseai::infra::profile::print_report();
 }

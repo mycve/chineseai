@@ -1,6 +1,6 @@
 use crate::az::{
-    AzCandidate, AzMovesLeftParams, AzNnue, AzSearchControl, AzSearchLimits, AzUciSearchResult,
-    SplitMix64, cp_from_q, search_uci,
+    AzCandidate, AzMatingGoal, AzMovesLeftParams, AzNnue, AzSearchControl, AzSearchLimits,
+    AzUciSearchResult, MatingTarget, SplitMix64, cp_from_q, search_uci,
 };
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
 use std::io::{self, BufRead, Write};
@@ -69,6 +69,7 @@ struct UciState {
     /// 更长的连杀需要更大的预算，代价线性体现在每手耗时上。
     mate_search_nodes: usize,
     moves_left_params: AzMovesLeftParams,
+    mating_goal: AzMatingGoal,
 }
 
 impl Default for UciState {
@@ -101,6 +102,7 @@ impl Default for UciState {
             mate_search_plies: DEFAULT_MATE_SEARCH_PLIES,
             mate_search_nodes: DEFAULT_MATE_SEARCH_NODES,
             moves_left_params: AzMovesLeftParams::default(),
+            mating_goal: AzMatingGoal::NONE,
         }
     }
 }
@@ -198,6 +200,11 @@ fn print_uci_id() {
     println!("option name OpeningTempPlies type spin default 0 min 0 max 1000");
     println!("option name OpeningTemperature type string default {DEFAULT_OPENING_TEMPERATURE}");
     println!("option name DrawScore type string default 0.0");
+    println!(
+        "option name MatingTarget type combo default none var none var double-cannon var iron-bolt"
+    );
+    println!("option name MatingStrength type string default 0.0");
+    println!("option name MatingSide type combo default red var red var black");
     println!("option name Sixty Move Rule type check default true");
     println!("option name RepetitionDraw type check default true");
     println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
@@ -275,6 +282,26 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         .unwrap_or_default();
 
     match name.as_str() {
+        "matingtarget" => match value.to_ascii_lowercase().parse::<MatingTarget>() {
+            Ok(target) => state.mating_goal.target = target,
+            Err(error) => println!("info string {error}"),
+        },
+        "matingstrength" => {
+            let parsed = value
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+            if let Some(strength) = parsed {
+                state.mating_goal.strength = strength;
+            } else {
+                println!("info string MatingStrength must be finite and within 0..1");
+            }
+        }
+        "matingside" => match value.to_ascii_lowercase().as_str() {
+            "red" => state.mating_goal.side = Color::Red,
+            "black" => state.mating_goal.side = Color::Black,
+            _ => println!("info string MatingSide must be red or black"),
+        },
         "movesleftenabled" => {
             if let Ok(enabled) = value.to_ascii_lowercase().parse::<bool>() {
                 state.moves_left_params.enabled = enabled;
@@ -416,7 +443,9 @@ fn handle_setoption(line: &str, state: &mut UciState) {
 }
 
 fn apply_rule_options(state: &mut UciState) {
-    state.position.set_repetition_draw_enabled(state.repetition_draw);
+    state
+        .position
+        .set_repetition_draw_enabled(state.repetition_draw);
     state
         .position
         .set_rule60_max_ply(state.sixty_move_rule.then_some(state.rule60_max_ply));
@@ -661,6 +690,15 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
     let control = AzSearchControl::new(Arc::clone(&stop), deadline);
+    if state.mating_goal.enabled() {
+        println!(
+            "info string mating target={} side={:?} strength={:.3} active={}",
+            state.mating_goal.target.key(),
+            state.mating_goal.side,
+            state.mating_goal.strength,
+            state.mating_goal.effective(&state.position).enabled()
+        );
+    }
     println!(
         "info string searchparams cpuct={:.4}/{:.4} base={:.1}/{:.1} factor={:.4}/{:.4} fpu={:.4}/{:.4} policytemp={:.4}",
         state.cpuct,
@@ -695,6 +733,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         legal,
         model,
         AzSearchLimits {
+            mating_goal: state.mating_goal,
             simulations,
             seed: state.seed,
             cpuct: state.cpuct,
@@ -751,6 +790,8 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
                     &result.candidates,
                     mv,
                     state.opening_temperature,
+                    state.mating_goal.effective(&state.position).enabled()
+                        && state.mating_goal.side == state.position.side_to_move(),
                     state.seed ^ entropy,
                 )
             } else {
@@ -877,6 +918,7 @@ fn choose_opening_move(
     candidates: &[AzCandidate],
     best: Move,
     temperature: f32,
+    goal_active: bool,
     seed: u64,
 ) -> Move {
     let priority = candidates
@@ -884,9 +926,13 @@ fn choose_opening_move(
         .map(AzCandidate::proof_priority)
         .max()
         .unwrap_or(0);
+    let honor_policy = goal_active && candidates.iter().any(|candidate| candidate.policy > 0.0);
+    let eligible = |candidate: &AzCandidate| {
+        candidate.proof_priority() == priority && (!honor_policy || candidate.policy > 0.0)
+    };
     let max_visits = candidates
         .iter()
-        .filter(|candidate| candidate.proof_priority() == priority)
+        .filter(|candidate| eligible(candidate))
         .map(|candidate| candidate.visits)
         .max()
         .unwrap_or(0);
@@ -895,7 +941,7 @@ fn choose_opening_move(
     }
     let exponent = 1.0 / temperature;
     let weight = |candidate: &AzCandidate| {
-        if candidate.proof_priority() != priority {
+        if !eligible(candidate) {
             return 0.0;
         }
         let visit_ratio = candidate.visits as f32 / max_visits as f32;
@@ -1221,6 +1267,38 @@ mod tests {
     }
 
     #[test]
+    fn mating_instruction_keeps_its_owner_across_turns_and_rejects_bad_strength() {
+        let mut state = UciState::default();
+        handle_setoption(
+            "setoption name MatingTarget value double-cannon",
+            &mut state,
+        );
+        handle_setoption("setoption name MatingStrength value 0.7", &mut state);
+        handle_setoption("setoption name MatingSide value black", &mut state);
+        let goal = state.mating_goal;
+        assert_eq!(goal.target, MatingTarget::DoubleCannon);
+        assert_eq!(goal.side, Color::Black);
+        assert_eq!(goal.strength, 0.7);
+        handle_position("position startpos moves h2e2", &mut state);
+        assert_eq!(state.position.side_to_move(), Color::Black);
+        assert_eq!(state.mating_goal, goal);
+        handle_position("position startpos moves h2e2 h7e7", &mut state);
+        assert_eq!(state.position.side_to_move(), Color::Red);
+        assert_eq!(state.mating_goal, goal);
+        for invalid in ["NaN", "inf", "-0.1", "1.1", "invalid"] {
+            handle_setoption(
+                &format!("setoption name MatingStrength value {invalid}"),
+                &mut state,
+            );
+            assert_eq!(state.mating_goal, goal);
+        }
+        handle_setoption("setoption name MatingTarget value 铁门栓", &mut state);
+        assert_eq!(state.mating_goal.target, MatingTarget::IronBolt);
+        handle_setoption("setoption name MatingStrength value 0", &mut state);
+        assert!(!state.mating_goal.enabled());
+    }
+
+    #[test]
     fn opening_temperature_samples_only_visited_moves() {
         let best = Move::new(0, 1);
         let alternate = Move::new(0, 2);
@@ -1234,6 +1312,7 @@ mod tests {
                 policy: 0.8,
                 solved: None,
                 moves_left: None,
+                goal_value: 0.0,
             },
             AzCandidate {
                 mv: alternate,
@@ -1244,6 +1323,7 @@ mod tests {
                 policy: 0.2,
                 solved: None,
                 moves_left: None,
+                goal_value: 0.0,
             },
             AzCandidate {
                 mv: Move::new(0, 3),
@@ -1254,15 +1334,26 @@ mod tests {
                 policy: 0.0,
                 solved: None,
                 moves_left: None,
+                goal_value: 0.0,
             },
         ];
-        assert_eq!(choose_opening_move(&candidates, best, 0.0, 1), best);
+        assert_eq!(choose_opening_move(&candidates, best, 0.0, false, 1), best);
         let alternates = (0..1000)
-            .map(|seed| choose_opening_move(&candidates, best, 1.0, seed))
+            .map(|seed| choose_opening_move(&candidates, best, 1.0, false, seed))
             .inspect(|mv| assert!(*mv == best || *mv == alternate))
             .filter(|mv| *mv == alternate)
             .count();
         assert!((100..300).contains(&alternates));
+        let mut controlled = candidates.clone();
+        controlled[0].policy = 0.0;
+        controlled[1].policy = 1.0;
+        for seed in 0..128 {
+            assert_eq!(
+                choose_opening_move(&controlled, alternate, 1.0, true, seed),
+                alternate,
+                "温度采样不能重新选中目标策略已排除的普通胜法"
+            );
+        }
     }
 
     #[test]

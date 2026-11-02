@@ -349,6 +349,7 @@ fn play_one_game(
                     policy_softmax_temp: config.policy_softmax_temp,
                     draw_score: 0.0,
                     value_scale: 1.0,
+                    mating_goal: crate::az::AzMatingGoal::NONE,
                 },
             );
             seed = seed.wrapping_add(1);

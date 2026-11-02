@@ -71,6 +71,11 @@ fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
         value_weight: 1.0,
         moves_left: 0.0,
         moves_left_weight: 0.0,
+        mating_targets: [0.0; chineseai::az::MATING_HEAD_SIZE],
+        mating_weight: 0.0,
+        mating_goal: chineseai::az::AzMatingGoal::NONE,
+        goal_target: 0.0,
+        goal_weight: 0.0,
         search_simulations: 2_000,
         meta: AzSampleMeta {
             generation_update: generation,

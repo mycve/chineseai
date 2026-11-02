@@ -15,6 +15,7 @@ mod hash;
 mod legality;
 mod make_move;
 mod masks;
+mod mating;
 mod relations;
 mod rules;
 mod setup;
@@ -22,6 +23,7 @@ mod types;
 
 pub use env::{AppliedMove, IllegalMove, StepOutcome, XiangqiEnv};
 pub use geom::{parse_square, square_name};
+pub use mating::{MateClassification, MateKind, MatingPattern};
 pub use types::{
     Color, Move, Piece, PieceKind, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome, Undo,
 };

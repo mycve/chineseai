@@ -30,6 +30,11 @@ pub(super) struct AzCandleModel {
     value_head_output: Var,
     moves_left_output: Var,
     moves_left_bias: Var,
+    mating_output: Var,
+    mating_bias: Var,
+    goal_hidden: Var,
+    goal_output: Var,
+    goal_bias: Var,
     threat_embedding: Var,
     value_threat_output: Var,
     policy_threat_context: Var,
@@ -43,7 +48,7 @@ pub(super) struct AzCandleModel {
     policy_repetition_bias: Var,
 }
 
-/// 两个输出头消费同一份局面编码，策略头自行投影线性棋子表示。
+/// 各输出头消费同一份局面编码，策略头自行投影线性棋子表示。
 struct SharedEncoding {
     hidden: Tensor,
     board: Tensor,
@@ -54,18 +59,38 @@ impl AzCandleModel {
     pub(super) fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
         let encoded = self.encode_shared(batch)?;
         let value_logits = self.value_head(batch, &encoded)?;
-        let policy_logits = self.policy_head(batch, &encoded)?;
+        let goal_hidden =
+            (&encoded.hidden + batch.goal_features.matmul(&self.goal_hidden)?)?.relu()?;
+        let policy_hidden = if batch.has_policy_goals {
+            batch
+                .goal_policy_mask
+                .gt(0.0)?
+                .broadcast_as(encoded.hidden.shape())?
+                .where_cond(&goal_hidden, &encoded.hidden)?
+        } else {
+            encoded.hidden.clone()
+        };
+        let policy_logits = self.policy_head(batch, &encoded, &policy_hidden)?;
+        let goal_logits = goal_hidden
+            .matmul(&self.goal_output.t()?)?
+            .broadcast_add(&self.goal_bias)?;
         let moves_left_raw = encoded
             .hidden
             .matmul(&self.moves_left_output.t()?)?
             .broadcast_add(&self.moves_left_bias)?
             .affine(1.0, 1.0)?;
         let moves_left = moves_left_raw.relu()?;
+        let mating_logits = encoded
+            .hidden
+            .matmul(&self.mating_output.t()?)?
+            .broadcast_add(&self.mating_bias)?;
         Ok(ForwardOutput {
             moves_left,
             moves_left_raw,
             value_logits,
             policy_logits,
+            mating_logits,
+            goal_logits,
         })
     }
 
@@ -121,8 +146,13 @@ impl AzCandleModel {
         logits + encoded.threat.matmul(&self.value_threat_output.t()?)?
     }
 
-    fn policy_head(&self, batch: &BatchTensors, encoded: &SharedEncoding) -> CandleResult<Tensor> {
-        let context = (encoded.hidden.matmul(&self.policy_context_hidden.t()?)?
+    fn policy_head(
+        &self,
+        batch: &BatchTensors,
+        encoded: &SharedEncoding,
+        hidden: &Tensor,
+    ) -> CandleResult<Tensor> {
+        let context = (hidden.matmul(&self.policy_context_hidden.t()?)?
             + encoded.threat.matmul(&self.policy_threat_context.t()?)?)?;
         let linear = encoded.board.matmul(&self.policy_accumulator_hidden.t()?)?;
         let context = Tensor::cat(&[&context, &linear], 1)?;
@@ -135,8 +165,7 @@ impl AzCandleModel {
         )?
         .flatten_all()?;
         let dynamic = fused_policy(&moves, &context, &batch.policy_items)?;
-        let repetition = encoded
-            .hidden
+        let repetition = hidden
             .matmul(
                 &self
                     .policy_repetition_hidden
@@ -144,8 +173,9 @@ impl AzCandleModel {
                     .reshape((self.arch.hidden_size, 1))?,
             )?
             .broadcast_add(&self.policy_repetition_bias)?;
-        (dynamic + self.policy_prior(batch)?)?
-            + batch.policy_repetition.broadcast_mul(&repetition)?
+        ((dynamic + self.policy_prior(batch)?)?
+            + batch.policy_repetition.broadcast_mul(&repetition)?)?
+            + &batch.goal_policy_bias
     }
 
     /// 几何、将位、吃子和战术表共同组成候选走法先验。
@@ -172,6 +202,8 @@ pub(super) struct ForwardOutput {
     pub(super) moves_left_raw: Tensor,
     pub(super) value_logits: Tensor,
     pub(super) policy_logits: Tensor,
+    pub(super) mating_logits: Tensor,
+    pub(super) goal_logits: Tensor,
 }
 
 pub(super) struct MovesLeftPairs {
@@ -183,6 +215,9 @@ pub(super) struct MovesLeftPairs {
 
 pub(super) struct BatchTensors {
     pub(super) batch_size: usize,
+    pub(super) has_mating_targets: bool,
+    pub(super) has_goal_targets: bool,
+    pub(super) has_policy_goals: bool,
     pub(super) value_buckets: Tensor,
     pub(super) feature_items: Tensor,
     pub(super) value_threat_indices: Tensor,
@@ -202,6 +237,13 @@ pub(super) struct BatchTensors {
     pub(super) value_weights: Tensor,
     pub(super) moves_left_targets: Tensor,
     pub(super) moves_left_weights: Tensor,
+    pub(super) mating_targets: Tensor,
+    pub(super) mating_weights: Tensor,
+    pub(super) goal_features: Tensor,
+    pub(super) goal_policy_mask: Tensor,
+    pub(super) goal_policy_bias: Tensor,
+    pub(super) goal_targets: Tensor,
+    pub(super) goal_weights: Tensor,
     pub(super) moves_left_pairs: Option<MovesLeftPairs>,
     pub(super) value_phase_masks: Tensor,
     pub(super) value_source_phase_masks: Tensor,
@@ -210,6 +252,9 @@ pub(super) struct BatchTensors {
 impl BatchTensors {
     pub(super) fn from_packed(packed: PackedBatch, device: &Device) -> CandleResult<Self> {
         let batch_size = packed.batch_size;
+        let has_mating_targets = packed.mating_weights.iter().any(|&weight| weight > 0.0);
+        let has_goal_targets = packed.goal_weights.iter().any(|&weight| weight > 0.0);
+        let has_policy_goals = packed.goal_policy_mask.iter().any(|&weight| weight > 0.0);
         let max_features = packed.max_features;
         let max_policy_moves = packed.max_policy_moves;
         let max_value_threats = packed.max_value_threats;
@@ -245,6 +290,9 @@ impl BatchTensors {
         };
         Ok(Self {
             batch_size,
+            has_mating_targets,
+            has_goal_targets,
+            has_policy_goals,
             moves_left_pairs,
             value_buckets: Tensor::from_vec(packed.value_buckets, batch_size, device)?,
             feature_items: Tensor::from_vec(
@@ -309,6 +357,25 @@ impl BatchTensors {
             value_weights: Tensor::from_vec(packed.value_weights, batch_size, device)?,
             moves_left_targets: Tensor::from_vec(packed.moves_left_targets, batch_size, device)?,
             moves_left_weights: Tensor::from_vec(packed.moves_left_weights, batch_size, device)?,
+            mating_targets: Tensor::from_vec(
+                packed.mating_targets,
+                (batch_size, super::MATING_HEAD_SIZE),
+                device,
+            )?,
+            mating_weights: Tensor::from_vec(packed.mating_weights, batch_size, device)?,
+            goal_features: Tensor::from_vec(
+                packed.goal_features,
+                (batch_size, super::GOAL_CONTEXT_SIZE),
+                device,
+            )?,
+            goal_policy_mask: Tensor::from_vec(packed.goal_policy_mask, (batch_size, 1), device)?,
+            goal_policy_bias: Tensor::from_vec(
+                packed.goal_policy_bias,
+                (batch_size, max_policy_moves),
+                device,
+            )?,
+            goal_targets: Tensor::from_vec(packed.goal_targets, (batch_size, 1), device)?,
+            goal_weights: Tensor::from_vec(packed.goal_weights, batch_size, device)?,
             value_phase_masks: Tensor::from_vec(packed.value_phase_masks, (batch_size, 3), device)?,
             value_source_phase_masks: Tensor::from_vec(
                 packed.value_source_phase_masks,
@@ -361,6 +428,19 @@ impl AzCandleModel {
             )?,
             moves_left_output: var_from_slice(&model.moves_left_output, (1, hidden), device)?,
             moves_left_bias: var_from_slice(&model.moves_left_bias, 1, device)?,
+            mating_output: var_from_slice(
+                &model.mating_output,
+                (super::MATING_HEAD_SIZE, hidden),
+                device,
+            )?,
+            mating_bias: var_from_slice(&model.mating_bias, super::MATING_HEAD_SIZE, device)?,
+            goal_hidden: var_from_slice(
+                &model.goal_hidden,
+                (super::GOAL_CONTEXT_SIZE, hidden),
+                device,
+            )?,
+            goal_output: var_from_slice(&model.goal_output, (1, hidden), device)?,
+            goal_bias: var_from_slice(&model.goal_bias, 1, device)?,
             threat_embedding: var_from_slice(
                 &model.threat_embedding,
                 (VALUE_THREAT_VOCAB, VALUE_THREAT_RANK),
@@ -414,6 +494,20 @@ impl AzCandleModel {
     #[cfg(test)]
     pub(super) fn all_vars(&self) -> Vec<Var> {
         self.all_vars_with_decay().0
+    }
+
+    #[cfg(test)]
+    pub(super) fn mating_vars(&self) -> [Var; 2] {
+        [self.mating_output.clone(), self.mating_bias.clone()]
+    }
+
+    #[cfg(test)]
+    pub(super) fn goal_vars(&self) -> [Var; 3] {
+        [
+            self.goal_hidden.clone(),
+            self.goal_output.clone(),
+            self.goal_bias.clone(),
+        ]
     }
 
     /// 查表参数和偏置不衰减；分组与张量形状共用结构清单。
@@ -473,6 +567,517 @@ mod tests {
         xiangqi::Position,
     };
 
+    fn mating_sample() -> AzTrainingSample {
+        let position = Position::startpos();
+        let moves = position.legal_moves();
+        AzTrainingSample {
+            features: extract_sparse_features_az(&position),
+            rule_context: [0.0; RULE_CONTEXT_SIZE],
+            history_features: crate::az::history_features(&position, &[]),
+            move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
+            repetition_flags: vec![0; moves.len()],
+            policy: vec![1.0 / moves.len() as f32; moves.len()],
+            value_wdl: [1.0, 0.0, 0.0],
+            root_search_wdl: [1.0, 0.0, 0.0],
+            value: 1.0,
+            side_sign: 1.0,
+            policy_weight: 0.0,
+            value_weight: 0.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 1.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
+            search_simulations: 0,
+            meta: Default::default(),
+        }
+    }
+
+    fn goal_sample(position: &Position, goal: crate::az::AzMatingGoal) -> AzTrainingSample {
+        let moves = position.legal_moves();
+        let side = position.side_to_move();
+        AzTrainingSample {
+            features: extract_sparse_features_az(position),
+            rule_context: crate::az::rule_context_features(position, &[]),
+            history_features: crate::az::history_features(position, &[]),
+            move_indices: moves
+                .iter()
+                .map(|&mv| dense_move_index(crate::az::nnue::canonical_move(side, mv)))
+                .collect(),
+            repetition_flags: vec![0; moves.len()],
+            policy: vec![1.0 / moves.len() as f32; moves.len()],
+            side_sign: if side == crate::xiangqi::Color::Red {
+                1.0
+            } else {
+                -1.0
+            },
+            mating_goal: goal,
+            goal_target: 1.0,
+            goal_weight: 1.0,
+            ..mating_sample()
+        }
+    }
+
+    fn conditioned_model() -> AzNnue {
+        let mut model = AzNnue::random(8, 1820);
+        for (i, weight) in model.goal_hidden.iter_mut().enumerate() {
+            *weight = ((i % 11) as f32 - 3.0) * 0.1;
+        }
+        for (i, weight) in model.policy_move_context.iter_mut().enumerate() {
+            *weight = ((i % 13) as f32 - 6.0) * 0.003;
+        }
+        model.goal_output.fill(0.03);
+        model.goal_bias[0] = -1.0;
+        model
+    }
+
+    fn check_goal_conditioning_matches_cpu(device: &Device) {
+        use crate::{
+            az::{AzMatingGoal, MatingTarget},
+            xiangqi::Color,
+        };
+        let owner = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 0.7,
+        };
+        let opponent = AzMatingGoal {
+            target: MatingTarget::IronBolt,
+            side: Color::Black,
+            strength: 0.7,
+        };
+        let start = Position::startpos();
+        let mut black_turn = start.clone();
+        black_turn.make_move(black_turn.parse_uci_move("h2e2").unwrap());
+        let samples = vec![
+            goal_sample(&start, owner),
+            goal_sample(&start, opponent),
+            goal_sample(&black_turn, owner),
+            goal_sample(&black_turn.mirror_files(), owner),
+            goal_sample(&start, AzMatingGoal::NONE),
+        ];
+        let packed = PackedBatch::from_indices(&samples, &[0, 1, 2, 3, 4]);
+        assert_eq!(&packed.goal_features[..4], &[0.7, 0.0, 0.0, 0.0]);
+        assert_eq!(&packed.goal_features[4..8], &[0.0, 0.0, 0.0, 0.7]);
+        assert_eq!(&packed.goal_features[8..12], &[0.0, 0.0, 0.7, 0.0]);
+        assert_eq!(&packed.goal_features[8..12], &packed.goal_features[12..16]);
+        assert_eq!(packed.goal_policy_mask, [1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(packed.goal_targets, [1.0, 1.0, 1.0, 1.0, 0.0]);
+        let batch = BatchTensors::from_packed(packed, device).unwrap();
+        let model = conditioned_model();
+        let candle = AzCandleModel::from_model(&model, device).unwrap();
+        let forward = candle.forward(&batch).unwrap();
+        let goal_probs = candle_nn::ops::sigmoid(&forward.goal_logits)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let policy = forward.policy_logits.to_vec2::<f32>().unwrap();
+        let wdl = forward.value_logits.to_vec2::<f32>().unwrap();
+        for (row, sample) in samples.iter().enumerate() {
+            let (cpu_goal, cpu_policy) =
+                crate::az::goal_outputs_for_training_sample(&model, sample).unwrap();
+            if sample.mating_goal.enabled() {
+                assert!((cpu_goal - goal_probs[row][0]).abs() < 2e-5);
+            } else {
+                assert_eq!(cpu_goal, 0.0);
+            }
+            for (&cpu, &gpu) in cpu_policy.iter().zip(&policy[row]) {
+                assert!(
+                    (cpu - gpu).abs() < 2e-4,
+                    "row={row}: cpu={cpu} candle={gpu}"
+                );
+            }
+            let mut ordinary = sample.clone();
+            ordinary.mating_goal = AzMatingGoal::NONE;
+            let (base_wdl, base_policy) =
+                crate::az::outputs_for_training_sample(&model, &ordinary).unwrap();
+            let candle_wdl = crate::az::softmax_fixed3(wdl[row].clone().try_into().unwrap());
+            for (base, conditioned) in base_wdl.iter().zip(candle_wdl) {
+                assert!((base - conditioned).abs() < 2e-5);
+            }
+            if row == 0 {
+                assert!(
+                    cpu_policy
+                        .iter()
+                        .zip(&base_policy)
+                        .any(|(a, b)| (a - b).abs() > 1e-5)
+                );
+            } else {
+                assert_eq!(cpu_policy, base_policy, "对手和普通回合策略精确退回 base");
+            }
+        }
+    }
+
+    #[test]
+    fn goal_conditioning_matches_cpu_and_preserves_wdl_and_opponent_policy() {
+        check_goal_conditioning_matches_cpu(&Device::Cpu);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn goal_conditioning_matches_cpu_on_cuda() {
+        let device =
+            crate::az::cuda_test_device::shared_cuda_device().expect("CUDA device required");
+        check_goal_conditioning_matches_cpu(device);
+    }
+
+    #[test]
+    fn fixed_goal_owner_probability_does_not_become_one_minus_p_on_opponent_turn() {
+        use crate::{
+            az::{AzMatingGoal, MatingTarget},
+            xiangqi::Color,
+        };
+        let mut model = conditioned_model();
+        model.goal_output.fill(0.0);
+        model.goal_bias[0] = (9.0f32).ln();
+        for side in [Color::Red, Color::Black] {
+            let goal = AzMatingGoal {
+                target: MatingTarget::DoubleCannon,
+                side,
+                strength: 1.0,
+            };
+            let sample = goal_sample(&Position::startpos(), goal);
+            let (probability, _) =
+                crate::az::goal_outputs_for_training_sample(&model, &sample).unwrap();
+            assert!((probability - 0.9).abs() < 1e-6);
+            let batch = PackedBatch::from_indices(&[sample], &[0]);
+            assert_eq!(batch.goal_targets, [1.0]);
+        }
+    }
+
+    #[test]
+    fn disabled_or_unreachable_goals_preserve_base_outputs_and_shared_probe() {
+        use crate::{
+            az::{AzMatingGoal, MatingTarget},
+            xiangqi::Color,
+        };
+        let model = conditioned_model();
+        let active = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 1.0,
+        };
+        for (position, goal) in [
+            (Position::startpos(), AzMatingGoal::NONE),
+            (
+                Position::startpos(),
+                AzMatingGoal {
+                    strength: 0.0,
+                    ..active
+                },
+            ),
+            (
+                Position::from_fen("3k5/9/9/9/9/4C4/9/9/9/4K4 w").unwrap(),
+                active,
+            ),
+        ] {
+            let sample = goal_sample(&position, goal);
+            let mut ordinary = sample.clone();
+            ordinary.mating_goal = AzMatingGoal::NONE;
+            let (goal_value, goal_policy) =
+                crate::az::goal_outputs_for_training_sample(&model, &sample).unwrap();
+            let (_, ordinary_policy) =
+                crate::az::outputs_for_training_sample(&model, &ordinary).unwrap();
+            assert_eq!(goal_value, 0.0);
+            assert_eq!(goal_policy, ordinary_policy);
+            assert_eq!(
+                crate::az::mating_outputs_for_training_sample(&model, &sample),
+                crate::az::mating_outputs_for_training_sample(&model, &ordinary),
+            );
+            let packed = PackedBatch::from_indices(&[sample], &[0]);
+            assert_eq!(packed.goal_weights, [0.0]);
+            assert_eq!(packed.goal_policy_mask, [0.0]);
+        }
+    }
+
+    #[test]
+    fn full_and_incremental_evaluation_share_the_same_goal_encoding() {
+        use crate::{
+            az::{AzEvalAccumulator, AzMatingGoal, MatingTarget},
+            xiangqi::Color,
+        };
+        let model = conditioned_model();
+        let position = Position::startpos();
+        let moves = position.legal_moves();
+        let goal = AzMatingGoal {
+            target: MatingTarget::IronBolt,
+            side: Color::Red,
+            strength: 0.5,
+        };
+        let mut full = AzEvalScratch::new(model.arch);
+        full.mating_goal = goal;
+        let rules = crate::az::rule_context_features(&position, &[]);
+        let expected = model.evaluate_with_scratch_output(&position, &moves, &rules, &mut full);
+        let accumulator = AzEvalAccumulator::new(&model, &position);
+        let policy_accumulator = model.policy_accumulator(&position, position.side_to_move());
+        let mut incremental = AzEvalScratch::new(model.arch);
+        incremental.mating_goal = goal;
+        let actual = model.evaluate_incremental_with_scratch_output(
+            &position,
+            &accumulator.hidden_sum,
+            &policy_accumulator,
+            &moves,
+            &[],
+            &rules,
+            &mut incremental,
+        );
+        assert!((expected.goal_value - actual.goal_value).abs() < 1e-6);
+        for (a, b) in expected.value_wdl.iter().zip(actual.value_wdl) {
+            assert!((a - b).abs() < 1e-6);
+        }
+        for (a, b) in full.logits.iter().zip(incremental.logits) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn goal_scalar_bce_learns_both_outcomes_and_reaches_the_residual_and_shared_trunk() {
+        use crate::{
+            az::{AzMatingGoal, MatingTarget},
+            xiangqi::Color,
+        };
+        let goal = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 0.7,
+        };
+        let mut model = AzNnue::random(8, 1821);
+        model.shared_bias.fill(1.0);
+        for target in [0.0, 1.0] {
+            let mut sample = goal_sample(&Position::startpos(), goal);
+            sample.goal_target = target;
+            let batch =
+                BatchTensors::from_packed(PackedBatch::from_indices(&[sample], &[0]), &Device::Cpu)
+                    .unwrap();
+            let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+            let objective = || {
+                let forward = candle.forward(&batch).unwrap();
+                let loss = crate::az::train_gpu_candle::mating_bce_per_sample(
+                    &forward.goal_logits,
+                    &batch.goal_targets,
+                )
+                .unwrap()
+                .mean_all()
+                .unwrap();
+                let probability = candle_nn::ops::sigmoid(&forward.goal_logits)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap()[0][0];
+                (loss, probability)
+            };
+            let (loss, initial) = objective();
+            let initial_loss = loss.to_scalar::<f32>().unwrap();
+            let first = loss.backward().unwrap();
+            assert!(
+                first
+                    .get(&candle.goal_output)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .iter()
+                    .any(|&x| x != 0.0)
+            );
+            let mut optimizer = crate::az::adamw::AzAdamW::new(
+                vec![
+                    candle.goal_hidden.clone(),
+                    candle.goal_output.clone(),
+                    candle.goal_bias.clone(),
+                ],
+                vec![false; 3],
+                0.1,
+            )
+            .unwrap();
+            optimizer.step(&first).unwrap();
+            let second = objective().0.backward().unwrap();
+            for var in [&candle.goal_hidden, &candle.shared_hidden] {
+                assert!(
+                    second
+                        .get(var)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                        .iter()
+                        .any(|&x| x != 0.0)
+                );
+            }
+            assert!(second.get(&candle.value_head_output).is_none());
+            assert!(second.get(&candle.mating_output).is_none());
+            for _ in 0..12 {
+                optimizer.step(&objective().0.backward().unwrap()).unwrap();
+            }
+            let (loss, final_probability) = objective();
+            assert!(loss.to_scalar::<f32>().unwrap() < initial_loss);
+            assert!((final_probability - initial) * (target - 0.5) > 0.0);
+        }
+    }
+
+    #[test]
+    fn mating_head_matches_cpu_without_changing_wdl() {
+        let sample = mating_sample();
+        let batch = BatchTensors::from_packed(
+            PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mut model = AzNnue::random(8, 1801);
+        let baseline_wdl = AzCandleModel::from_model(&model, &Device::Cpu)
+            .unwrap()
+            .forward(&batch)
+            .unwrap()
+            .value_logits
+            .to_vec2::<f32>()
+            .unwrap();
+        for (i, weight) in model.mating_output.iter_mut().enumerate() {
+            *weight = (i % 7) as f32 * 0.003 - 0.009;
+        }
+        model.mating_bias.fill(0.25);
+        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let forward = candle.forward(&batch).unwrap();
+        assert_eq!(baseline_wdl, forward.value_logits.to_vec2::<f32>().unwrap());
+        let probs = candle_nn::ops::sigmoid(&forward.mating_logits)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let (cpu, _) = crate::az::mating_outputs_for_training_sample(&model, &sample).unwrap();
+        for (gpu, cpu) in probs[0].iter().zip(cpu) {
+            assert!((gpu - cpu).abs() < 2e-5, "candle={gpu} cpu={cpu}");
+        }
+        assert!(
+            probs[0].iter().sum::<f32>() > 1.0,
+            "杀法头应独立 sigmoid，不作互斥归一化"
+        );
+    }
+
+    #[test]
+    fn mating_loss_reaches_shared_encoding_and_masks_unknown_rows() {
+        let mut sample = mating_sample();
+        sample.mating_targets[0] = 1.0;
+        let batch = BatchTensors::from_packed(
+            PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mut model = AzNnue::random(8, 1802);
+        model.shared_bias.fill(1.0);
+        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let objective = |batch: &BatchTensors| {
+            let forward = candle.forward(batch).unwrap();
+            let rows = crate::az::train_gpu_candle::mating_bce_per_sample(
+                &forward.mating_logits,
+                &batch.mating_targets,
+            )
+            .unwrap();
+            (&rows * &batch.mating_weights).unwrap().sum_all().unwrap()
+        };
+        let first = objective(&batch).backward().unwrap();
+        assert!(
+            first
+                .get(&candle.mating_output)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .any(|&x| x != 0.0)
+        );
+        // 零初始化读出先学会方向，随后梯度进入共享主干；不引入私有杀法主干。
+        let mut optimizer = crate::az::adamw::AzAdamW::new(
+            vec![candle.mating_output.clone(), candle.mating_bias.clone()],
+            vec![false; 2],
+            0.03,
+        )
+        .unwrap();
+        optimizer.step(&first).unwrap();
+        let second = objective(&batch).backward().unwrap();
+        assert!(
+            second
+                .get(&candle.shared_hidden)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .any(|&x| x != 0.0)
+        );
+        assert!(second.get(&candle.value_head_output).is_none());
+
+        sample.mating_weight = 0.0;
+        sample.mating_targets.fill(f32::NAN);
+        let masked =
+            BatchTensors::from_packed(PackedBatch::from_indices(&[sample], &[0]), &Device::Cpu)
+                .unwrap();
+        let loss = objective(&masked);
+        assert_eq!(loss.to_scalar::<f32>().unwrap(), 0.0);
+        let gradients = loss.backward().unwrap();
+        for var in [
+            &candle.mating_output,
+            &candle.mating_bias,
+            &candle.shared_hidden,
+        ] {
+            if let Some(gradient) = gradients.get(var) {
+                assert!(
+                    gradient
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                        .iter()
+                        .all(|&x| x == 0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mating_head_learns_positive_and_negative_labels() {
+        let mut sample = mating_sample();
+        sample.mating_targets[0] = 1.0;
+        let batch =
+            BatchTensors::from_packed(PackedBatch::from_indices(&[sample], &[0]), &Device::Cpu)
+                .unwrap();
+        let mut model = AzNnue::random(8, 1803);
+        model.shared_bias.fill(1.0);
+        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let evaluate = || {
+            let forward = candle.forward(&batch).unwrap();
+            let loss = crate::az::train_gpu_candle::mating_bce_per_sample(
+                &forward.mating_logits,
+                &batch.mating_targets,
+            )
+            .unwrap()
+            .mean_all()
+            .unwrap();
+            let probs = candle_nn::ops::sigmoid(&forward.mating_logits)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            (loss, probs[0].clone())
+        };
+        let (initial_loss, initial_probs) = evaluate();
+        let initial_loss = initial_loss.to_scalar::<f32>().unwrap();
+        let mut optimizer = crate::az::adamw::AzAdamW::new(
+            vec![candle.mating_output.clone(), candle.mating_bias.clone()],
+            vec![false; 2],
+            0.1,
+        )
+        .unwrap();
+        for _ in 0..12 {
+            optimizer.step(&evaluate().0.backward().unwrap()).unwrap();
+        }
+        let (final_loss, final_probs) = evaluate();
+        assert!(final_loss.to_scalar::<f32>().unwrap() < initial_loss);
+        assert!(final_probs[0] > initial_probs[0]);
+        assert!(final_probs[1] < initial_probs[1]);
+    }
+
     #[test]
     fn king_piece_factorization_initialization_trains_both_factors() {
         king_piece_factorization_training_matches_cpu(&Device::Cpu);
@@ -504,6 +1109,11 @@ mod tests {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: Default::default(),
         };
@@ -643,6 +1253,11 @@ mod tests {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: Default::default(),
         };
@@ -923,6 +1538,11 @@ mod tests {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 1,
             meta: AzSampleMeta::default(),
         };
@@ -1129,6 +1749,11 @@ mod tests {
                     value_weight: 1.0,
                     moves_left: 0.0,
                     moves_left_weight: 0.0,
+                    mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+                    mating_weight: 0.0,
+                    mating_goal: crate::az::AzMatingGoal::NONE,
+                    goal_target: 0.0,
+                    goal_weight: 0.0,
                     search_simulations: 1,
                     meta: AzSampleMeta::default(),
                 }

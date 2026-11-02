@@ -6,13 +6,17 @@ use crate::az::nnue::{
     canonical_move, extract_sparse_features_az, mirror_file_move,
     mirror_sparse_features_az_canonical_file,
 };
-use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome};
+use crate::xiangqi::{
+    Color, MateClassification, MateKind, MatingPattern, Move, Position, RuleDrawReason,
+    RuleHistoryEntry, RuleOutcome,
+};
 
 use super::alphazero::{AzSearchWorkspace, alphazero_search_with_rules_reusing};
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzStartSnapshot,
-    AzStartSource, AzTrainingSample, SplitMix64, alphazero_search_with_rules, dense_move_index,
-    normalize_wdl_target, rule_context_features, scalar_value_to_wdl_target,
+    AzCandidate, AzLoopConfig, AzMatingGoal, AzMatingStats, AzNnue, AzSampleMeta, AzSearchLimits,
+    AzStartSnapshot, AzStartSource, AzTrainingSample, MatingTarget, SplitMix64,
+    alphazero_search_with_rules, dense_move_index, normalize_wdl_target, rule_context_features,
+    scalar_value_to_wdl_target,
 };
 
 fn outcome_index(result_red: f32) -> usize {
@@ -27,7 +31,8 @@ fn outcome_index(result_red: f32) -> usize {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
-    /// 已由搜索证明的提前终局，按红胜、和棋、黑胜排列。
+    /// 每局首次搜索证明的结果，按红胜、和棋、黑胜排列。证明后继续走到实际终局，
+    /// 因此本项与 checkmate、stalemate 等实际终局统计可以重叠。
     pub search_proven: [usize; 3],
     pub no_legal_moves: usize,
     pub checkmate: usize,
@@ -230,6 +235,7 @@ pub struct AzSelfplayData {
     pub best_q_sum: f32,
     pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
+    pub mating: AzMatingStats,
     pub search_simulations: AzSearchSimulationStats,
 }
 
@@ -280,12 +286,17 @@ impl AzSelfplayData {
         self.best_q_sum += other.best_q_sum;
         self.played_q_sum += other.played_q_sum;
         self.terminal.add_assign(&other.terminal);
+        self.mating.add_assign(&other.mating);
         self.search_simulations
             .add_assign(&other.search_simulations);
     }
 }
 
 pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+    config
+        .mating_goal
+        .validate()
+        .expect("invalid selfplay mating goal");
     crate::scope_profile!("az.selfplay.generate");
     // 连杀预算挂在模型上（`AzNnue::mate_search_plies`）。这里统一打一次补丁，让单线程与
     // 多线程两条路径共用同一份设置；两边本来就一样时不克隆（关闭态零代价）。
@@ -360,6 +371,21 @@ fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSe
         policy_softmax_temp: config.policy_softmax_temp,
         draw_score: config.draw_score,
         value_scale: 1.0,
+        mating_goal: config.mating_goal,
+    }
+}
+
+fn choose_selfplay_goal(config: &AzLoopConfig, rng: &mut SplitMix64) -> AzMatingGoal {
+    if !config.mating_goal_mix {
+        return config.mating_goal;
+    }
+    AzMatingGoal {
+        target: match rng.next_u64() % 3 {
+            0 => MatingTarget::None,
+            1 => MatingTarget::DoubleCannon,
+            _ => MatingTarget::IronBolt,
+        },
+        ..config.mating_goal
     }
 }
 
@@ -446,10 +472,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut best_q_sum = 0.0f32;
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
+    let mut mating = AzMatingStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
     let mut search_workspace = AzSearchWorkspace::new(model);
 
     for game_index in 0..config.games {
+        let mating_goal = choose_selfplay_goal(config, &mut rng);
         let start = choose_selfplay_start(config, &mut rng, game_index);
         let mut position = start.position;
         let mut rule_history = start.rule_history;
@@ -466,7 +494,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut game_proofs = Vec::new();
         let mut result = None;
         let mut search_failed = false;
-        let mut proven_termination = false;
+        let mut proof_recorded = false;
         let mut proven_terminal_ply = None;
         let mut played_plies = 0usize;
         let mut plies = 0usize;
@@ -494,11 +522,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
             search_simulations.searches += 1;
 
-            let limits = selfplay_search_limits(
+            let mut limits = selfplay_search_limits(
                 config,
                 ply,
                 rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
             );
+            limits.mating_goal = mating_goal;
             let search = {
                 crate::scope_profile!("az.selfplay.search");
                 alphazero_search_with_rules_reusing(
@@ -549,6 +578,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 entropy_mid_count += 1;
             }
             let temperature = temperature_for_ply(config, ply);
+            let effective_goal = mating_goal.effective(&position);
+            let goal_active =
+                effective_goal.enabled() && effective_goal.side == position.side_to_move();
             let mv_opt = if temperature <= 1e-6 {
                 search.best_move.or_else(|| {
                     choose_selfplay_move(
@@ -556,6 +588,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                         temperature,
                         config.temperature_visit_offset,
                         &mut rng,
+                        goal_active,
                     )
                 })
             } else {
@@ -564,6 +597,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     temperature,
                     config.temperature_visit_offset,
                     &mut rng,
+                    goal_active,
                 )
             };
             let Some(mv) = mv_opt else {
@@ -601,7 +635,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 if config.record_fens {
                     position_fens.push(position.to_fen_with_history(&rule_history));
                 }
-                let sample = make_training_sample(
+                let mut sample = make_training_sample(
                     &position,
                     &rule_history,
                     &search.candidates,
@@ -612,15 +646,17 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     search.simulations,
                     1.0,
                 );
+                sample.mating_goal = mating_goal;
                 game_samples.push(sample);
                 game_proofs.push(proven_root_value(&search.candidates));
             }
             if let Some(outcome) = proven_result {
-                terminal.search_proven[outcome_index(outcome)] += 1;
-                proven_termination = true;
-                proven_terminal_ply = search.proven_moves_left.map(|distance| ply + distance);
-                result = Some(outcome);
-                break;
+                if !proof_recorded {
+                    terminal.search_proven[outcome_index(outcome)] += 1;
+                    proof_recorded = true;
+                    proven_terminal_ply = search.proven_moves_left.map(|distance| ply + distance);
+                }
+                // 证明只监督胜负与距离，不代表已经观察到最终杀形。
             }
             let mover = position.side_to_move();
             let captured = position.piece_at(mv.to as usize);
@@ -648,6 +684,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     RuleOutcome::Win(Color::Red) => 1.0,
                     RuleOutcome::Win(Color::Black) => -1.0,
                 });
+                // 规则层会让将死、困毙优先于同时触发的步数或重复判定。
+                // 此时结果仍正确，但原因必须记为棋盘终局，不能误记规则判胜。
+                if position.legal_moves().is_empty() {
+                    terminal.record_no_legal_moves(&position);
+                    break;
+                }
                 match rule_outcome {
                     RuleOutcome::Draw(reason) => {
                         terminal.rule_draw += 1;
@@ -688,6 +730,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
 
         let terminal_result = result;
+        let mating_observed = terminal_result.is_some()
+            && !search_failed
+            && position.has_general(Color::Red)
+            && position.has_general(Color::Black);
+        let classification = mating_observed.then(|| position.classify_mate()).flatten();
+        mating.record(classification.as_ref(), mating_observed);
+        mating.record_goal(mating_goal, classification.as_ref(), mating_observed);
         let result: f32 = terminal_result.unwrap_or(0.0);
         match result.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => red_wins += 1,
@@ -699,12 +748,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         {
             crate::scope_profile!("az.selfplay.finalize_game");
             finalize_value_targets(&mut game_samples, &game_proofs, terminal_result);
+            finalize_mating_targets(&mut game_samples, classification.as_ref(), mating_observed);
+            finalize_goal_targets(&mut game_samples, classification.as_ref(), mating_observed);
             finalize_moves_left_targets(
                 &mut game_samples,
-                proven_terminal_ply.or_else(|| {
-                    (terminal_result.is_some() && !proven_termination)
-                        .then_some(start_phase_ply + played_plies)
-                }),
+                terminal_result
+                    .map(|_| start_phase_ply + played_plies)
+                    .or(proven_terminal_ply),
             );
         }
         samples.extend(game_samples.clone());
@@ -753,6 +803,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         best_q_sum,
         played_q_sum,
         terminal,
+        mating,
         search_simulations,
     }
 }
@@ -880,6 +931,11 @@ fn make_training_sample(
         value_weight: 1.0,
         moves_left: 0.0,
         moves_left_weight: 0.0,
+        mating_targets: [0.0; super::MATING_HEAD_SIZE],
+        mating_weight: 0.0,
+        mating_goal: AzMatingGoal::default(),
+        goal_target: 0.0,
+        goal_weight: 0.0,
         search_simulations: search_simulations.min(u32::MAX as usize) as u32,
         meta,
     }
@@ -967,6 +1023,56 @@ fn finalize_moves_left_targets(samples: &mut [AzTrainingSample], terminal_ply: O
     }
 }
 
+fn finalize_mating_targets(
+    samples: &mut [AzTrainingSample],
+    classification: Option<&MateClassification>,
+    observed: bool,
+) {
+    for sample in samples {
+        sample.mating_targets.fill(0.0);
+        sample.mating_weight = f32::from(u8::from(observed));
+        if let Some(classification) = classification
+            && observed
+            && classification.kind == MateKind::Checkmate
+            && (sample.side_sign > 0.0) == (classification.winner == Color::Red)
+        {
+            for (index, pattern) in MatingPattern::ALL.into_iter().enumerate() {
+                sample.mating_targets[index] =
+                    f32::from(u8::from(classification.patterns.contains(&pattern)));
+            }
+        }
+    }
+}
+
+fn finalize_goal_targets(
+    samples: &mut [AzTrainingSample],
+    classification: Option<&MateClassification>,
+    observed: bool,
+) {
+    for sample in samples {
+        sample.goal_target = 0.0;
+        sample.goal_weight = 0.0;
+        let goal = sample.mating_goal;
+        if !observed || !goal.enabled() {
+            continue;
+        }
+        let side = if sample.side_sign > 0.0 {
+            Color::Red
+        } else {
+            Color::Black
+        };
+        let reachable = super::position_for_training_sample(sample)
+            .is_some_and(|position| goal.canonical_for(side).effective(&position).enabled());
+        if reachable {
+            sample.goal_weight = 1.0;
+            sample.goal_target = f32::from(u8::from(super::mating_stats::goal_succeeded(
+                goal,
+                classification,
+            )));
+        }
+    }
+}
+
 fn finalize_value_targets(
     samples: &mut [AzTrainingSample],
     proofs: &[Option<i8>],
@@ -1021,15 +1127,17 @@ fn choose_selfplay_move(
     temperature: f32,
     visit_offset: f32,
     rng: &mut SplitMix64,
+    goal_active: bool,
 ) -> Option<Move> {
     let priority = candidates.iter().map(AzCandidate::proof_priority).max()?;
     let fallback = candidates
         .iter()
-        .find(|candidate| candidate.proof_priority() == priority)
+        .find(|candidate| selfplay_candidate_eligible(candidate, priority, goal_active))
         .map(|candidate| candidate.mv);
     if temperature <= 1e-6 {
         return candidates
             .iter()
+            .filter(|candidate| selfplay_candidate_eligible(candidate, priority, goal_active))
             .max_by(|left, right| {
                 left.proof_priority()
                     .cmp(&right.proof_priority())
@@ -1042,7 +1150,7 @@ fn choose_selfplay_move(
             .map(|candidate| candidate.mv);
     }
 
-    let weights = temperature_move_weights(candidates, temperature, visit_offset);
+    let weights = temperature_move_weights(candidates, temperature, visit_offset, goal_active);
     let total = candidates
         .iter()
         .zip(&weights)
@@ -1062,10 +1170,17 @@ fn choose_selfplay_move(
     fallback
 }
 
+fn selfplay_candidate_eligible(candidate: &AzCandidate, priority: u8, goal_active: bool) -> bool {
+    // 目标根策略已排除的普通胜法，不能被 visits 温度或零质量回退重新采入。
+    // 只在目标执行方的有效目标回合启用，普通模式保留既有采样语义。
+    candidate.proof_priority() == priority && (!goal_active || candidate.policy > 0.0)
+}
+
 fn temperature_move_weights(
     candidates: &[AzCandidate],
     temperature: f32,
     visit_offset: f32,
+    goal_active: bool,
 ) -> Vec<f32> {
     let inv_temperature = 1.0 / temperature.max(1e-3);
     let priority = candidates
@@ -1075,13 +1190,13 @@ fn temperature_move_weights(
         .unwrap_or(0);
     let max_visits = candidates
         .iter()
-        .filter(|candidate| candidate.proof_priority() == priority)
+        .filter(|candidate| selfplay_candidate_eligible(candidate, priority, goal_active))
         .map(|c| (c.visits as f32 + visit_offset).max(0.0))
         .fold(0.0f32, f32::max);
     candidates
         .iter()
         .map(|candidate| {
-            if candidate.proof_priority() != priority {
+            if !selfplay_candidate_eligible(candidate, priority, goal_active) {
                 0.0
             } else if max_visits > 0.0 {
                 ((candidate.visits as f32 + visit_offset).max(0.0) / max_visits)
@@ -1340,6 +1455,7 @@ fn play_arena_game(
                 policy_softmax_temp,
                 draw_score,
                 value_scale: 1.0,
+                mating_goal: AzMatingGoal::default(),
             },
         );
         let Some(mv) = result.best_move else {
@@ -1379,6 +1495,216 @@ fn play_arena_game(
 mod tests {
     use super::*;
 
+    fn goal_sample(position: &Position, goal: AzMatingGoal) -> AzTrainingSample {
+        let mut sample = make_training_sample(
+            position,
+            &[],
+            &[],
+            0.0,
+            [0.0, 1.0, 0.0],
+            false,
+            AzSampleMeta::default(),
+            1,
+            1.0,
+        );
+        sample.mating_goal = goal;
+        sample
+    }
+
+    #[test]
+    fn goal_targets_share_owner_perspective_and_mask_each_prefix_independently() {
+        let goal = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 1.0,
+        };
+        let red = Position::startpos();
+        let mut black = red.clone();
+        black.make_move(black.parse_uci_move("b0c2").unwrap());
+        let fallback = Position::from_fen("4k4/9/9/4C4/9/9/9/9/9/4K4 w").unwrap();
+        let mut samples = vec![
+            goal_sample(&red, goal),
+            goal_sample(&black, goal),
+            goal_sample(&fallback, goal),
+        ];
+        let mate = Position::from_fen("2bakab2/9/9/4C4/9/4C4/9/9/9/4K4 b")
+            .unwrap()
+            .classify_mate()
+            .unwrap();
+        finalize_goal_targets(&mut samples, Some(&mate), true);
+        assert_eq!(
+            samples.iter().map(|s| s.goal_target).collect::<Vec<_>>(),
+            [1.0, 1.0, 0.0]
+        );
+        assert_eq!(
+            samples.iter().map(|s| s.goal_weight).collect::<Vec<_>>(),
+            [1.0, 1.0, 0.0]
+        );
+        assert!(
+            samples.iter().all(|s| s.mating_goal == goal),
+            "fallback不能清除原始指令"
+        );
+        finalize_goal_targets(&mut samples, None, true);
+        assert!(samples.iter().all(|s| s.goal_target == 0.0));
+        assert_eq!(
+            samples[0].goal_weight, 1.0,
+            "终局不可达不能抹掉此前可达失败监督"
+        );
+        assert_eq!(samples[2].goal_weight, 0.0);
+        finalize_goal_targets(&mut samples, Some(&mate), false);
+        assert!(
+            samples
+                .iter()
+                .all(|s| s.goal_weight == 0.0 && s.goal_target == 0.0)
+        );
+        let black_goal = AzMatingGoal {
+            side: Color::Black,
+            ..goal
+        };
+        let black_mate = MateClassification {
+            winner: Color::Black,
+            ..mate
+        };
+        for sample in &mut samples[..2] {
+            sample.mating_goal = black_goal;
+        }
+        finalize_goal_targets(&mut samples[..2], Some(&black_mate), true);
+        assert!(
+            samples[..2]
+                .iter()
+                .all(|s| s.goal_target == 1.0 && s.goal_weight == 1.0)
+        );
+    }
+
+    #[test]
+    fn selfplay_keeps_one_instruction_through_both_sides_and_cutoff() {
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 4;
+        config.simulations = 2;
+        config.mating_goal = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 0.75,
+        };
+        let model = AzNnue::random(8, 331);
+        let data = generate_selfplay_data(&model, &config);
+        assert!(data.samples.len() >= 2);
+        assert!(
+            data.samples
+                .iter()
+                .all(|s| s.mating_goal == config.mating_goal)
+        );
+        assert!(data.samples.iter().any(|s| s.side_sign < 0.0));
+        assert!(
+            data.samples
+                .iter()
+                .all(|s| s.goal_weight == 0.0 && s.goal_target == 0.0)
+        );
+        assert_eq!(data.mating.goal_attempts, [1, 0]);
+        assert_eq!(data.mating.goal_unknown, [1, 0]);
+    }
+
+    #[test]
+    fn mixed_goals_preserve_configured_strength_and_owner_even_for_none() {
+        let mut config = selfplay_test_config(1);
+        config.mating_goal = AzMatingGoal {
+            target: MatingTarget::None,
+            side: Color::Black,
+            strength: 0.6,
+        };
+        config.mating_goal_mix = true;
+        let mut rng = SplitMix64::new(17);
+        let mut counts = [0; 3];
+        for _ in 0..300 {
+            let goal = choose_selfplay_goal(&config, &mut rng);
+            assert_eq!(goal.side, Color::Black);
+            assert_eq!(goal.strength, 0.6);
+            counts[goal.target.index().map_or(0, |index| index + 1)] += 1;
+        }
+        assert!(counts.iter().all(|&count| count > 0));
+    }
+
+    #[test]
+    fn selfplay_observed_double_cannon_labels_goal_and_counts_success() {
+        let position = Position::from_fen("2bakab2/9/9/4C4/9/7C1/9/9/9/4K4 w").unwrap();
+        let mut config = selfplay_test_config(1);
+        config.simulations = 1;
+        config.max_plies = 2;
+        config.mate_search_plies = 1;
+        config.mating_goal = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 1.0,
+        };
+        config.opening_positions = vec![AzStartSnapshot {
+            rule_history: position.initial_rule_history(),
+            position,
+            phase_ply: 0,
+            generation: 0,
+        }]
+        .into();
+        let data = generate_selfplay_data(&AzNnue::random(8, 532), &config);
+        assert_eq!(data.mating.checkmates, 1);
+        assert_eq!(data.mating.goal_attempts, [1, 0]);
+        assert_eq!(data.mating.goal_successes, [1, 0]);
+        assert_eq!(data.mating.goal_unknown, [0, 0]);
+        assert!(!data.samples.is_empty());
+        assert!(data.samples.iter().all(|s| s.goal_target == 1.0
+            && s.goal_weight == 1.0
+            && s.mating_goal == config.mating_goal));
+    }
+
+    #[test]
+    fn selfplay_temperature_keeps_target_mate_when_another_immediate_win_exists() {
+        for (fen, target) in [
+            (
+                "3aka3/R8/6N2/4C4/9/7C1/9/9/9/4K4 w",
+                MatingTarget::DoubleCannon,
+            ),
+            (
+                "2bak4/4a4/4b4/1N2C4/9/9/5R3/9/9/5K3 w",
+                MatingTarget::IronBolt,
+            ),
+        ] {
+            for temperature in [0.9, 1.2] {
+                let position = Position::from_fen(fen).unwrap();
+                let mut config = selfplay_test_config(4);
+                config.max_plies = 1;
+                config.simulations = 128;
+                config.temperature_start = temperature;
+                config.temperature_endgame = temperature;
+                config.mating_goal = AzMatingGoal {
+                    target,
+                    side: Color::Red,
+                    strength: 1.0,
+                };
+                config.opening_positions = vec![AzStartSnapshot {
+                    rule_history: position.initial_rule_history(),
+                    position,
+                    phase_ply: 0,
+                    generation: 0,
+                }]
+                .into();
+                let data = generate_selfplay_data(&AzNnue::random(8, 91), &config);
+                assert_eq!(
+                    data.mating.goal_successes[target.index().unwrap()],
+                    4,
+                    "{} temperature={temperature}",
+                    target.name()
+                );
+                assert_eq!(data.mating.checkmates, 4);
+                assert_eq!(data.samples.len(), 4);
+                assert!(
+                    data.samples
+                        .iter()
+                        .all(|sample| sample.mating_goal == config.mating_goal
+                            && sample.goal_target == 1.0
+                            && sample.goal_weight == 1.0)
+                );
+            }
+        }
+    }
+
     fn selfplay_test_config(games: usize) -> AzLoopConfig {
         AzLoopConfig {
             games,
@@ -1413,6 +1739,8 @@ mod tests {
             record_fens: false,
             moves_left_params: crate::az::AzMovesLeftParams::default(),
             mate_search_plies: 0,
+            mating_goal: AzMatingGoal::default(),
+            mating_goal_mix: false,
         }
     }
 
@@ -1488,6 +1816,14 @@ mod tests {
         assert_eq!(first.value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(first.moves_left, 15.0);
         assert_eq!(first.moves_left_weight, 1.0);
+        assert_eq!(data.samples.len(), 2, "证明后仍须继续实际走棋");
+        assert_eq!(data.terminal.search_proven, [0, 0, 1]);
+        assert_eq!(data.mating.unknown_games, 1);
+        assert!(
+            data.samples
+                .iter()
+                .all(|sample| sample.mating_weight == 0.0)
+        );
 
         // 关掉连杀预算之后同一局面必须回到普通 MCTS：64 simulations 撞不出 mate-in-8，
         // 所以既不会出现一热策略目标、也不会被判成必胜。
@@ -1553,12 +1889,12 @@ mod tests {
         candidates[0].prior = 0.2;
         candidates[1].prior = 0.8;
         assert_eq!(
-            temperature_move_weights(&candidates, 1.0, -0.8),
+            temperature_move_weights(&candidates, 1.0, -0.8, false),
             vec![0.2, 0.8]
         );
         candidates[0].visits = 1;
         candidates[1].visits = 2;
-        let weights = temperature_move_weights(&candidates, 1.0, -0.8);
+        let weights = temperature_move_weights(&candidates, 1.0, -0.8, false);
         assert!((weights[0] - 1.0 / 6.0).abs() < 1e-6);
         assert_eq!(weights[1], 1.0);
     }
@@ -1607,6 +1943,14 @@ mod tests {
         assert_eq!(data.terminal.max_plies, 4);
         assert_eq!(data.terminal.search_proven, [0, 0, 0]);
         assert!(data.samples.iter().all(|sample| sample.value_weight == 0.0));
+        assert_eq!(data.mating.games, 4);
+        assert_eq!(data.mating.labeled_games, 0);
+        assert_eq!(data.mating.unknown_games, 4);
+        assert!(
+            data.samples
+                .iter()
+                .all(|sample| sample.mating_weight == 0.0)
+        );
     }
 
     #[test]
@@ -1630,8 +1974,18 @@ mod tests {
         .into();
         let data = generate_selfplay_chunk(&model, &config);
         assert_eq!(data.terminal.search_proven, [1, 0, 0]);
+        assert_eq!(data.terminal.checkmate, 1, "证明后必须真的走到将死");
+        assert_eq!(data.mating.checkmates, 1);
+        assert_eq!(data.mating.labeled_games, 1);
+        assert_eq!(data.mating.unknown_games, 0);
         assert_eq!(data.samples.len(), 1);
         let sample = &data.samples[0];
+        assert_eq!(sample.mating_weight, 1.0);
+        let rook_index = MatingPattern::ALL
+            .iter()
+            .position(|&p| p == MatingPattern::RookCheck)
+            .unwrap();
+        assert_eq!(sample.mating_targets[rook_index], 1.0);
         assert_eq!(sample.value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(sample.value_weight, 1.0);
         let policy = sample
@@ -1640,6 +1994,92 @@ mod tests {
             .position(|&index| index == mate_index)
             .unwrap();
         assert_eq!(sample.policy[policy], 1.0);
+    }
+
+    #[test]
+    fn observed_selfplay_mating_targets_train_the_auxiliary_head_end_to_end() {
+        let mut model = AzNnue::random(8, 20261102);
+        let position = Position::from_fen(
+            "2bak2r1/4a4/4b4/p2R4p/4C1n2/2P1c3P/P1r3P2/4B4/4A4/2BK1A2R w - - 1 1",
+        )
+        .unwrap();
+        let mut config = selfplay_test_config(1);
+        config.simulations = 1;
+        config.mirror_probability = 0.0;
+        config.mating_goal = AzMatingGoal {
+            target: MatingTarget::IronBolt,
+            side: Color::Red,
+            strength: 0.8,
+        };
+        config.opening_positions = vec![AzStartSnapshot {
+            rule_history: position.initial_rule_history(),
+            position,
+            phase_ply: 0,
+            generation: 0,
+        }]
+        .into();
+        let mut data = generate_selfplay_data(&model, &config);
+        assert_eq!(data.mating.checkmates, 1);
+        assert_eq!(data.samples.len(), 1);
+        assert_eq!(data.samples[0].goal_target, 1.0);
+        assert_eq!(data.samples[0].goal_weight, 1.0);
+        // 单独验证辅助任务：原来的距离、策略和 WDL 目标不参与这次优化。
+        data.samples[0].moves_left_weight = 0.0;
+        let loss = |model: &AzNnue| {
+            let (probs, _) =
+                super::super::mating_outputs_for_training_sample(model, &data.samples[0]).unwrap();
+            probs
+                .into_iter()
+                .zip(data.samples[0].mating_targets)
+                .map(|(p, y)| {
+                    let p = p.clamp(1e-7, 1.0 - 1e-7);
+                    -y * p.ln() - (1.0 - y) * (-p).ln_1p()
+                })
+                .sum::<f32>()
+                / super::super::MATING_HEAD_SIZE as f32
+        };
+        let before = loss(&model);
+        let goal_before = super::super::goal_outputs_for_training_sample(&model, &data.samples[0])
+            .unwrap()
+            .0;
+        let stats = super::super::train_samples_weighted(
+            &mut model,
+            &data.samples,
+            12,
+            0.1,
+            1,
+            &mut SplitMix64::new(27),
+            super::super::AzTrainLossWeights {
+                value: 0.0,
+                policy: 0.0,
+                mating: 1.0,
+                goal: 1.0,
+            },
+        )
+        .unwrap();
+        let after = loss(&model);
+        let goal_after = super::super::goal_outputs_for_training_sample(&model, &data.samples[0])
+            .unwrap()
+            .0;
+        assert_eq!(stats.mating_samples, 1);
+        assert_eq!(stats.goal_samples, 1);
+        assert!(
+            goal_after > goal_before,
+            "真实指令终局必须能训练条件目标头：{goal_before} -> {goal_after}"
+        );
+        assert!(
+            after < before,
+            "终局标签必须能训练杀法读出：{before} -> {after}"
+        );
+        assert!(model.mating_output.iter().any(|&x| x != 0.0));
+        assert!(model.goal_output.iter().any(|&x| x != 0.0));
+        assert!(model.value_head_output.iter().all(|&x| x == 0.0));
+        eprintln!("自博弈→真实终局→独立杀法头 smoke：BCE {before:.6} -> {after:.6}");
+        eprintln!(
+            "同盘铁门栓条件目标 smoke：BCE {:.6} -> {:.6}",
+            -goal_before.ln(),
+            -goal_after.ln()
+        );
     }
 
     #[test]
@@ -1680,7 +2120,10 @@ mod tests {
             mate_index
         );
         assert_eq!(data.red_wins, 1, "terminal={:?}", data.terminal);
-        assert_eq!(data.terminal.checkmate + data.terminal.search_proven[0], 1);
+        assert_eq!(data.terminal.checkmate, 1);
+        assert!(data.terminal.search_proven[0] <= 1);
+        assert_eq!(data.mating.checkmates, 1);
+        assert_eq!(data.samples[0].mating_weight, 1.0);
         assert_eq!(data.terminal.max_plies, 0);
         assert_eq!(data.samples.len(), 1);
         assert_eq!(data.samples[0].value_weight, 1.0);
@@ -1713,6 +2156,46 @@ mod tests {
     }
 
     #[test]
+    fn checkmate_on_the_natural_move_limit_is_counted_as_checkmate() {
+        let position = Position::from_fen("2bakab2/9/9/4C4/9/7C1/9/9/9/4K4 w - - 119 1").unwrap();
+        let mate = position.parse_uci_move("h4e4").unwrap();
+        let mut terminal_position = position.clone();
+        terminal_position.make_move(mate);
+        assert_eq!(terminal_position.rule60_count_with_history(&[]), 120);
+        assert_eq!(
+            terminal_position.rule_outcome_with_history(&[]),
+            Some(RuleOutcome::Win(Color::Red))
+        );
+
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 1;
+        config.simulations = 1;
+        config.opening_positions = vec![AzStartSnapshot {
+            rule_history: position.initial_rule_history(),
+            position,
+            phase_ply: 0,
+            generation: 0,
+        }]
+        .into();
+        let data = generate_selfplay_chunk(&AzNnue::random(16, 20260907), &config);
+        assert_eq!(data.red_wins, 1);
+        assert_eq!(data.terminal.checkmate, 1);
+        assert_eq!(data.terminal.no_legal_moves, 1);
+        assert_eq!(data.terminal.rule_win_red, 0);
+        assert_eq!(data.terminal.rule_draw_natural_limit, 0);
+        assert_eq!(data.mating.checkmates, 1);
+        assert_eq!(data.samples.len(), 1);
+        assert_eq!(data.samples[0].value_wdl, [1.0, 0.0, 0.0]);
+        assert_eq!(data.samples[0].value_weight, 1.0);
+        assert_eq!(data.samples[0].mating_weight, 1.0);
+        let index = MatingPattern::ALL
+            .iter()
+            .position(|&pattern| pattern == MatingPattern::DoubleCannon)
+            .unwrap();
+        assert_eq!(data.samples[0].mating_targets[index], 1.0);
+    }
+
+    #[test]
     fn cutoff_games_keep_policy_but_do_not_train_false_draw_values() {
         let model = AzNnue::random(16, 20260907);
         let mut config = selfplay_test_config(4);
@@ -1740,6 +2223,11 @@ mod tests {
         chunk.start_age_sum[AzStartSource::OpeningBook.index()] = 6;
         chunk.start_age_max[AzStartSource::OpeningBook.index()] = 4;
         chunk.start_temperature_sum[AzStartSource::OpeningBook.index()] = 1.2;
+        chunk.mating.games = 2;
+        chunk.mating.labeled_games = 1;
+        chunk.mating.checkmates = 1;
+        chunk.mating.unknown_games = 1;
+        chunk.mating.pattern_counts[0] = 1;
 
         merged.add_assign(&chunk);
 
@@ -1748,6 +2236,10 @@ mod tests {
         assert_eq!(merged.start_age_sum, [0, 6, 0]);
         assert_eq!(merged.start_age_max, [0, 4, 0]);
         assert_eq!(merged.start_temperature_sum, [0.0, 1.2, 0.0]);
+        assert_eq!(merged.mating.games, 2);
+        assert_eq!(merged.mating.labeled_games, 1);
+        assert_eq!(merged.mating.unknown_games, 1);
+        assert_eq!(merged.mating.pattern_counts[0], 1);
     }
 
     #[test]
@@ -1797,6 +2289,7 @@ mod tests {
             policy,
             solved: None,
             moves_left: None,
+            goal_value: 0.0,
         }
     }
 
@@ -1810,6 +2303,7 @@ mod tests {
             policy: 0.0,
             solved: None,
             moves_left: None,
+            goal_value: 0.0,
         }
     }
 
@@ -1829,6 +2323,11 @@ mod tests {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; super::super::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: AzMatingGoal::default(),
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         }
@@ -1845,6 +2344,77 @@ mod tests {
         assert!(samples.iter().all(|s| s.moves_left_weight == 1.0));
         finalize_moves_left_targets(&mut samples, None);
         assert!(samples.iter().all(|s| s.moves_left_weight == 0.0));
+    }
+
+    #[test]
+    fn mating_targets_use_the_winning_side_and_preserve_overlapping_patterns() {
+        let position = Position::from_fen("2bakab2/9/9/4C4/9/4C4/9/9/9/4K4 b").unwrap();
+        let classification = position.classify_mate().unwrap();
+        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
+        finalize_mating_targets(&mut samples, Some(&classification), true);
+        assert!(samples.iter().all(|sample| sample.mating_weight == 1.0));
+        for pattern in [MatingPattern::DoubleCannon, MatingPattern::CannonCheck] {
+            let index = MatingPattern::ALL
+                .iter()
+                .position(|&p| p == pattern)
+                .unwrap();
+            assert_eq!(samples[0].mating_targets[index], 1.0);
+            assert_eq!(samples[1].mating_targets[index], 0.0);
+        }
+        assert!(
+            samples[1]
+                .mating_targets
+                .iter()
+                .all(|&target| target == 0.0)
+        );
+
+        let mut black_win = classification;
+        black_win.winner = Color::Black;
+        finalize_mating_targets(&mut samples, Some(&black_win), true);
+        assert!(
+            samples[0]
+                .mating_targets
+                .iter()
+                .all(|&target| target == 0.0)
+        );
+        assert!(
+            samples[1]
+                .mating_targets
+                .iter()
+                .any(|&target| target == 1.0)
+        );
+    }
+
+    #[test]
+    fn mating_targets_distinguish_observed_non_mates_from_unknown_endings() {
+        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
+        for sample in &mut samples {
+            sample.mating_targets.fill(1.0);
+        }
+        finalize_mating_targets(&mut samples, None, true);
+        assert!(samples.iter().all(|sample| sample.mating_weight == 1.0));
+        assert!(
+            samples
+                .iter()
+                .flat_map(|sample| sample.mating_targets)
+                .all(|target| target == 0.0)
+        );
+        finalize_mating_targets(&mut samples, None, false);
+        assert!(samples.iter().all(|sample| sample.mating_weight == 0.0));
+
+        let stalemate = Position::from_fen("3k5/8R/9/9/9/9/9/9/9/4K4 b")
+            .unwrap()
+            .classify_mate()
+            .unwrap();
+        assert_eq!(stalemate.kind, MateKind::Stalemate);
+        finalize_mating_targets(&mut samples, Some(&stalemate), true);
+        assert!(samples.iter().all(|sample| sample.mating_weight == 1.0));
+        assert!(
+            samples
+                .iter()
+                .flat_map(|sample| sample.mating_targets)
+                .all(|target| target == 0.0)
+        );
     }
 
     #[test]
@@ -2023,7 +2593,7 @@ mod tests {
                 candidate_q(Move::new(0, 2), visits, 0.0),
             ];
             for temperature in [0.001, 0.05, 0.6, 0.9, 1.2] {
-                let weights = temperature_move_weights(&candidates, temperature, -0.8);
+                let weights = temperature_move_weights(&candidates, temperature, -0.8, false);
                 assert!(
                     weights
                         .iter()
@@ -2041,9 +2611,56 @@ mod tests {
             candidate_q(Move::new(0, 2), 10, 0.0),
         ];
 
-        let weights = temperature_move_weights(&candidates, 1.0, 0.0);
+        let weights = temperature_move_weights(&candidates, 1.0, 0.0, false);
 
         assert_eq!(weights, vec![0.1, 1.0]);
+    }
+
+    #[test]
+    fn goal_temperature_and_zero_mass_fallback_respect_positive_policy_eligibility() {
+        let mut ordinary = candidate(Move::new(0, 1), 0.0);
+        ordinary.solved = Some(1);
+        ordinary.visits = u32::MAX;
+        ordinary.prior = 0.0;
+        let mut target = candidate(Move::new(2, 3), 1.0);
+        target.solved = Some(1);
+        target.prior = 0.0;
+        let mut moves = [ordinary, target];
+        for visits in [10, 0] {
+            moves[1].visits = visits;
+            for temperature in [0.0, 0.9, 1.2] {
+                assert_eq!(
+                    temperature_move_weights(&moves, temperature, -0.8, true)[0],
+                    0.0
+                );
+                let mut rng = SplitMix64::new(331);
+                for _ in 0..32 {
+                    assert_eq!(
+                        choose_selfplay_move(&moves, temperature, -0.8, &mut rng, true),
+                        Some(moves[1].mv)
+                    );
+                }
+            }
+        }
+        assert!(
+            temperature_move_weights(&moves, 0.9, -0.8, false)[0] > 0.0,
+            "普通模式不能依据 policy=0 过滤历史 visits"
+        );
+        moves[0].policy = 0.25;
+        for temperature in [0.0, 0.9, 1.2] {
+            assert_eq!(
+                temperature_move_weights(&moves, temperature, -0.8, true),
+                temperature_move_weights(&moves, temperature, -0.8, false)
+            );
+            let mut plain_rng = SplitMix64::new(91);
+            let mut goal_rng = SplitMix64::new(91);
+            for _ in 0..32 {
+                assert_eq!(
+                    choose_selfplay_move(&moves, temperature, -0.8, &mut plain_rng, false),
+                    choose_selfplay_move(&moves, temperature, -0.8, &mut goal_rng, true)
+                );
+            }
+        }
     }
 
     #[test]
@@ -2069,11 +2686,14 @@ mod tests {
         let mut rng = SplitMix64::new(20260927);
         for temperature in [0.0, 0.05, 0.9, 1.2] {
             if temperature > 0.0 {
-                assert_eq!(temperature_move_weights(&moves, temperature, -0.8)[0], 0.0);
+                assert_eq!(
+                    temperature_move_weights(&moves, temperature, -0.8, false)[0],
+                    0.0
+                );
             }
             for _ in 0..128 {
                 assert_eq!(
-                    choose_selfplay_move(&moves, temperature, -0.8, &mut rng),
+                    choose_selfplay_move(&moves, temperature, -0.8, &mut rng, false),
                     Some(moves[1].mv)
                 );
             }
@@ -2089,11 +2709,14 @@ mod tests {
         let mut rng = SplitMix64::new(20260927);
         for temperature in [0.0, 0.05, 0.9, 1.2] {
             if temperature > 0.0 {
-                assert_eq!(temperature_move_weights(&moves, temperature, -0.8)[0], 0.0);
+                assert_eq!(
+                    temperature_move_weights(&moves, temperature, -0.8, false)[0],
+                    0.0
+                );
             }
             for _ in 0..128 {
                 assert_eq!(
-                    choose_selfplay_move(&moves, temperature, -0.8, &mut rng),
+                    choose_selfplay_move(&moves, temperature, -0.8, &mut rng, false),
                     Some(moves[1].mv)
                 );
             }
@@ -2108,7 +2731,7 @@ mod tests {
         let moves = [lost, safe];
         let mut rng = SplitMix64::new(20260927);
         assert_eq!(
-            choose_selfplay_move(&moves, 0.9, -0.8, &mut rng),
+            choose_selfplay_move(&moves, 0.9, -0.8, &mut rng, false),
             Some(moves[1].mv)
         );
     }

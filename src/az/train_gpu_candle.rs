@@ -103,6 +103,8 @@ pub(super) fn train_samples_gpu(
         stats.value_loss /= valid;
         stats.policy_ce /= denom;
         stats.moves_left_loss /= stats.moves_left_samples.max(1) as f32;
+        stats.mating_loss /= stats.mating_samples.max(1) as f32;
+        stats.goal_loss /= stats.goal_samples.max(1) as f32;
     }
     let trainer = model
         .gpu_trainer
@@ -199,6 +201,8 @@ impl GpuTrainer {
                 ids.len(),
                 weights.value,
                 weights.policy,
+                weights.mating,
+                weights.goal,
             )?;
             stats.add_assign(&output.stats);
         }
@@ -209,6 +213,13 @@ impl GpuTrainer {
             value_samples: valid,
             loss: stats.loss / stats.samples.max(1) as f32,
             value_loss: stats.value_loss / valid.max(1) as f32,
+            mating_loss: stats.mating_loss / stats.mating_samples.max(1) as f32,
+            mating_samples: stats.mating_samples,
+            goal_loss: stats.goal_loss / stats.goal_samples.max(1) as f32,
+            goal_samples: stats.goal_samples,
+            goal_target_sum: stats.goal_target_sum,
+            goal_pred_sum: stats.goal_pred_sum,
+            goal_brier_sum: stats.goal_brier_sum,
             moves_left_rmse: (stats.moves_left_loss / stats.moves_left_samples.max(1) as f32)
                 .sqrt()
                 * super::MOVES_LEFT_SCALE,
@@ -303,6 +314,8 @@ impl GpuReplica {
             batch_len,
             loss_weights.value,
             loss_weights.policy,
+            loss_weights.mating,
+            loss_weights.goal,
         )?;
         profile_sync(&self.device)?;
         let loss_seconds = loss_started.elapsed().as_secs_f64();
@@ -329,6 +342,8 @@ impl GpuReplica {
         batch_len: usize,
         value_weight: f32,
         policy_weight: f32,
+        mating_weight: f32,
+        goal_weight: f32,
     ) -> CandleResult<BatchLossOutput> {
         let forward = self.model.forward(batch_tensors)?;
         let value_log_probs = log_softmax(&forward.value_logits, 1)?;
@@ -354,6 +369,45 @@ impl GpuReplica {
             .broadcast_mul(&batch_tensors.policy_weights)?
             .sum_all()?
             .affine(policy_weight.max(0.0) as f64, 0.0)?;
+        let mating_ce_per_sample =
+            mating_bce_per_sample(&forward.mating_logits, &batch_tensors.mating_targets)?;
+        let valid_mating = batch_tensors
+            .mating_weights
+            .gt(0.0)?
+            .to_dtype(candle_core::DType::F32)?;
+        let mating_ce = (&mating_ce_per_sample * &valid_mating)?.sum_all()?;
+        let weighted_mating_ce = (&mating_ce_per_sample * &batch_tensors.mating_weights)?
+            .sum_all()?
+            .affine(mating_weight.max(0.0) as f64, 0.0)?;
+        let mating_probs = candle_nn::ops::sigmoid(&forward.mating_logits.detach())?;
+        let mating_mask = valid_mating.unsqueeze(1)?;
+        let mating_moments = Tensor::stack(
+            &[
+                batch_tensors
+                    .mating_targets
+                    .broadcast_mul(&mating_mask)?
+                    .sum(0)?,
+                mating_probs.broadcast_mul(&mating_mask)?.sum(0)?,
+                (&mating_probs - &batch_tensors.mating_targets)?
+                    .sqr()?
+                    .broadcast_mul(&mating_mask)?
+                    .sum(0)?,
+            ],
+            0,
+        )?
+        .to_vec2::<f32>()?;
+        let goal_ce_per_sample =
+            mating_bce_per_sample(&forward.goal_logits, &batch_tensors.goal_targets)?;
+        let valid_goal = batch_tensors
+            .goal_weights
+            .gt(0.0)?
+            .to_dtype(candle_core::DType::F32)?;
+        let goal_ce = (&goal_ce_per_sample * &valid_goal)?.sum_all()?;
+        let weighted_goal_ce = (&goal_ce_per_sample * &batch_tensors.goal_weights)?
+            .sum_all()?
+            .affine(goal_weight.max(0.0) as f64, 0.0)?;
+        let goal_probs = candle_nn::ops::sigmoid(&forward.goal_logits.detach())?.squeeze(1)?;
+        let goal_targets = batch_tensors.goal_targets.squeeze(1)?;
         let moves_left_prediction = forward.moves_left.squeeze(1)?;
         let moves_left_error =
             (&moves_left_prediction - &batch_tensors.moves_left_targets)?.sqr()?;
@@ -378,6 +432,17 @@ impl GpuReplica {
         )?;
         let loss_sum = ((weighted_value_loss + weighted_policy_ce)?
             + moves_left_objective.affine(super::MOVES_LEFT_LOSS_WEIGHT as f64, 0.0)?)?;
+        // 乘零仍会留下 Some(0) 梯度并触发 AdamW 动量/衰减；停用或无标签时断开该分支。
+        let loss_sum = if mating_weight > 0.0 && batch_tensors.has_mating_targets {
+            (loss_sum + weighted_mating_ce)?
+        } else {
+            loss_sum
+        };
+        let loss_sum = if goal_weight > 0.0 && batch_tensors.has_goal_targets {
+            (loss_sum + weighted_goal_ce)?
+        } else {
+            loss_sum
+        };
         let loss_tensor = (&loss_sum / batch_len as f64)?;
         let moments = masked_value_moments(
             &value,
@@ -399,6 +464,13 @@ impl GpuReplica {
                 policy_ce.detach(),
                 moves_left_loss.detach(),
                 correct_pairs,
+                mating_ce.detach(),
+                valid_mating.sum_all()?,
+                goal_ce.detach(),
+                valid_goal.sum_all()?,
+                (&goal_targets * &valid_goal)?.sum_all()?,
+                (&goal_probs * &valid_goal)?.sum_all()?,
+                ((&goal_probs - &goal_targets)?.sqr()? * &valid_goal)?.sum_all()?,
             ],
             0,
         )?
@@ -411,6 +483,16 @@ impl GpuReplica {
             moves_left_samples: valid_moves_left,
             moves_left_pairs,
             moves_left_correct_pairs: metrics[4] as usize,
+            mating_loss: metrics[5],
+            mating_samples: metrics[6] as usize,
+            mating_target_sum: std::array::from_fn(|i| mating_moments[0][i]),
+            mating_pred_sum: std::array::from_fn(|i| mating_moments[1][i]),
+            mating_brier_sum: std::array::from_fn(|i| mating_moments[2][i]),
+            goal_loss: metrics[7],
+            goal_samples: metrics[8] as usize,
+            goal_target_sum: metrics[9],
+            goal_pred_sum: metrics[10],
+            goal_brier_sum: metrics[11],
             value_pred_sum: global.pred_sum,
             value_pred_sq_sum: global.pred_sq_sum,
             value_target_sum: global.target_sum,
@@ -423,6 +505,12 @@ impl GpuReplica {
         };
         Ok(BatchLossOutput { loss_tensor, stats })
     }
+}
+
+/// BCEWithLogits：指数的输入始终非正，避免饱和 sigmoid 后 log(0)。
+pub(super) fn mating_bce_per_sample(logits: &Tensor, targets: &Tensor) -> CandleResult<Tensor> {
+    let softplus_tail = logits.abs()?.neg()?.exp()?.affine(1.0, 1.0)?.log()?;
+    ((logits.relu()? - (logits * targets)?)? + softplus_tail)?.mean(1)
 }
 
 // 按100半回合归一化：绝对回归使用30半回合的稳健区间，局部时间差使用3半回合。
@@ -606,6 +694,337 @@ fn dataloader_error(error: super::dataloader::DataLoaderError) -> candle_core::E
 mod monitoring_tests {
     use super::*;
 
+    fn goal_sample() -> AzTrainingSample {
+        let position = crate::xiangqi::Position::startpos();
+        let moves = position.legal_moves();
+        AzTrainingSample {
+            features: crate::az::nnue::extract_sparse_features_az(&position),
+            rule_context: Default::default(),
+            history_features: crate::az::history_features(&position, &[]),
+            move_indices: moves
+                .iter()
+                .map(|&mv| crate::az::dense_move_index(mv))
+                .collect(),
+            repetition_flags: Vec::new(),
+            policy: vec![1.0 / moves.len() as f32; moves.len()],
+            value_wdl: [1.0, 0.0, 0.0],
+            root_search_wdl: [1.0, 0.0, 0.0],
+            value: 1.0,
+            side_sign: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal {
+                target: crate::az::MatingTarget::DoubleCannon,
+                side: crate::xiangqi::Color::Black,
+                strength: 1.0,
+            },
+            goal_target: 1.0,
+            goal_weight: 1.0,
+            search_simulations: 0,
+            meta: Default::default(),
+        }
+    }
+
+    #[test]
+    fn goal_statistics_mask_unknowns_and_keep_the_instruction_owner_view() {
+        let sample = goal_sample();
+        let mut unknown = sample.clone();
+        unknown.goal_target = f32::NAN;
+        unknown.goal_weight = 0.0;
+        let mut model = AzNnue::random(8, 1830);
+        model.goal_bias[0] = (9.0f32).ln();
+        let replica = GpuReplica::new_cpu(&model).unwrap();
+        let samples = vec![sample, unknown];
+        let batch =
+            BatchTensors::from_packed(PackedBatch::from_indices(&samples, &[0, 1]), &Device::Cpu)
+                .unwrap();
+        let output = replica
+            .compute_batch_loss(&batch, 2, 1.0, 1.0, 0.0, 0.1)
+            .unwrap();
+        assert_eq!(output.stats.goal_samples, 1);
+        assert_eq!(output.stats.goal_target_sum, 1.0);
+        assert!((output.stats.goal_pred_sum - 0.9).abs() < 1e-6);
+        assert!((output.stats.goal_brier_sum - 0.01).abs() < 1e-6);
+        assert!((output.stats.goal_loss + (0.9f32).ln()).abs() < 1e-6);
+        assert!(output.stats.value_loss > 0.0);
+        let (vars, decay) = replica.model.all_vars_with_decay();
+        let optimizer = AzAdamW::new(vars, decay, 0.001).unwrap();
+        let mut trainer = GpuTrainer {
+            arch: model.arch,
+            optimizer_kind: AzTrainOptimizer::AdamW,
+            replica,
+            optimizer,
+            holdout: Some(Arc::new(samples)),
+            checks: Vec::new(),
+        };
+        trainer
+            .check_holdout(2, AzTrainLossWeights::default())
+            .unwrap();
+        let checks = trainer.take_checks();
+        assert_eq!(checks[0].goal_samples, 1);
+        assert_eq!(checks[0].goal_target_sum, 1.0);
+        assert!((checks[0].goal_loss - output.stats.goal_loss).abs() < 1e-6);
+        assert!((checks[0].goal_brier_sum - output.stats.goal_brier_sum).abs() < 1e-6);
+    }
+
+    #[test]
+    fn goal_loss_disconnects_disabled_or_unknown_heads_with_existing_momentum() {
+        let sample = goal_sample();
+        let mut model = AzNnue::random(8, 1831);
+        model.goal_hidden.fill(0.02);
+        model.goal_output.fill(0.05);
+        model.shared_bias.fill(1.0);
+        let replica = GpuReplica::new_cpu(&model).unwrap();
+        let heads = replica.model.goal_vars();
+        let snapshot = || {
+            heads
+                .iter()
+                .map(|v| v.flatten_all().unwrap().to_vec1::<f32>().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let initial = snapshot();
+        let (vars, decay) = replica.model.all_vars_with_decay();
+        let mut optimizer = AzAdamW::new(vars, decay, 0.03).unwrap();
+        let batch = BatchTensors::from_packed(
+            PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let output = replica
+            .compute_batch_loss(&batch, 1, 1.0, 1.0, 0.0, 1.0)
+            .unwrap();
+        optimizer
+            .step(&output.loss_tensor.backward().unwrap())
+            .unwrap();
+        let learned = snapshot();
+        assert_ne!(initial, learned);
+        for (weight, known) in [(0.0, true), (1.0, false)] {
+            let mut masked = sample.clone();
+            if !known {
+                masked.goal_weight = 0.0;
+                masked.goal_target = f32::NAN;
+            }
+            let batch =
+                BatchTensors::from_packed(PackedBatch::from_indices(&[masked], &[0]), &Device::Cpu)
+                    .unwrap();
+            assert!(
+                !batch.has_policy_goals,
+                "当前是执行方的对手，条件策略不得接入"
+            );
+            let output = replica
+                .compute_batch_loss(&batch, 1, 1.0, 1.0, 0.0, weight)
+                .unwrap();
+            assert!(output.stats.value_loss > 0.0);
+            let grads = output.loss_tensor.backward().unwrap();
+            assert!(heads.iter().all(|var| grads.get(var).is_none()));
+            optimizer.step(&grads).unwrap();
+            assert_eq!(learned, snapshot());
+        }
+    }
+
+    #[test]
+    fn disabled_or_unknown_mating_loss_freezes_heads_with_existing_adam_momentum() {
+        let position = crate::xiangqi::Position::startpos();
+        let moves = position.legal_moves();
+        let mut sample = AzTrainingSample {
+            features: crate::az::nnue::extract_sparse_features_az(&position),
+            rule_context: Default::default(),
+            history_features: crate::az::history_features(&position, &[]),
+            move_indices: moves
+                .iter()
+                .map(|&mv| crate::az::dense_move_index(mv))
+                .collect(),
+            repetition_flags: Vec::new(),
+            policy: vec![1.0 / moves.len() as f32; moves.len()],
+            value_wdl: [1.0, 0.0, 0.0],
+            root_search_wdl: [1.0, 0.0, 0.0],
+            value: 1.0,
+            side_sign: 1.0,
+            policy_weight: 0.0,
+            value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 1.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
+            search_simulations: 0,
+            meta: Default::default(),
+        };
+        sample.mating_targets[0] = 1.0;
+        let mut model = AzNnue::random(8, 1805);
+        model.mating_output.fill(0.05);
+        model.shared_bias.fill(1.0);
+        let replica = GpuReplica::new_cpu(&model).unwrap();
+        let heads = replica.model.mating_vars();
+        let snapshot = || {
+            heads
+                .iter()
+                .map(|v| v.flatten_all().unwrap().to_vec1::<f32>().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let initial = snapshot();
+        let (vars, decay) = replica.model.all_vars_with_decay();
+        let mut optimizer = AzAdamW::new(vars, decay, 0.03).unwrap();
+        let tensors = BatchTensors::from_packed(
+            PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let learned = replica
+            .compute_batch_loss(&tensors, 1, 1.0, 0.0, 1.0, 0.0)
+            .unwrap();
+        let grads = learned.loss_tensor.backward().unwrap();
+        assert!(heads.iter().all(|var| grads.get(var).is_some()));
+        optimizer.step(&grads).unwrap();
+        let trained = snapshot();
+        assert_ne!(initial, trained, "预先建立真实杀法梯度与 Adam 动量");
+
+        for (global_weight, supervised) in [(0.0, true), (1.0, false), (0.0, false)] {
+            let mut current = sample.clone();
+            if !supervised {
+                current.mating_weight = 0.0;
+                current.mating_targets.fill(f32::NAN);
+            }
+            let tensors = BatchTensors::from_packed(
+                PackedBatch::from_indices(&[current], &[0]),
+                &Device::Cpu,
+            )
+            .unwrap();
+            assert_eq!(tensors.has_mating_targets, supervised);
+            let output = replica
+                .compute_batch_loss(&tensors, 1, 1.0, 0.0, global_weight, 0.0)
+                .unwrap();
+            assert!(output.stats.value_loss > 0.0, "胜负头继续接受训练");
+            let grads = output.loss_tensor.backward().unwrap();
+            assert!(
+                heads.iter().all(|var| grads.get(var).is_none()),
+                "停用头应从损失图断开"
+            );
+            optimizer.step(&grads).unwrap();
+            assert_eq!(snapshot(), trained, "动量或权重衰减不应改变停用头参数");
+        }
+    }
+
+    #[test]
+    fn mating_bce_stays_finite_at_extreme_logits_and_has_correct_zero_gradient() {
+        let logits =
+            candle_core::Var::from_slice(&[-1000.0f32, 1000.0, 0.0], (3, 1), &Device::Cpu).unwrap();
+        let targets = Tensor::from_vec(vec![1.0f32, 0.0, 1.0], (3, 1), &Device::Cpu).unwrap();
+        let rows = mating_bce_per_sample(&logits, &targets).unwrap();
+        let values = rows.to_vec1::<f32>().unwrap();
+        assert_eq!(values[0], 1000.0);
+        assert_eq!(values[1], 1000.0);
+        assert!((values[2] - std::f32::consts::LN_2).abs() < 1e-6);
+        let gradient = rows
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap()
+            .get(&logits)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(gradient, [-1.0, 1.0, -0.5]);
+    }
+
+    #[test]
+    fn mating_statistics_and_holdout_respect_masks_without_removing_wdl() {
+        let position = crate::xiangqi::Position::startpos();
+        let moves = position.legal_moves();
+        let mut sample = AzTrainingSample {
+            features: crate::az::nnue::extract_sparse_features_az(&position),
+            rule_context: Default::default(),
+            history_features: crate::az::history_features(&position, &[]),
+            move_indices: moves
+                .iter()
+                .map(|&mv| crate::az::dense_move_index(mv))
+                .collect(),
+            repetition_flags: Vec::new(),
+            policy: vec![1.0 / moves.len() as f32; moves.len()],
+            value_wdl: [1.0, 0.0, 0.0],
+            root_search_wdl: [1.0, 0.0, 0.0],
+            value: 1.0,
+            side_sign: 1.0,
+            policy_weight: 0.0,
+            value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 1.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
+            search_simulations: 0,
+            meta: Default::default(),
+        };
+        sample.mating_targets[0] = 1.0;
+        sample.mating_targets[3] = 1.0;
+        let mut unknown = sample.clone();
+        unknown.mating_targets.fill(f32::NAN);
+        unknown.mating_weight = 0.0;
+        let model = AzNnue::random(8, 1804);
+        let replica = GpuReplica::new_cpu(&model).unwrap();
+        let evaluate = |samples: &[AzTrainingSample], mating_weight| {
+            let ids = (0..samples.len()).collect::<Vec<_>>();
+            let batch =
+                BatchTensors::from_packed(PackedBatch::from_indices(samples, &ids), &Device::Cpu)
+                    .unwrap();
+            replica
+                .compute_batch_loss(&batch, samples.len(), 1.0, 0.0, mating_weight, 0.0)
+                .unwrap()
+        };
+        let known = evaluate(std::slice::from_ref(&sample), 0.1);
+        let mixed = evaluate(&[sample.clone(), unknown.clone()], 0.1);
+        assert_eq!(mixed.stats.mating_samples, 1);
+        assert_eq!(mixed.stats.mating_target_sum[0], 1.0);
+        assert_eq!(mixed.stats.mating_target_sum[3], 1.0);
+        assert_eq!(mixed.stats.mating_target_sum[1], 0.0);
+        assert_eq!(mixed.stats.mating_target_sum, known.stats.mating_target_sum);
+        for i in 0..crate::az::MATING_HEAD_SIZE {
+            assert!((mixed.stats.mating_pred_sum[i] - known.stats.mating_pred_sum[i]).abs() < 1e-6);
+            assert!(
+                (mixed.stats.mating_brier_sum[i] - known.stats.mating_brier_sum[i]).abs() < 1e-6
+            );
+        }
+        assert!((mixed.stats.mating_loss - known.stats.mating_loss).abs() < 1e-6);
+        let masked = evaluate(std::slice::from_ref(&unknown), 0.1);
+        let wdl_only = evaluate(std::slice::from_ref(&unknown), 0.0);
+        assert_eq!(masked.stats.mating_samples, 0);
+        assert_eq!(masked.stats.mating_loss, 0.0);
+        assert!(masked.stats.value_loss > 0.0);
+        assert_eq!(
+            masked.loss_tensor.to_scalar::<f32>().unwrap(),
+            wdl_only.loss_tensor.to_scalar::<f32>().unwrap()
+        );
+
+        let (vars, decay) = replica.model.all_vars_with_decay();
+        let optimizer = AzAdamW::new(vars, decay, 0.001).unwrap();
+        let mut trainer = GpuTrainer {
+            arch: model.arch,
+            optimizer_kind: AzTrainOptimizer::AdamW,
+            replica,
+            optimizer,
+            holdout: Some(Arc::new(vec![sample, unknown])),
+            checks: Vec::new(),
+        };
+        trainer
+            .check_holdout(2, AzTrainLossWeights::default())
+            .unwrap();
+        let checks = trainer.take_checks();
+        assert_eq!(checks[0].mating_samples, 1);
+        assert!((checks[0].mating_loss - known.stats.mating_loss).abs() < 1e-6);
+        assert_eq!(checks[0].value_samples, 2);
+        assert_eq!(trainer.steps(), 0);
+    }
+
     fn check_moves_left_robust_ranking_objective(device: &Device) {
         let negative = candle_core::Var::from_slice(&[-0.2f32, -0.03, -1.0], 3, device).unwrap();
         let target = Tensor::new(&[0.11f32, 0.05, 123.0], device).unwrap();
@@ -716,6 +1135,11 @@ mod monitoring_tests {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: Default::default(),
         };
@@ -723,6 +1147,8 @@ mod monitoring_tests {
         let weights = AzTrainLossWeights {
             value: 1.0,
             policy: 1.0,
+            mating: 0.1,
+            goal: 0.1,
         };
         for (kind, lr) in [(AzTrainOptimizer::AdamW, 4e-4f32)] {
             let mut model = AzNnue::random(16, 20260927);
@@ -822,6 +1248,11 @@ mod monitoring_tests {
             value_weight: 0.0,
             moves_left: 40.0,
             moves_left_weight: 1.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: Default::default(),
         };
@@ -853,19 +1284,23 @@ mod monitoring_tests {
                 .unwrap()[0]
                 < 0.0
         );
-        let initial = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
+        let initial = replica
+            .compute_batch_loss(&batch, 1, 0.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(initial.stats.moves_left_samples, 1);
         let initial_loss = initial.stats.moves_left_loss;
         let (vars, decay) = replica.model.all_vars_with_decay();
         let mut optimizer = AzAdamW::new(vars, decay, 4e-4).unwrap();
         for _ in 0..80 {
-            let loss = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
+            let loss = replica
+                .compute_batch_loss(&batch, 1, 0.0, 0.0, 0.0, 0.0)
+                .unwrap();
             optimizer
                 .step(&loss.loss_tensor.backward().unwrap())
                 .unwrap();
         }
         let final_loss = replica
-            .compute_batch_loss(&batch, 1, 0.0, 0.0)
+            .compute_batch_loss(&batch, 1, 0.0, 0.0, 0.0, 0.0)
             .unwrap()
             .stats
             .moves_left_loss;
@@ -890,7 +1325,9 @@ mod monitoring_tests {
         let batch =
             BatchTensors::from_packed(PackedBatch::from_indices(&[masked], &[0]), &Device::Cpu)
                 .unwrap();
-        let loss = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
+        let loss = replica
+            .compute_batch_loss(&batch, 1, 0.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(loss.stats.moves_left_samples, 0);
         assert_eq!(loss.loss_tensor.to_scalar::<f32>().unwrap(), 0.0);
     }
@@ -917,6 +1354,11 @@ mod monitoring_tests {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: Default::default(),
         };
@@ -932,7 +1374,7 @@ mod monitoring_tests {
                 BatchTensors::from_packed(PackedBatch::from_indices(samples, &ids), &Device::Cpu)
                     .unwrap();
             replica
-                .compute_batch_loss(&batch, samples.len(), 1.0, 1.0)
+                .compute_batch_loss(&batch, samples.len(), 1.0, 1.0, 0.0, 0.0)
                 .unwrap()
         };
         let baseline = evaluate(&[sample.clone()]);

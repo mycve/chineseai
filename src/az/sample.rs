@@ -44,6 +44,9 @@ pub struct AzLoopConfig {
     /// 把该手的策略目标压成杀着、价值目标设成必胜，这是让模型从自博弈里学到连杀的关键。
     pub moves_left_params: AzMovesLeftParams,
     pub mate_search_plies: usize,
+    pub mating_goal: AzMatingGoal,
+    /// 训练时按盘混合普通争胜、重炮和铁门栓，具体指令仍在盘内保持不变。
+    pub mating_goal_mix: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -73,6 +76,17 @@ pub struct AzLoopReport {
     pub moves_left_samples: usize,
     pub moves_left_pairs: usize,
     pub moves_left_pair_accuracy: f32,
+    pub mating: AzMatingStats,
+    pub mating_loss: f32,
+    pub mating_samples: usize,
+    pub mating_target_sum: [f32; MATING_HEAD_SIZE],
+    pub mating_pred_sum: [f32; MATING_HEAD_SIZE],
+    pub mating_brier_sum: [f32; MATING_HEAD_SIZE],
+    pub goal_loss: f32,
+    pub goal_samples: usize,
+    pub goal_target_sum: f32,
+    pub goal_pred_sum: f32,
+    pub goal_brier_sum: f32,
     pub value_mse: f32,
     pub value_pred_mean: f32,
     pub value_target_mean: f32,
@@ -166,6 +180,15 @@ pub struct AzTrainingSample {
     /// 距离实际终局的半回合数；未知距离时权重为零。
     pub moves_left: f32,
     pub moves_left_weight: f32,
+    /// 当前行棋方最终以各杀法将死获胜的 multi-hot 标签；未知终局不设负标签。
+    pub mating_targets: [f32; MATING_HEAD_SIZE],
+    /// 真实终局为 1，搜索证明、截断及没有终局标签的外部数据为 0。
+    pub mating_weight: f32,
+    /// 原始整盘指令，执行方为绝对红黑；不可达时不重写此字段。
+    pub mating_goal: AzMatingGoal,
+    /// 固定执行方最终以指定杀法获胜；双方局面的目标相同，不作取反。
+    pub goal_target: f32,
+    pub goal_weight: f32,
     pub search_simulations: u32,
     pub meta: AzSampleMeta,
 }
@@ -443,6 +466,16 @@ pub struct AzTrainStats {
     pub moves_left_samples: usize,
     pub moves_left_pairs: usize,
     pub moves_left_correct_pairs: usize,
+    pub mating_loss: f32,
+    pub mating_samples: usize,
+    pub mating_target_sum: [f32; MATING_HEAD_SIZE],
+    pub mating_pred_sum: [f32; MATING_HEAD_SIZE],
+    pub mating_brier_sum: [f32; MATING_HEAD_SIZE],
+    pub goal_loss: f32,
+    pub goal_samples: usize,
+    pub goal_target_sum: f32,
+    pub goal_pred_sum: f32,
+    pub goal_brier_sum: f32,
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
@@ -464,6 +497,13 @@ pub struct AzHoldoutReport {
     pub value_samples: usize,
     pub loss: f32,
     pub value_loss: f32,
+    pub mating_loss: f32,
+    pub mating_samples: usize,
+    pub goal_loss: f32,
+    pub goal_samples: usize,
+    pub goal_target_sum: f32,
+    pub goal_pred_sum: f32,
+    pub goal_brier_sum: f32,
     pub moves_left_rmse: f32,
     pub moves_left_samples: usize,
     pub moves_left_pairs: usize,
@@ -487,6 +527,8 @@ pub struct AzValueMomentStats {
 pub struct AzTrainLossWeights {
     pub value: f32,
     pub policy: f32,
+    pub mating: f32,
+    pub goal: f32,
 }
 
 impl Default for AzTrainLossWeights {
@@ -494,6 +536,8 @@ impl Default for AzTrainLossWeights {
         Self {
             value: 1.0,
             policy: 1.0,
+            mating: 0.1,
+            goal: 0.1,
         }
     }
 }
@@ -508,6 +552,18 @@ impl AzTrainStats {
         self.moves_left_samples += other.moves_left_samples;
         self.moves_left_pairs += other.moves_left_pairs;
         self.moves_left_correct_pairs += other.moves_left_correct_pairs;
+        self.mating_loss += other.mating_loss;
+        self.mating_samples += other.mating_samples;
+        self.goal_loss += other.goal_loss;
+        self.goal_samples += other.goal_samples;
+        self.goal_target_sum += other.goal_target_sum;
+        self.goal_pred_sum += other.goal_pred_sum;
+        self.goal_brier_sum += other.goal_brier_sum;
+        for i in 0..MATING_HEAD_SIZE {
+            self.mating_target_sum[i] += other.mating_target_sum[i];
+            self.mating_pred_sum[i] += other.mating_pred_sum[i];
+            self.mating_brier_sum[i] += other.mating_brier_sum[i];
+        }
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
         self.value_target_sum += other.value_target_sum;

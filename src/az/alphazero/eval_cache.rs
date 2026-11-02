@@ -21,10 +21,14 @@ fn signature(mut limits: AzSearchLimits) -> AzSearchLimits {
 pub(super) fn take_cached(
     position: &Position,
     history: &[RuleHistoryEntry],
-    limits: AzSearchLimits,
+    mut limits: AzSearchLimits,
     workspace: &mut AzSearchWorkspace<'_>,
 ) -> Option<CachedTree> {
+    limits.mating_goal = limits.mating_goal.effective(position);
     let previous = workspace.previous_limits.replace(signature(limits));
+    if limits.mating_goal.enabled() {
+        return None;
+    }
     if previous != Some(signature(limits)) || limits.draw_score != 0.0 || workspace.nodes.is_empty()
     {
         return None;
@@ -99,6 +103,7 @@ impl CachedTree {
                 value: n.value,
                 value_wdl: n.value_wdl,
                 moves_left: n.moves_left,
+                goal_value: n.goal_value,
             },
             edges,
         ))
@@ -179,7 +184,8 @@ mod tests {
             p.make_move(mv);
         }
         assert!(hits > 0, "必须实际命中网络缓存");
-        assert_eq!(std::mem::size_of::<AzChild>(), 32);
+        // goal_value_sum 增加 4 字节，保留紧凑 u32 child 索引。
+        assert_eq!(std::mem::size_of::<AzChild>(), 36);
     }
 
     #[test]

@@ -9,8 +9,8 @@ use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
 use super::{
-    AzSampleMeta, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, WDL_HEAD_SIZE,
-    normalize_wdl_target,
+    AzMatingGoal, AzSampleMeta, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE,
+    MATING_HEAD_SIZE, MatingTarget, SplitMix64, WDL_HEAD_SIZE, normalize_wdl_target,
 };
 
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
@@ -56,7 +56,35 @@ fn replay_read_f32<R: Read>(reader: &mut R) -> io::Result<f32> {
     reader.read_f32::<LittleEndian>()
 }
 
+fn valid_mating_target(targets: &[f32; MATING_HEAD_SIZE], weight: f32) -> bool {
+    targets
+        .iter()
+        .chain(std::iter::once(&weight))
+        .all(|&value| value.is_finite() && (0.0..=1.0).contains(&value))
+}
+
+fn valid_goal_target(goal: AzMatingGoal, target: f32, weight: f32) -> bool {
+    goal.validate().is_ok()
+        && (target == 0.0 || target == 1.0)
+        && weight.is_finite()
+        && (0.0..=1.0).contains(&weight)
+        && (weight > 0.0 || target == 0.0)
+        && (goal.enabled() || weight == 0.0)
+}
+
 fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io::Result<()> {
+    if !valid_goal_target(sample.mating_goal, sample.goal_target, sample.goal_weight) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid mating goal or target",
+        ));
+    }
+    if !valid_mating_target(&sample.mating_targets, sample.mating_weight) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid mating target",
+        ));
+    }
     if sample.features.len() > REPLAY_MAX_FEATURES_PER_SAMPLE as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -127,6 +155,22 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     replay_push_f32(out, sample.value_weight);
     replay_push_f32(out, sample.moves_left);
     replay_push_f32(out, sample.moves_left_weight);
+    for &target in &sample.mating_targets {
+        replay_push_f32(out, target);
+    }
+    replay_push_f32(out, sample.mating_weight);
+    out.push(match sample.mating_goal.target {
+        MatingTarget::None => 0,
+        MatingTarget::DoubleCannon => 1,
+        MatingTarget::IronBolt => 2,
+    });
+    out.push(match sample.mating_goal.side {
+        crate::xiangqi::Color::Red => 0,
+        crate::xiangqi::Color::Black => 1,
+    });
+    replay_push_f32(out, sample.mating_goal.strength);
+    replay_push_f32(out, sample.goal_target);
+    replay_push_f32(out, sample.goal_weight);
     replay_push_u32(out, sample.search_simulations);
     replay_push_u32(out, sample.meta.generation_update);
     replay_push_u64(out, sample.meta.game_id);
@@ -273,6 +317,51 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
             "invalid moves-left target",
         ));
     }
+    let mut mating_targets = [0.0; MATING_HEAD_SIZE];
+    for target in &mut mating_targets {
+        *target = replay_read_f32(reader)?;
+    }
+    let mating_weight = replay_read_f32(reader)?;
+    if !valid_mating_target(&mating_targets, mating_weight) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid mating target",
+        ));
+    }
+    let target = match reader.read_u8()? {
+        0 => MatingTarget::None,
+        1 => MatingTarget::DoubleCannon,
+        2 => MatingTarget::IronBolt,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid goal target code",
+            ));
+        }
+    };
+    let side = match reader.read_u8()? {
+        0 => crate::xiangqi::Color::Red,
+        1 => crate::xiangqi::Color::Black,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid goal side code",
+            ));
+        }
+    };
+    let mating_goal = AzMatingGoal {
+        target,
+        side,
+        strength: replay_read_f32(reader)?,
+    };
+    let goal_target = replay_read_f32(reader)?;
+    let goal_weight = replay_read_f32(reader)?;
+    if !valid_goal_target(mating_goal, goal_target, goal_weight) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid mating goal or target",
+        ));
+    }
     let search_simulations = replay_read_u32(reader)?;
     let meta = AzSampleMeta {
         generation_update: replay_read_u32(reader)?,
@@ -307,6 +396,11 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
         value_weight,
         moves_left,
         moves_left_weight,
+        mating_targets,
+        mating_weight,
+        mating_goal,
+        goal_target,
+        goal_weight,
         search_simulations,
         meta,
     })
@@ -440,7 +534,11 @@ impl Px0ReplaySampler {
 }
 
 fn chunk_is_test(chunk: &ReplayChunk, seed: u64) -> bool {
-    let game_id = chunk.entries[0].sample.meta.game_id;
+    replay_game_is_test(chunk.entries[0].sample.meta.game_id, seed)
+}
+
+/// 与训练经验池一致的整盘留出划分；同一 game_id 的所有样本必须一起划分。
+pub fn replay_game_is_test(game_id: u64, seed: u64) -> bool {
     SplitMix64::new(game_id ^ seed ^ 0xA076_1D64_78BD_642F).next_u64() % 10 == 0
 }
 
@@ -614,6 +712,18 @@ impl AzExperiencePool {
         self.chunks
             .iter()
             .flat_map(|chunk| chunk.entries.iter().map(|entry| &entry.sample))
+    }
+
+    /// 训练留出按 chunk 首盘 ID 划分；探针必须拒绝混装多盘的外部 chunk。
+    pub fn has_grouped_game_ids(&self) -> bool {
+        self.chunks.iter().all(|chunk| {
+            chunk.entries.first().is_none_or(|first| {
+                chunk
+                    .entries
+                    .iter()
+                    .all(|entry| entry.sample.meta.game_id == first.sample.meta.game_id)
+            })
+        })
     }
 
     pub fn all_sample_groups(&self) -> Vec<Vec<AzTrainingSample>> {
@@ -868,6 +978,11 @@ mod tests {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: AzMatingGoal::default(),
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 400,
             meta: AzSampleMeta {
                 generation_update: generation,
@@ -876,6 +991,59 @@ mod tests {
                 ..AzSampleMeta::default()
             },
         }
+    }
+
+    #[test]
+    fn replay_preserves_raw_instruction_and_masks_unknown_goal_outcomes() {
+        let mut original = sample(AzStartSource::OpeningBook, 1, 77);
+        original.mating_goal = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: crate::xiangqi::Color::Black,
+            strength: 0.625,
+        };
+        for known in [true, false] {
+            original.goal_target = if known { 1.0 } else { 0.0 };
+            original.goal_weight = if known { 1.0 } else { 0.0 };
+            let mut bytes = Vec::new();
+            encode_az_training_sample(&mut bytes, &original).unwrap();
+            let decoded = decode_az_training_sample(&mut Cursor::new(&bytes)).unwrap();
+            assert_eq!(decoded.mating_goal, original.mating_goal);
+            assert_eq!(decoded.goal_target, original.goal_target);
+            assert_eq!(decoded.goal_weight, original.goal_weight);
+            let strength_offset = bytes
+                .windows(4)
+                .position(|window| window == 0.625f32.to_le_bytes())
+                .unwrap();
+            for offset in [strength_offset - 2, strength_offset - 1] {
+                let mut corrupt = bytes.clone();
+                corrupt[offset] = 255;
+                assert!(decode_az_training_sample(&mut Cursor::new(corrupt)).is_err());
+            }
+            for invalid in [f32::NAN, -0.1, 1.1] {
+                let mut corrupt = bytes.clone();
+                corrupt[strength_offset..strength_offset + 4]
+                    .copy_from_slice(&invalid.to_le_bytes());
+                assert!(decode_az_training_sample(&mut Cursor::new(corrupt)).is_err());
+            }
+        }
+        original.goal_target = 1.0;
+        original.goal_weight = 0.0;
+        assert!(encode_az_training_sample(&mut Vec::new(), &original).is_err());
+        original.goal_weight = 1.0;
+        original.mating_goal.strength = 0.0;
+        assert!(encode_az_training_sample(&mut Vec::new(), &original).is_err());
+    }
+
+    #[test]
+    fn probe_requires_the_same_game_grouping_as_training() {
+        let first = sample(AzStartSource::OpeningBook, 1, 11);
+        let second = sample(AzStartSource::OpeningBook, 1, 22);
+        let mut grouped = AzExperiencePool::new(10);
+        grouped.add_games(vec![vec![first.clone()], vec![second.clone()]]);
+        assert!(grouped.has_grouped_game_ids());
+        let mut mixed = AzExperiencePool::new(10);
+        mixed.add_samples([first, second]);
+        assert!(!mixed.has_grouped_game_ids());
     }
 
     #[test]
@@ -949,6 +1117,9 @@ mod tests {
         original.root_search_wdl = [0.6, 0.3, 0.1];
         original.moves_left = 37.0;
         original.moves_left_weight = 1.0;
+        original.mating_targets =
+            std::array::from_fn(|index| index as f32 / (MATING_HEAD_SIZE - 1) as f32);
+        original.mating_weight = 0.75;
         original.repetition_flags[0] = 1;
         original.history_features = std::array::from_fn(|i| i as f32 / 128.0);
         encode_az_training_sample(&mut encoded, &original).unwrap();
@@ -959,8 +1130,44 @@ mod tests {
         assert_eq!(decoded.root_search_wdl, original.root_search_wdl);
         assert_eq!(decoded.moves_left, 37.0);
         assert_eq!(decoded.moves_left_weight, 1.0);
+        assert_eq!(decoded.mating_targets, original.mating_targets);
+        assert_eq!(decoded.mating_weight, original.mating_weight);
         assert_eq!(decoded.repetition_flags, original.repetition_flags);
         assert_eq!(decoded.history_features, original.history_features);
+    }
+
+    #[test]
+    fn replay_rejects_non_finite_or_out_of_range_mating_targets_and_weights() {
+        let mut original = sample(AzStartSource::OpeningBook, 7, 11);
+        original.mating_targets[0] = 0.375;
+        original.mating_weight = 0.625;
+        let mut encoded = Vec::new();
+        encode_az_training_sample(&mut encoded, &original).unwrap();
+        for (marker, is_weight) in [(0.375f32, false), (0.625f32, true)] {
+            let marker_bytes = marker.to_le_bytes();
+            let offsets = encoded
+                .windows(4)
+                .enumerate()
+                .filter_map(|(offset, bytes)| (bytes == marker_bytes).then_some(offset))
+                .collect::<Vec<_>>();
+            assert_eq!(offsets.len(), 1, "测试字段需要唯一字节标记");
+            for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1] {
+                let mut invalid_sample = original.clone();
+                if is_weight {
+                    invalid_sample.mating_weight = invalid;
+                } else {
+                    invalid_sample.mating_targets[0] = invalid;
+                }
+                let error =
+                    encode_az_training_sample(&mut Vec::new(), &invalid_sample).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+                let mut corrupt = encoded.clone();
+                corrupt[offsets[0]..offsets[0] + 4].copy_from_slice(&invalid.to_le_bytes());
+                let error = decode_az_training_sample(&mut Cursor::new(corrupt)).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
     }
 
     #[test]
@@ -1027,6 +1234,10 @@ mod tests {
             let decoded = decode_replay_entry(&mut Cursor::new(encoded)).unwrap();
             let restored = ReplayChunk::new(vec![decoded.sample]);
             assert_eq!(chunk_is_test(chunk, 77), chunk_is_test(&restored, 77));
+            assert_eq!(
+                chunk_is_test(chunk, 77),
+                replay_game_is_test(chunk.entries[0].sample.meta.game_id, 77)
+            );
         }
         let empty = AzExperiencePool::new(10);
         assert!(

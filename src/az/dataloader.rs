@@ -272,6 +272,13 @@ pub(super) struct PackedBatch {
     pub value_weights: Vec<f32>,
     pub moves_left_targets: Vec<f32>,
     pub moves_left_weights: Vec<f32>,
+    pub mating_targets: Vec<f32>,
+    pub mating_weights: Vec<f32>,
+    pub goal_features: Vec<f32>,
+    pub goal_policy_mask: Vec<f32>,
+    pub goal_policy_bias: Vec<f32>,
+    pub goal_targets: Vec<f32>,
+    pub goal_weights: Vec<f32>,
     pub moves_left_pair_from: Vec<u32>,
     pub moves_left_pair_to: Vec<u32>,
     pub moves_left_pair_weights: Vec<f32>,
@@ -366,6 +373,13 @@ impl PackedBatch {
             value_weights: vec![1.0f32; batch_size],
             moves_left_targets: vec![0.0; batch_size],
             moves_left_weights: vec![0.0; batch_size],
+            mating_targets: vec![0.0; batch_size * super::MATING_HEAD_SIZE],
+            mating_weights: vec![0.0; batch_size],
+            goal_features: vec![0.0; batch_size * super::GOAL_CONTEXT_SIZE],
+            goal_policy_mask: vec![0.0; batch_size],
+            goal_policy_bias: vec![0.0; batch_size * max_policy_moves],
+            goal_targets: vec![0.0; batch_size],
+            goal_weights: vec![0.0; batch_size],
             moves_left_pair_from: Vec::new(),
             moves_left_pair_to: Vec::new(),
             moves_left_pair_weights: Vec::new(),
@@ -398,6 +412,23 @@ impl PackedBatch {
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.policy_weights[row] = sample.policy_weight.max(0.0);
             packed.value_weights[row] = sample.value_weight.max(0.0);
+            assert!(
+                sample.mating_weight.is_finite() && sample.mating_weight >= 0.0,
+                "mating weight must be finite and nonnegative"
+            );
+            if sample.mating_weight > 0.0 {
+                assert!(
+                    sample
+                        .mating_targets
+                        .iter()
+                        .all(|&x| x.is_finite() && (0.0..=1.0).contains(&x)),
+                    "supervised mating targets must be finite probabilities"
+                );
+                packed.mating_targets
+                    [row * super::MATING_HEAD_SIZE..(row + 1) * super::MATING_HEAD_SIZE]
+                    .copy_from_slice(&sample.mating_targets);
+                packed.mating_weights[row] = sample.mating_weight;
+            }
             if sample.moves_left.is_finite()
                 && sample.moves_left >= 0.0
                 && sample.moves_left_weight.is_finite()
@@ -474,6 +505,32 @@ impl PackedBatch {
         attacks: [u128; 2],
     ) {
         let policy_base = row * self.max_policy_moves;
+        let original_side = if sample.side_sign > 0.0 {
+            Color::Red
+        } else {
+            Color::Black
+        };
+        let goal = sample
+            .mating_goal
+            .canonical_for(original_side)
+            .effective(position);
+        let goal_features = goal.features(position);
+        self.goal_features[row * super::GOAL_CONTEXT_SIZE..(row + 1) * super::GOAL_CONTEXT_SIZE]
+            .copy_from_slice(&goal_features);
+        self.goal_policy_mask[row] =
+            f32::from(goal.enabled() && goal.side == position.side_to_move());
+        assert!(
+            sample.goal_weight.is_finite() && sample.goal_weight >= 0.0,
+            "goal weight must be finite and nonnegative"
+        );
+        if goal.enabled() && sample.goal_weight > 0.0 {
+            assert!(
+                sample.goal_target.is_finite() && (0.0..=1.0).contains(&sample.goal_target),
+                "supervised goal target must be a finite probability"
+            );
+            self.goal_targets[row] = sample.goal_target;
+            self.goal_weights[row] = sample.goal_weight;
+        }
         let [own_attacks, opponent_attacks] = attacks;
         let moves = sample
             .move_indices
@@ -508,6 +565,12 @@ impl PackedBatch {
             if move_index < DENSE_MOVE_SPACE {
                 self.policy_targets[policy_base + policy_offset] = target.max(0.0);
                 self.policy_mask[policy_base + policy_offset] = 0.0;
+                if goal.enabled() && goal.side == position.side_to_move() {
+                    if let Some((from, to)) = dense_move_squares(move_index) {
+                        self.goal_policy_bias[policy_base + policy_offset] =
+                            goal.policy_bias(position, crate::xiangqi::Move::new(from, to));
+                    }
+                }
                 self.policy_repetition[policy_base + policy_offset] = f32::from(
                     sample
                         .repetition_flags
@@ -765,9 +828,45 @@ mod tests {
             value_weight: 1.0,
             moves_left: 0.0,
             moves_left_weight: 0.0,
+            mating_targets: [0.0; crate::az::MATING_HEAD_SIZE],
+            mating_weight: 0.0,
+            mating_goal: crate::az::AzMatingGoal::NONE,
+            goal_target: 0.0,
+            goal_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         }
+    }
+
+    #[test]
+    fn mating_targets_pack_independently_and_unknown_targets_are_zeroed() {
+        let mut known = sample(0);
+        known.mating_targets[0] = 1.0;
+        known.mating_targets[3] = 0.25;
+        known.mating_weight = 0.5;
+        let mut unknown = known.clone();
+        unknown.mating_targets.fill(f32::NAN);
+        unknown.mating_weight = 0.0;
+        let packed = PackedBatch::from_indices(&[known.clone(), unknown], &[0, 1]);
+        assert_eq!(packed.mating_weights, [0.5, 0.0]);
+        assert_eq!(
+            &packed.mating_targets[..super::super::MATING_HEAD_SIZE],
+            &known.mating_targets
+        );
+        assert!(
+            packed.mating_targets[super::super::MATING_HEAD_SIZE..]
+                .iter()
+                .all(|&x| x == 0.0)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "supervised mating targets must be finite probabilities")]
+    fn supervised_mating_targets_reject_out_of_range_values() {
+        let mut known = sample(0);
+        known.mating_weight = 1.0;
+        known.mating_targets[0] = 1.01;
+        PackedBatch::from_indices(&[known], &[0]);
     }
 
     #[test]
