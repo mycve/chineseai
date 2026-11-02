@@ -443,7 +443,9 @@ struct KldGainStopper {
 
 impl KldGainStopper {
     fn should_stop(&mut self, tree: &AzTree<'_>, threshold: f32) -> bool {
-        if threshold <= 0.0 || tree.mating_goal.enabled() {
+        if threshold <= 0.0
+            || (tree.nodes[tree.root].solved.is_some() && !tree.search_finished(tree.root))
+        {
             return false;
         }
         let total = tree.nodes[tree.root].visits;
@@ -502,6 +504,8 @@ struct AzTree<'a> {
     draw_score: f32,
     value_scale: f32,
     mating_goal: AzMatingGoal,
+    /// 首次普通必胜后的目标探索也计入原 simulations，最多再用 64 次。
+    goal_search_until: Option<u32>,
     max_depth: usize,
     search_depth_sum: usize,
     search_depth_count: usize,
@@ -534,8 +538,8 @@ struct AzNode {
     moves_left_sum: f32,
     goal_value_sum: f32,
     goal_value: f32,
-    /// 仅来自真实终局及完整目标子树，不把普通胜负证明或网络概率当作目标证明。
-    goal_proven: Option<bool>,
+    /// 仅记录真实终局或必要条件失败；目标概率不做 AND/OR 证明传播。
+    goal_outcome: Option<bool>,
     value: f32,
     value_wdl: [f32; 3],
     moves_left: f32,
@@ -823,7 +827,7 @@ impl<'a> AzTree<'a> {
             moves_left_sum: 0.0,
             goal_value_sum: 0.0,
             goal_value: 0.0,
-            goal_proven: None,
+            goal_outcome: None,
             value: 0.0,
             value_wdl: [0.0, 1.0, 0.0],
             moves_left: 0.0,
@@ -876,6 +880,7 @@ impl<'a> AzTree<'a> {
             draw_score: limits.draw_score.clamp(-1.0, 1.0),
             value_scale: limits.value_scale.clamp(0.0, 1.0),
             mating_goal,
+            goal_search_until: None,
             max_depth: if limits.max_depth == 0 {
                 limits.simulations
             } else {
@@ -1229,7 +1234,8 @@ impl<'a> AzTree<'a> {
     fn simulate(&mut self, node_index: usize, depth: usize) -> AzEvalOutput {
         crate::scope_profile!("az.search.simulate");
         if self.nodes[node_index].solved.is_some()
-            && (!self.goal_at(node_index).enabled() || self.nodes[node_index].goal_proven.is_some())
+            && (!self.goal_at(node_index).enabled()
+                || self.nodes[node_index].goal_outcome.is_some())
         {
             let eval = self.node_eval(node_index);
             self.add_node_visit(node_index, eval);
@@ -1351,7 +1357,7 @@ impl<'a> AzTree<'a> {
                     moves_left_sum: 0.0,
                     goal_value_sum: 0.0,
                     goal_value: 0.0,
-                    goal_proven: None,
+                    goal_outcome: None,
                     value: 0.0,
                     value_wdl: [0.0, 1.0, 0.0],
                     moves_left: 0.0,
@@ -1383,7 +1389,7 @@ impl<'a> AzTree<'a> {
         self.update_solved(node_index);
         let eval = if self.nodes[node_index].solved.is_some() {
             let mut solved = self.node_eval(node_index);
-            if self.mating_goal.enabled() && self.nodes[node_index].goal_proven.is_none() {
+            if self.mating_goal.enabled() && self.nodes[node_index].goal_outcome.is_none() {
                 solved.goal_value = eval.goal_value;
             }
             solved
@@ -1543,6 +1549,11 @@ impl<'a> AzTree<'a> {
         let cpuct = self.compute_cpuct(node.visits, is_root);
         let moves_left = self.moves_left_context(node_index);
         let goal_active = self.goal_at(node_index).enabled();
+        let goal_weight = if goal_active && node.position.side_to_move() == self.mating_goal.side {
+            0.25 * self.mating_goal.strength
+        } else {
+            0.0
+        };
         // 一趟同时取"证明优先级 → PUCT 分数 → 先验"的字典序最大值。
         // 原实现先扫一遍找已证明胜的子节点、再扫一遍求最高优先级、最后在最高
         // 优先级里比分数，每个子节点要查三次 `child_solved`（每次都随机访问
@@ -1570,7 +1581,11 @@ impl<'a> AzTree<'a> {
                 parent_visits_sqrt,
                 cpuct,
                 moves_left.as_ref(),
-            ) + self.goal_bonus(node_index, child);
+            ) + if goal_weight > 0.0 {
+                goal_weight * self.child_goal_value(child)
+            } else {
+                0.0
+            };
             let replace = best.is_none_or(|(_, best_priority, best_prior, best_score)| {
                 priority > best_priority
                     || (priority == best_priority
@@ -1690,15 +1705,19 @@ impl<'a> AzTree<'a> {
             .map(|child| self.child_priority(child))
             .max()
             .unwrap_or(0);
+        // 普通必胜路线间按目标成功估计选取，策略标签与实际选着保持一致。
+        let best_goal =
+            (self.goal_turn(node_index) && priority == proof_priority(Some(1))).then(|| {
+                children
+                    .iter()
+                    .filter(|child| self.child_priority(child) == priority)
+                    .map(|child| self.child_goal_value(child))
+                    .fold(0.0f32, f32::max)
+            });
         let eligible = |child: &AzChild| {
             self.child_priority(child) == priority
                 && self.follows_proven_distance(node_index, child)
-                && (!self.goal_turn(node_index)
-                    || !children.iter().any(|other| {
-                        self.child_priority(other) == priority
-                            && self.child_goal_proven(other) == Some(true)
-                    })
-                    || self.child_goal_proven(child) == Some(true))
+                && best_goal.is_none_or(|best| self.child_goal_value(child) >= best)
         };
         let total_visits = children
             .iter()
@@ -1884,7 +1903,6 @@ impl<'a> AzTree<'a> {
     }
 
     fn update_solved(&mut self, node_index: usize) {
-        self.update_goal_proven(node_index);
         if let Some(value) = self.nodes[node_index].solved {
             self.set_proven(node_index, value);
             return;
@@ -1914,6 +1932,10 @@ impl<'a> AzTree<'a> {
         let previous = self.nodes[node_index].solved;
         if previous.is_some_and(|solved| solved != value) {
             return;
+        }
+        if previous.is_none() && node_index == self.root && value == 1 && self.goal_turn(node_index)
+        {
+            self.goal_search_until = Some(self.nodes[node_index].visits.saturating_add(64));
         }
         self.reject_unwinnable_goal(node_index, value);
         let distances = self

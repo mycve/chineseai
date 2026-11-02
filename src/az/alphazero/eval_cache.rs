@@ -26,9 +26,6 @@ pub(super) fn take_cached(
 ) -> Option<CachedTree> {
     limits.mating_goal = limits.mating_goal.effective(position);
     let previous = workspace.previous_limits.replace(signature(limits));
-    if limits.mating_goal.enabled() {
-        return None;
-    }
     if previous != Some(signature(limits)) || limits.draw_score != 0.0 || workspace.nodes.is_empty()
     {
         return None;
@@ -139,6 +136,7 @@ mod tests {
             assert_eq!((a.mv, a.visits, a.policy), (b.mv, b.visits, b.policy));
             assert!((a.raw_prior - b.raw_prior).abs() <= 1e-6);
             assert!((a.q - b.q).abs() <= 1e-6);
+            assert!((a.goal_value - b.goal_value).abs() <= 1e-6);
         }
         cached
     }
@@ -186,6 +184,67 @@ mod tests {
         assert!(hits > 0, "必须实际命中网络缓存");
         // goal_value_sum 增加 4 字节，保留紧凑 u32 child 索引。
         assert_eq!(std::mem::size_of::<AzChild>(), 36);
+    }
+
+    #[test]
+    fn goal_cache_matches_cold_and_rejects_changed_instructions() {
+        use crate::az::MatingTarget;
+        let mut model = AzNnue::random(8, 108);
+        model.goal_hidden.fill(0.2);
+        model.goal_output.fill(0.3);
+        let mut workspace = AzSearchWorkspace::new(&model);
+        let mut position = Position::startpos();
+        let mut history = position.initial_rule_history();
+        let limits = AzSearchLimits {
+            simulations: 400,
+            max_depth: 4,
+            root_dirichlet_alpha: 0.12,
+            root_exploration_fraction: 0.1,
+            minimum_kldgain_per_node: 5e-5,
+            mating_goal: AzMatingGoal {
+                target: MatingTarget::DoubleCannon,
+                side: Color::Red,
+                strength: 0.8,
+            },
+            ..Default::default()
+        };
+        let mut hits = 0;
+        for _ in 0..4 {
+            let result = compare(&position, &history, limits, &mut workspace);
+            hits += workspace.last_cache_hits;
+            let mv = result.best_move.unwrap();
+            history.push(position.rule_history_entry_after_move(mv));
+            position.make_move(mv);
+        }
+        assert!(hits > 0, "相同整盘目标必须实际复用网络结果");
+        for goal in [
+            AzMatingGoal {
+                target: MatingTarget::IronBolt,
+                ..limits.mating_goal
+            },
+            AzMatingGoal {
+                side: Color::Black,
+                ..limits.mating_goal
+            },
+            AzMatingGoal {
+                strength: 0.5,
+                ..limits.mating_goal
+            },
+        ] {
+            workspace.previous_limits = Some(signature(limits));
+            assert!(
+                take_cached(
+                    &position,
+                    &history,
+                    AzSearchLimits {
+                        mating_goal: goal,
+                        ..limits
+                    },
+                    &mut workspace,
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]

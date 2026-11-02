@@ -833,6 +833,84 @@ mod tests {
     }
 
     #[test]
+    fn opening_goal_search_policy_trains_the_condition_encoding_without_terminal_labels() {
+        use crate::az::{AzMatingGoal, AzSearchLimits, MatingTarget, alphazero_search};
+        use crate::xiangqi::Color;
+        let position = Position::startpos();
+        let mut model = conditioned_model();
+        model.goal_hidden.fill(0.0);
+        model.goal_output.fill(0.0);
+        model.shared_bias.fill(1.0);
+        let samples = [MatingTarget::DoubleCannon, MatingTarget::IronBolt].map(|target| {
+            let goal = AzMatingGoal {
+                target,
+                side: Color::Red,
+                strength: 1.0,
+            };
+            let search = alphazero_search(
+                &position,
+                &model,
+                AzSearchLimits {
+                    simulations: 128,
+                    max_depth: 1,
+                    mating_goal: goal,
+                    ..Default::default()
+                },
+            );
+            let mut sample = goal_sample(&position, goal);
+            sample.goal_weight = 0.0; // 尚未走到终局，仍然要训练目标策略。
+            sample.policy_weight = 1.0;
+            for (index, value) in sample.move_indices.iter().zip(&mut sample.policy) {
+                *value = search
+                    .candidates
+                    .iter()
+                    .find(|candidate| dense_move_index(candidate.mv) == *index)
+                    .unwrap()
+                    .policy;
+            }
+            sample
+        });
+        assert_ne!(samples[0].policy, samples[1].policy);
+        let batch =
+            BatchTensors::from_packed(PackedBatch::from_indices(&samples, &[0, 1]), &Device::Cpu)
+                .unwrap();
+        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let objective = || {
+            let forward = candle.forward(&batch).unwrap();
+            let logits = (&forward.policy_logits + &batch.policy_mask).unwrap();
+            let log_policy = candle_nn::ops::log_softmax(&logits, 1).unwrap();
+            ((&batch.policy_targets * &log_policy).unwrap() * -1.0)
+                .unwrap()
+                .sum(1)
+                .unwrap()
+                .mean_all()
+                .unwrap()
+        };
+        let initial = objective().to_scalar::<f32>().unwrap();
+        let grads = objective().backward().unwrap();
+        assert!(
+            grads
+                .get(&candle.goal_hidden)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .any(|&x| x != 0.0)
+        );
+        assert!(grads.get(&candle.goal_output).is_none());
+        assert!(grads.get(&candle.value_head_output).is_none());
+        let mut optimizer =
+            crate::az::adamw::AzAdamW::new(vec![candle.goal_hidden.clone()], vec![false], 0.1)
+                .unwrap();
+        for _ in 0..12 {
+            optimizer.step(&objective().backward().unwrap()).unwrap();
+        }
+        assert!(objective().to_scalar::<f32>().unwrap() < initial);
+    }
+
+    #[test]
     fn goal_scalar_bce_learns_both_outcomes_and_reaches_the_residual_and_shared_trunk() {
         use crate::{
             az::{AzMatingGoal, MatingTarget},
