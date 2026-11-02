@@ -228,6 +228,22 @@ fn mating_line(report: &AzLoopReport) -> String {
     } else {
         "NA".into()
     };
+    let [goal_wins, goal_losses, goal_draws, goal_unknown] = stats.goal_result_totals();
+    let [plain_red, plain_black, plain_draws, plain_unknown] = stats.ordinary_results;
+    let goal_games = goal_wins + goal_losses + goal_draws + goal_unknown;
+    let goal_win_rate = if goal_games > 0 {
+        format!("{:.1}%", goal_wins as f32 * 100.0 / goal_games as f32)
+    } else {
+        "NA".into()
+    };
+    let success_given_win = if goal_wins > 0 {
+        format!(
+            "{:.1}%",
+            stats.goal_successes.iter().sum::<usize>() as f32 * 100.0 / goal_wins as f32
+        )
+    } else {
+        "NA".into()
+    };
     let goal_counts = chineseai::az::MatingTarget::ALL
         .into_iter()
         .enumerate()
@@ -247,7 +263,7 @@ fn mating_line(report: &AzLoopReport) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "本批杀法：实际将死={} 困毙={} 未知={} 覆盖={} CE={}/{} 目标CE={}/{} 轨迹CE={:.4}/{} 目标执行红/黑={}/{} {} 计数(批内全部%/批内将死%)：{}",
+        "本批杀法：实际将死={} 困毙={} 未知={} 覆盖={} CE={}/{} 目标CE={}/{} 轨迹CE={:.4}/{} 目标执行红/黑={}/{} 目标局胜/负/和/未知={}/{}/{}/{}(胜率={},胜局命中={}) 普通局红/黑/和/未知={}/{}/{}/{} {} 计数(批内全部%/批内将死%)：{}",
         stats.checkmates,
         stats.stalemates,
         stats.unknown_games,
@@ -260,6 +276,16 @@ fn mating_line(report: &AzLoopReport) -> String {
         report.goal_imitation_samples,
         stats.goal_side_attempts[0],
         stats.goal_side_attempts[1],
+        goal_wins,
+        goal_losses,
+        goal_draws,
+        goal_unknown,
+        goal_win_rate,
+        success_given_win,
+        plain_red,
+        plain_black,
+        plain_draws,
+        plain_unknown,
         goal_counts,
         if counts.is_empty() {
             "无匹配标签"
@@ -291,5 +317,19 @@ mod tests {
         assert!(line.contains("重炮=2(50.0%/100.0%)"));
         assert!(line.contains("马后炮=2(50.0%/100.0%)"));
         assert!(line.contains("CE=NA/0"));
+    }
+    #[test]
+    fn goal_win_rate_and_success_given_win_have_different_denominators() {
+        let mut report = AzLoopReport::default();
+        report.mating.games = 13;
+        report.mating.goal_attempts[0] = 10;
+        report.mating.goal_successes[0] = 1;
+        report.mating.goal_results[0] = [2, 6, 1, 1];
+        report.mating.ordinary_results = [1, 1, 0, 1];
+        let line = mating_line(&report);
+        assert!(line.contains("目标局胜/负/和/未知=2/6/1/1(胜率=20.0%,胜局命中=50.0%)"));
+        assert!(line.contains("普通局红/黑/和/未知=1/1/0/1"));
+        report.mating.goal_results[0][0] = 0;
+        assert!(mating_line(&report).contains("胜局命中=NA"));
     }
 }

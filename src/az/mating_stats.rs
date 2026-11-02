@@ -16,8 +16,12 @@ pub struct AzMatingStats {
     pub goal_attempts: [usize; MATING_TARGET_COUNT],
     pub goal_successes: [usize; MATING_TARGET_COUNT],
     pub goal_unknown: [usize; MATING_TARGET_COUNT],
-    /// [红方执行、黑方执行]，用于检查随机执行方的实际采样。
+    /// [红方执行、黑方执行]，用于检查目标执行方的实际分布。
     pub goal_side_attempts: [usize; 2],
+    /// 各目标执行方的 [胜、负、和、未知/截断]，以实际结果而非搜索证明计数。
+    pub goal_results: [[usize; 4]; MATING_TARGET_COUNT],
+    /// 普通对局的 [红胜、黑胜、和、未知/截断]。
+    pub ordinary_results: [usize; 4],
 }
 
 impl AzMatingStats {
@@ -34,9 +38,38 @@ impl AzMatingStats {
             self.goal_attempts[i] += other.goal_attempts[i];
             self.goal_successes[i] += other.goal_successes[i];
             self.goal_unknown[i] += other.goal_unknown[i];
+            for result in 0..4 {
+                self.goal_results[i][result] += other.goal_results[i][result];
+            }
+        }
+        for i in 0..4 {
+            self.ordinary_results[i] += other.ordinary_results[i];
         }
         for i in 0..2 {
             self.goal_side_attempts[i] += other.goal_side_attempts[i];
+        }
+    }
+
+    pub fn goal_result_totals(&self) -> [usize; 4] {
+        std::array::from_fn(|result| self.goal_results.iter().map(|row| row[result]).sum())
+    }
+
+    pub(super) fn record_result(&mut self, goal: AzMatingGoal, result: Option<f32>) {
+        let owner_sign = if goal.enabled() && goal.side == crate::xiangqi::Color::Black {
+            -1.0
+        } else {
+            1.0
+        };
+        let outcome = match result.map(|result| result * owner_sign) {
+            Some(result) if result > 0.0 => 0,
+            Some(result) if result < 0.0 => 1,
+            Some(_) => 2,
+            None => 3,
+        };
+        if goal.enabled() {
+            self.goal_results[goal.target.index().unwrap()][outcome] += 1;
+        } else {
+            self.ordinary_results[outcome] += 1;
         }
     }
 
@@ -163,5 +196,45 @@ mod tests {
         }
         assert_eq!(AzMatingStats::default().rate_all(0), 0.0);
         assert_eq!(AzMatingStats::default().rate_checkmates(0), 0.0);
+    }
+    #[test]
+    fn actual_results_keep_goal_owner_and_ordinary_colors_separate() {
+        use crate::xiangqi::Color;
+        let goal = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 0.8,
+        };
+        let mut stats = AzMatingStats::default();
+        for side in [Color::Red, Color::Black] {
+            for result in [Some(1.0), Some(-1.0), Some(0.0), None] {
+                stats.record_result(AzMatingGoal { side, ..goal }, result);
+            }
+        }
+        assert_eq!(stats.goal_results[0], [2, 2, 2, 2]);
+        assert_eq!(stats.ordinary_results, [0; 4]);
+        stats.record_result(
+            AzMatingGoal {
+                side: Color::Black,
+                ..goal
+            },
+            Some(-1.0),
+        );
+        assert_eq!(stats.goal_results[0][0], 3, "黑方执行时黑胜算执行方获胜");
+        for result in [Some(1.0), Some(-1.0), Some(0.0), None] {
+            stats.record_result(
+                AzMatingGoal {
+                    strength: 0.0,
+                    ..goal
+                },
+                result,
+            );
+        }
+        assert_eq!(stats.ordinary_results, [1; 4]);
+        let mut merged = AzMatingStats::default();
+        merged.add_assign(&stats);
+        merged.add_assign(&stats);
+        assert_eq!(merged.goal_result_totals(), [6, 4, 4, 4]);
+        assert_eq!(merged.ordinary_results, [2; 4]);
     }
 }

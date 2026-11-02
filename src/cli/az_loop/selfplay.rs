@@ -328,12 +328,54 @@ pub(crate) fn mating_count_metrics(
                 stats.goal_unknown[i] as f32,
             ),
         ]);
+        for (result, count) in ["wins", "losses", "draws", "unfinished"]
+            .into_iter()
+            .zip(stats.goal_results[i])
+        {
+            metrics.push((format!("{prefix}/goal/{name}/{result}"), count as f32));
+        }
+        if stats.goal_results[i][0] > 0 {
+            metrics.push((
+                format!("{prefix}/goal/{name}/success_given_win"),
+                stats.goal_successes[i] as f32 / stats.goal_results[i][0] as f32,
+            ));
+        }
         if attempts > 0.0 {
+            metrics.push((
+                format!("{prefix}/goal/{name}/win_rate"),
+                stats.goal_results[i][0] as f32 / attempts,
+            ));
             metrics.push((
                 format!("{prefix}/goal/{name}/success_rate"),
                 stats.goal_successes[i] as f32 / attempts,
             ));
         }
+    }
+    let goal_results = stats.goal_result_totals();
+    for (result, count) in ["wins", "losses", "draws", "unfinished"]
+        .into_iter()
+        .zip(goal_results)
+    {
+        metrics.push((format!("{prefix}/goal_owner/{result}"), count as f32));
+    }
+    let goal_games = goal_results.iter().sum::<usize>();
+    if goal_games > 0 {
+        metrics.push((
+            format!("{prefix}/goal_owner/win_rate"),
+            goal_results[0] as f32 / goal_games as f32,
+        ));
+    }
+    if goal_results[0] > 0 {
+        metrics.push((
+            format!("{prefix}/goal_owner/success_given_win"),
+            stats.goal_successes.iter().sum::<usize>() as f32 / goal_results[0] as f32,
+        ));
+    }
+    for (result, count) in ["red_wins", "black_wins", "draws", "unfinished"]
+        .into_iter()
+        .zip(stats.ordinary_results)
+    {
+        metrics.push((format!("{prefix}/ordinary/{result}"), count as f32));
     }
     for (i, side) in ["red", "black"].into_iter().enumerate() {
         metrics.push((
@@ -497,5 +539,21 @@ mod tests {
                 .iter()
                 .any(|(tag, _)| tag == "train/mating_bce" || tag.ends_with("/brier"))
         );
+    }
+    #[test]
+    fn goal_result_metrics_separate_winning_from_forming_the_requested_mate() {
+        let mut stats = chineseai::az::AzMatingStats::default();
+        stats.goal_attempts[0] = 10;
+        stats.goal_successes[0] = 1;
+        stats.goal_results[0] = [2, 6, 1, 1];
+        stats.ordinary_results = [1, 1, 0, 1];
+        let metrics = mating_count_metrics(&stats, "mating")
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(metrics["mating/goal/重炮/win_rate"], 0.2);
+        assert_eq!(metrics["mating/goal/重炮/success_rate"], 0.1);
+        assert_eq!(metrics["mating/goal/重炮/success_given_win"], 0.5);
+        assert_eq!(metrics["mating/goal_owner/unfinished"], 1.0);
+        assert_eq!(metrics["mating/ordinary/red_wins"], 1.0);
     }
 }

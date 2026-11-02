@@ -756,6 +756,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let classification = mating_observed.then(|| position.classify_mate()).flatten();
         mating.record(classification.as_ref(), mating_observed);
         mating.record_goal(mating_goal, classification.as_ref(), mating_observed);
+        mating.record_result(mating_goal, terminal_result);
         let result: f32 = terminal_result.unwrap_or(0.0);
         match result.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => red_wins += 1,
@@ -1636,6 +1637,8 @@ mod tests {
                 .all(|s| s.goal_weight == 0.0 && s.goal_target == 0.0)
         );
         assert_eq!(data.mating.goal_attempts[..2], [1, 0]);
+        assert_eq!(data.mating.goal_result_totals().iter().sum::<usize>(), 1);
+        assert_eq!(data.mating.ordinary_results, [0; 4]);
         assert_eq!(data.mating.goal_unknown[..2], [1, 0]);
     }
 
@@ -1731,6 +1734,8 @@ mod tests {
         let data = generate_selfplay_data(&AzNnue::random(8, 532), &config);
         assert_eq!(data.mating.checkmates, 1);
         assert_eq!(data.mating.goal_attempts[..2], [1, 0]);
+        assert_eq!(data.mating.goal_result_totals().iter().sum::<usize>(), 1);
+        assert_eq!(data.mating.ordinary_results, [0; 4]);
         assert_eq!(data.mating.goal_successes[..2], [1, 0]);
         assert_eq!(data.mating.goal_unknown[..2], [0, 0]);
         assert!(!data.samples.is_empty());
