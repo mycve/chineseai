@@ -387,7 +387,7 @@ fn choose_selfplay_goal(
         target: MatingTarget::None,
         ..config.mating_goal
     };
-    if rng.next_u64() % 10 == 0 {
+    if rng.next_u64() % 10 < 4 {
         return goal;
     }
     // 只排除必要资源已丢失的目标，不按网络概率筛选，以免永远学不到困难目标。
@@ -1707,8 +1707,8 @@ mod tests {
             assert_eq!(goal.strength, 0.6);
             counts[goal.target.index().map_or(0, |index| index + 1)] += 1;
         }
-        assert!((230..370).contains(&counts[0]));
-        let expected = 2700 / crate::az::MATING_TARGET_COUNT;
+        assert!((1100..1300).contains(&counts[0]));
+        let expected = 1800 / crate::az::MATING_TARGET_COUNT;
         assert!(
             counts[1..]
                 .iter()

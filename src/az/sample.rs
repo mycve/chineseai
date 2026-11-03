@@ -45,7 +45,7 @@ pub struct AzLoopConfig {
     pub moves_left_params: AzMovesLeftParams,
     pub mate_search_plies: usize,
     pub mating_goal: AzMatingGoal,
-    /// 每盘约 10% 普通争胜，其余在具备必要子力的确认目标中均匀采样，执行方与强度不变。
+    /// 每盘约 40% 普通争胜，其余 60% 在具备必要子力的确认目标中均匀采样，执行方与强度不变。
     pub mating_goal_mix: bool,
 }
 
