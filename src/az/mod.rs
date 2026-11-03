@@ -1,7 +1,7 @@
 mod accumulator;
 mod adamw;
 mod alphazero;
-pub(crate) use alphazero::{AzUciSearchResult, search_uci};
+pub(crate) use alphazero::{AzUciSearchResult, GoalPlan, search_uci};
 mod arch;
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
@@ -55,7 +55,7 @@ mod value;
 
 pub use alphazero::{
     AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, AzSearchTraceStep,
-    alphazero_search, alphazero_search_external_root_controlled_with_progress,
+    AzSearchWorkspace, alphazero_search, alphazero_search_external_root_controlled_with_progress,
     alphazero_search_trace_with_rules, alphazero_search_with_rules,
     alphazero_search_with_rules_controlled, alphazero_search_with_rules_controlled_with_progress,
     cp_from_q,

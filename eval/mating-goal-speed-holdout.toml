@@ -1,0 +1,50 @@
+# 额外八局面：seed=20261105，均匀reservoir抽样，排除此前32局面，不按结果筛选。
+targets = ["double_cannon", "iron_bolt", "horse_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks", "two_ghosts"]
+
+[[cases]]
+name = "speed-holdout-2052729"
+stage = "speed_holdout"
+fen = "r1bakabnr/9/nc6c/2p1p1p1p/p8/1C7/P1P1P1P1P/C8/8R/RNBAKABN1 w"
+side = "red"
+
+[[cases]]
+name = "speed-holdout-1568265"
+stage = "speed_holdout"
+fen = "1r2kab2/3na4/3cb2cn/p1p1p1p2/5r2p/2PRP1P2/P7P/NC2BCN2/4A4/1R2KAB2 w"
+side = "red"
+
+[[cases]]
+name = "speed-holdout-3004719"
+stage = "speed_holdout"
+fen = "2bakab1r/r8/nc6c/2p1n4/p5p1p/2P6/P3P1P1P/N2C2N2/9/1RBAKABR1 w"
+side = "red"
+
+[[cases]]
+name = "speed-holdout-958617"
+stage = "speed_holdout"
+fen = "1rbaka1n1/9/c1n1bc3/p1p1p1p1p/9/2P3P2/P3P3P/C1N1BCN2/9/R2AKABr1 w"
+side = "red"
+
+[[cases]]
+name = "speed-holdout-1818738"
+stage = "speed_holdout"
+fen = "r1baka1nr/9/nc5cb/2p1p1p1p/p8/6P2/P1P1P3P/N4C1C1/9/R1BAKABNR w"
+side = "red"
+
+[[cases]]
+name = "speed-holdout-2922656"
+stage = "speed_holdout"
+fen = "rn1akabnr/9/4b3c/p1p1p1p1p/7c1/9/P1P1P1P1P/3CB4/7C1/RNBAKA1NR w"
+side = "red"
+
+[[cases]]
+name = "speed-holdout-337806"
+stage = "speed_holdout"
+fen = "2baka2r/9/2ccb3n/p3p1p1N/2p4R1/6P1P/P1n1P4/C1N1BC3/4A4/1r2KAB2 w"
+side = "red"
+
+[[cases]]
+name = "speed-holdout-2615174"
+stage = "speed_holdout"
+fen = "rnbakabnr/9/6c2/p1p1p1p1p/9/2c6/P3P1P1P/C6C1/9/RNBAKABNR w"
+side = "red"

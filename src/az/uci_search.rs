@@ -4,6 +4,7 @@ use std::collections::BinaryHeap;
 
 const MAX_UCI_TREE_NODES: usize = 100_000;
 
+#[derive(Clone)]
 pub(crate) struct AzUciPv {
     pub moves: Vec<Move>,
     pub wdl: [f32; 3],
@@ -11,9 +12,38 @@ pub(crate) struct AzUciPv {
     pub proven: Option<i8>,
 }
 
+#[derive(Clone)]
 pub(crate) struct AzUciSearchResult {
     pub search: AzSearchResult,
     pub variations: Vec<AzUciPv>,
+    pub goal_plan: Option<GoalPlan>,
+}
+
+impl AzUciSearchResult {
+    pub(crate) fn use_goal_plan(
+        &mut self,
+        plan: &GoalPlan,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+        goal: AzMatingGoal,
+    ) -> bool {
+        let Some(moves) = plan.apply(position, history, goal, &mut self.search) else {
+            return false;
+        };
+        self.variations
+            .retain(|pv| pv.moves.first() != moves.first());
+        self.variations.insert(
+            0,
+            AzUciPv {
+                moves,
+                wdl: [1.0, 0.0, 0.0],
+                q: 1.0,
+                proven: Some(1),
+            },
+        );
+        self.goal_plan = Some(plan.clone());
+        true
+    }
 }
 
 impl AzTree<'_> {
@@ -122,7 +152,11 @@ impl AzTree<'_> {
                 }
             })
             .collect();
-        AzUciSearchResult { search, variations }
+        AzUciSearchResult {
+            search,
+            variations,
+            goal_plan: None,
+        }
     }
 }
 
@@ -144,12 +178,20 @@ pub(crate) fn search_uci(
     tree.prove_root_mate(position, model);
     let mut used = 0;
     let mut last_progress = Instant::now();
+    let mut goal_plan = None;
     if tree.nodes[0].children_len > 0 {
         for _ in 0..limits.simulations {
             if control.should_stop() {
                 break;
             }
             if tree.nodes.len() >= MAX_UCI_TREE_NODES {
+                GoalPlan::retain_shorter(
+                    &mut goal_plan,
+                    tree.goal_plan(),
+                    position,
+                    &tree.rule_history_scratch,
+                    limits.mating_goal,
+                );
                 tree.compact_uci_tree(MAX_UCI_TREE_NODES / 2);
             }
             tree.simulate(0, 0);
@@ -165,7 +207,16 @@ pub(crate) fn search_uci(
             }
         }
     }
-    tree.uci_snapshot(used, multipv)
+    GoalPlan::retain_shorter(
+        &mut goal_plan,
+        tree.goal_plan(),
+        position,
+        &tree.rule_history_scratch,
+        limits.mating_goal,
+    );
+    let mut result = tree.uci_snapshot(used, multipv);
+    result.goal_plan = goal_plan;
+    result
 }
 
 #[cfg(test)]

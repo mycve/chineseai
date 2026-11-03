@@ -1,11 +1,220 @@
 use super::*;
 
+#[derive(Clone)]
+pub(crate) struct GoalPlan {
+    goal: AzMatingGoal,
+    history: Vec<RuleHistoryEntry>,
+    root: Arc<GoalPlanNode>,
+}
+
+struct GoalPlanNode {
+    position: Position,
+    plies: u32,
+    children: Vec<(Move, RuleHistoryEntry, Arc<GoalPlanNode>)>,
+}
+
+impl GoalPlan {
+    fn at(
+        &self,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+        goal: AzMatingGoal,
+    ) -> Option<&GoalPlanNode> {
+        if !goal.effective(position).enabled()
+            || goal.target != self.goal.target
+            || goal.side != self.goal.side
+            || position.side_to_move() != goal.side
+            || !history.starts_with(&self.history)
+        {
+            return None;
+        }
+        let mut node = self.root.as_ref();
+        for entry in &history[self.history.len()..] {
+            node = node
+                .children
+                .iter()
+                .find(|(_, expected, _)| expected == entry)?
+                .2
+                .as_ref();
+        }
+        (node.position == *position && !node.children.is_empty()).then_some(node)
+    }
+
+    pub(crate) fn apply(
+        &self,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+        goal: AzMatingGoal,
+        result: &mut AzSearchResult,
+    ) -> Option<Vec<Move>> {
+        let node = self.at(position, history, goal)?;
+        let mv = node.children.first()?.0;
+        if !result.candidates.iter().any(|candidate| candidate.mv == mv) {
+            return None;
+        }
+        result.best_move = Some(mv);
+        result.value_q = 1.0;
+        result.value_wdl = [1.0, 0.0, 0.0];
+        result.best_value_wdl = result.value_wdl;
+        result.value_cp = cp_from_q(1.0);
+        result.goal_value = 1.0;
+        result.proven_moves_left = Some(node.plies as usize);
+        for candidate in &mut result.candidates {
+            candidate.policy = f32::from(u8::from(candidate.mv == mv));
+            if candidate.mv == mv {
+                candidate.q = 1.0;
+                candidate.solved = Some(1);
+                candidate.goal_value = 1.0;
+                candidate.moves_left = Some(node.plies as f32);
+            }
+        }
+        let mut pv = Vec::new();
+        let mut current = node;
+        while let Some((mv, _, next)) = current
+            .children
+            .iter()
+            .max_by_key(|(_, _, next)| next.plies)
+        {
+            pv.push(*mv);
+            current = next;
+        }
+        Some(pv)
+    }
+
+    pub(crate) fn retain_shorter(
+        cache: &mut Option<Self>,
+        fresh: Option<Self>,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+        goal: AzMatingGoal,
+    ) {
+        let previous = cache
+            .as_ref()
+            .and_then(|plan| plan.at(position, history, goal))
+            .map(|node| node.plies);
+        if let Some(plan) = fresh {
+            if previous.is_none_or(|bound| plan.root.plies < bound) {
+                *cache = Some(plan);
+            }
+        }
+    }
+}
+
 impl AzTree<'_> {
+    pub(super) fn goal_plan(&self) -> Option<GoalPlan> {
+        if !self.goal_turn(self.root) {
+            return None;
+        }
+        fn collect(tree: &AzTree<'_>, index: usize) -> Option<Arc<GoalPlanNode>> {
+            let node = &tree.nodes[index];
+            if node.goal_outcome != Some(true) {
+                return None;
+            }
+            let mut children = Vec::new();
+            if node.goal_plies > 0 {
+                let edges: Vec<_> = if node.position.side_to_move() == tree.mating_goal.side {
+                    vec![&tree.node_children(index)[tree.best_goal_root_child(index)?]]
+                } else {
+                    tree.node_children(index).iter().collect()
+                };
+                if edges.is_empty() {
+                    return None;
+                }
+                for edge in edges {
+                    let child = edge.child_node()?;
+                    let next = collect(tree, child)?;
+                    if next.plies + 1 > node.goal_plies {
+                        return None;
+                    }
+                    children.push((edge.mv, tree.nodes[child].rule_entry?, next));
+                }
+            } else if !tree.terminal_goal_success(&node.position) {
+                return None;
+            }
+            Some(Arc::new(GoalPlanNode {
+                position: node.position.clone(),
+                plies: node.goal_plies,
+                children,
+            }))
+        }
+        Some(GoalPlan {
+            goal: self.mating_goal,
+            history: self.rule_history_scratch.clone(),
+            root: collect(self, self.root)?,
+        })
+    }
+    /// 普通必胜证明不等于指定杀法已经完成；保留该条件策略的耗时估计。
+    pub(super) fn goal_pending(&self, node: usize) -> bool {
+        self.mating_goal.enabled() && self.nodes[node].goal_outcome.is_none()
+    }
+
+    pub(super) fn evaluation_moves_left(&self, node: usize, estimate: f32) -> f32 {
+        if self.nodes[node].goal_outcome == Some(true) {
+            self.nodes[node].goal_plies as f32
+        } else if self.goal_pending(node) {
+            estimate
+        } else {
+            self.nodes[node]
+                .proven_moves_left
+                .map_or(estimate, |distance| distance as f32)
+        }
+    }
+
+    pub(super) fn child_goal_proven_distance(&self, child: &AzChild) -> Option<usize> {
+        let node = &self.nodes[child.child_node()?];
+        (node.goal_outcome == Some(true)).then_some(node.goal_plies as usize + 1)
+    }
+
+    pub(super) fn update_goal_proof(&mut self, node: usize) {
+        if !self.mating_goal.enabled() || self.node_children(node).is_empty() {
+            return;
+        }
+        if self.nodes[node].goal_outcome == Some(false) {
+            self.nodes[node].goal_min_plies = u32::MAX;
+            return;
+        }
+        let owner = self.nodes[node].position.side_to_move() == self.mating_goal.side;
+        let lower = self
+            .node_children(node)
+            .iter()
+            .map(|child| self.goal_child_lower_bound(node, child).saturating_add(1));
+        let lower = if owner { lower.min() } else { lower.max() }.unwrap_or(0);
+        self.nodes[node].goal_min_plies = self.nodes[node].goal_min_plies.max(lower);
+        let mut distances = self
+            .node_children(node)
+            .iter()
+            .map(|child| self.child_goal_proven_distance(child));
+        let distance = if owner {
+            distances.flatten().min()
+        } else {
+            distances.try_fold(0usize, |bound, distance| Some(bound.max(distance?)))
+        };
+        if let Some(distance) = distance {
+            let entry = &mut self.nodes[node];
+            entry.goal_outcome = Some(true);
+            entry.goal_plies = distance as u32;
+            entry.goal_value = 1.0;
+            entry.moves_left = distance as f32;
+        }
+    }
     pub(super) fn goal_at(&self, node: usize) -> AzMatingGoal {
         if self.nodes[node].goal_outcome == Some(false) {
             return AzMatingGoal::NONE;
         }
         self.mating_goal.effective(&self.nodes[node].position)
+    }
+
+    pub(super) fn goal_child_lower_bound(&self, parent: usize, child: &AzChild) -> u32 {
+        child.child_node().map_or_else(
+            || {
+                if self.nodes[parent].position.side_to_move() == self.mating_goal.side {
+                    2
+                } else {
+                    1
+                }
+            },
+            |index| self.nodes[index].goal_min_plies,
+        )
     }
 
     pub(super) fn goal_turn(&self, node: usize) -> bool {
@@ -17,12 +226,19 @@ impl AzTree<'_> {
         if self.nodes[node].solved.is_none() {
             return false;
         }
-        if !self.goal_turn(node) || self.nodes[node].goal_outcome.is_some() {
+        if !self.goal_turn(node) || self.nodes[node].goal_outcome == Some(false) {
+            return true;
+        }
+        if self.nodes[node].goal_outcome == Some(true)
+            && self.nodes[node].goal_min_plies >= self.nodes[node].goal_plies
+        {
             return true;
         }
         if self.node_children(node).iter().any(|child| {
             child.child_node().is_some_and(|index| {
-                self.nodes[index].goal_outcome == Some(true) && self.child_solved(child) == Some(1)
+                self.nodes[index].goal_outcome == Some(true)
+                    && self.nodes[index].goal_plies == 0
+                    && self.child_solved(child) == Some(1)
             })
         }) {
             return true;
@@ -52,7 +268,7 @@ impl AzTree<'_> {
         if let Some(value) = self.nodes[node].solved {
             eval.value = value as f32;
             eval.value_wdl = scalar_terminal_wdl(value as f32);
-            eval.moves_left = self.nodes[node].moves_left;
+            eval.moves_left = self.evaluation_moves_left(node, eval.moves_left);
         }
         if let Some(success) = self.nodes[node].goal_outcome {
             eval.goal_value = f32::from(u8::from(success));
@@ -82,6 +298,29 @@ impl AzTree<'_> {
         (1.0 - strength) * q + strength * (2.0 * probability - 1.0)
     }
 
+    /// 胜势明确后，比较单位预计耗时的目标收益；前期维持原目标效用。
+    /// MLH 是条件策略的对局长度估计，不是指定杀法的严格距离证明。
+    pub(super) fn goal_child_utility(&self, child: &AzChild, q: f32) -> f32 {
+        let probability = self.child_goal_value(child);
+        let plies = self.child_moves_left(child);
+        let params = self.model.moves_left_params;
+        let confidence = if params.threshold < 1.0 {
+            ((q - params.threshold) / (1.0 - params.threshold)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let timely = if self.model.moves_left_active
+            && params.enabled
+            && params.max_effect > 0.0
+            && plies.is_finite()
+        {
+            probability / (1.0 + confidence * params.slope * plies.max(0.0))
+        } else {
+            probability
+        };
+        self.goal_utility(q, timely)
+    }
+
     pub(super) fn goal_child_priority(&self, child: &AzChild, solved: Option<i8>) -> u8 {
         if solved == Some(1)
             && child
@@ -102,16 +341,17 @@ impl AzTree<'_> {
             .max_by(|(_, left), (_, right)| {
                 self.goal_child_priority(left, self.child_solved(left))
                     .cmp(&self.goal_child_priority(right, self.child_solved(right)))
+                    .then_with(|| {
+                        self.child_goal_proven_distance(right)
+                            .unwrap_or(usize::MAX)
+                            .cmp(&self.child_goal_proven_distance(left).unwrap_or(usize::MAX))
+                    })
                     .then_with(|| left.visits.cmp(&right.visits))
                     .then_with(|| {
-                        self.goal_utility(
-                            self.child_q(left, draw_score),
-                            self.child_goal_value(left),
-                        )
-                        .total_cmp(&self.goal_utility(
-                            self.child_q(right, draw_score),
-                            self.child_goal_value(right),
-                        ))
+                        self.goal_child_utility(left, self.child_q(left, draw_score))
+                            .total_cmp(
+                                &self.goal_child_utility(right, self.child_q(right, draw_score)),
+                            )
                     })
                     .then_with(|| {
                         self.child_q(left, draw_score)
@@ -140,14 +380,20 @@ impl AzTree<'_> {
         let success = owner_won && self.terminal_goal_success(&self.nodes[node].position);
         self.nodes[node].goal_value = f32::from(u8::from(success));
         self.nodes[node].goal_outcome = self.mating_goal.enabled().then_some(success);
+        self.nodes[node].goal_min_plies = if success { 0 } else { u32::MAX };
     }
 
     pub(super) fn prepare_goal(&mut self, node: usize) {
         let effective = self.goal_at(node);
         self.eval_scratch.mating_goal = effective;
+        if effective.enabled() {
+            let minimum = effective.minimum_finish_plies(&self.nodes[node].position);
+            self.nodes[node].goal_min_plies = self.nodes[node].goal_min_plies.max(minimum);
+        }
         if self.mating_goal.enabled() && !effective.enabled() {
             self.nodes[node].goal_value = 0.0;
             self.nodes[node].goal_outcome = Some(false);
+            self.nodes[node].goal_min_plies = u32::MAX;
         }
     }
 
@@ -164,6 +410,7 @@ impl AzTree<'_> {
             self.nodes[node].goal_outcome = Some(false);
             self.nodes[node].goal_value = 0.0;
             self.nodes[node].goal_value_sum = 0.0;
+            self.nodes[node].goal_min_plies = u32::MAX;
         }
     }
 }
@@ -191,7 +438,7 @@ mod tests {
         }
         let mut checksum = 0.0f64;
         for (label, instructions) in [
-            ("ordinary_eval", vec![AzMatingGoal::NONE; 14]),
+            ("ordinary_eval", vec![AzMatingGoal::NONE; goals.len()]),
             ("goal_eval", goals.to_vec()),
         ] {
             let started = Instant::now();
@@ -204,7 +451,8 @@ mod tests {
                 }
             }
             eprintln!(
-                "{label}: evaluations=1400 ms={:.3}",
+                "{label}: evaluations={} ms={:.3}",
+                100 * instructions.len(),
                 started.elapsed().as_secs_f64() * 1000.0
             );
         }
@@ -231,7 +479,8 @@ mod tests {
             }
         }
         eprintln!(
-            "goal_search: searches=56 simulations={simulations} ms={:.3} checksum={checksum:.9}",
+            "goal_search: searches={} simulations={simulations} ms={:.3} checksum={checksum:.9}",
+            4 * goals.len(),
             started.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -770,6 +1019,210 @@ mod tests {
             tree.moves_left_context(0).is_none(),
             "胜负不明确时仍关闭距离加分"
         );
+    }
+
+    #[test]
+    fn ordinary_win_proof_keeps_goal_rollout_time_until_the_goal_is_settled() {
+        let model = AzNnue::random(8, 1920);
+        let mut tree = two_move_tree(&Position::startpos(), &model, Color::Red);
+        tree.nodes[0].moves_left = 80.0;
+        tree.nodes[0].proven_moves_left = Some(3);
+        tree.set_proven(0, 1);
+        assert_eq!(tree.nodes[0].proven_moves_left, Some(3));
+        assert_eq!(tree.nodes[0].moves_left, 80.0);
+        let neural = AzEvalOutput {
+            moves_left: 90.0,
+            value_wdl: [0.7, 0.1, 0.2],
+            value: 0.5,
+            goal_value: 0.6,
+        };
+        let proven = tree.with_proven_wdl(0, neural);
+        assert_eq!(proven.value, 1.0);
+        assert_eq!(proven.moves_left, 90.0);
+        tree.max_depth = 1;
+        let backed = tree.simulate_child(0, 0, 1);
+        assert_eq!(
+            backed.moves_left, 101.0,
+            "普通三步杀不能截短目标路线的距离回传"
+        );
+        tree.nodes[0].goal_outcome = Some(false);
+        tree.set_proven(0, 1);
+        assert_eq!(tree.nodes[0].moves_left, 3.0);
+        assert_eq!(tree.with_proven_wdl(0, neural).moves_left, 3.0);
+    }
+
+    #[test]
+    fn proven_ordinary_wins_still_prefer_a_faster_goal_route() {
+        let mut model = AzNnue::random(8, 1921);
+        model.moves_left_active = true;
+        let mut tree = two_move_tree(&Position::startpos(), &model, Color::Red);
+        tree.mating_goal.strength = 0.4;
+        for i in 0..2 {
+            tree.simulate_child(0, i, 1);
+            let index = tree.node_children(0)[i].child_node().unwrap();
+            tree.set_proven(index, -1);
+            tree.nodes[index].proven_moves_left = Some(3);
+        }
+        tree.nodes[0].visits = 200;
+        tree.nodes[0].value_wdl_sum = [200.0, 0.0, 0.0];
+        tree.nodes[0].moves_left_sum = 200.0 * 80.0;
+        for (i, child) in tree.node_children_mut(0).iter_mut().enumerate() {
+            child.visits = 100;
+            child.prior = 0.5;
+            child.value_wdl_sum = [100.0, 0.0, 0.0];
+            child.goal_value_sum = 80.0;
+            child.moves_left_sum = 100.0 * if i == 0 { 150.0 } else { 10.0 };
+        }
+        assert_eq!(tree.child_moves_left(&tree.node_children(0)[0]), 150.0);
+        assert_eq!(tree.select_child(0), 1);
+        tree.node_children_mut(0)[0].goal_value_sum = 95.0;
+        tree.node_children_mut(0)[1].goal_value_sum = 10.0;
+        assert_eq!(tree.select_child(0), 0, "明显更可能完成目标的路线仍可优先");
+    }
+
+    #[test]
+    fn cached_goal_plan_covers_all_defenses_and_rejects_different_instructions_or_history() {
+        let position = Position::from_fen("3aka3/R8/6N2/p3C3p/9/6PC1/9/9/9/4K4 w").unwrap();
+        let history = position.initial_rule_history();
+        let model = AzNnue::random(8, 1923);
+        let requested = goal(MatingTarget::DoubleCannon, Color::Red, 1.0);
+        let roots = ["a8e8", "h4h3"]
+            .map(|text| position.parse_uci_move(text).unwrap())
+            .to_vec();
+        let mut tree = AzTree::new(
+            position.clone(),
+            history.clone(),
+            Some(roots),
+            &model,
+            AzSearchLimits {
+                simulations: 4096,
+                max_depth: 5,
+                mating_goal: requested,
+                ..Default::default()
+            },
+        );
+        tree.expand(0);
+        for _ in 0..4096 {
+            tree.simulate(0, 0);
+        }
+        let plan = tree.goal_plan().expect("真实三步重炮必须形成完整应对证明");
+        assert_eq!(plan.root.plies, 3);
+        let mut result = tree.search_result(4096);
+        assert!(
+            plan.apply(&position, &history, requested, &mut result)
+                .is_some()
+        );
+        assert_eq!(result.best_move.unwrap().to_uci(), "h4h3");
+        assert_eq!(result.proven_moves_left, Some(3));
+        assert!(
+            plan.at(
+                &position,
+                &history,
+                goal(MatingTarget::IronBolt, Color::Red, 1.0)
+            )
+            .is_none()
+        );
+        let mut after = position.clone();
+        let mut moves = history.clone();
+        let setup = result.best_move.unwrap();
+        let mover = after.side_to_move();
+        let captured = after.piece_at(setup.to as usize);
+        after.make_move(setup);
+        moves.push(after.rule_history_entry_after_moved(mover, setup, captured));
+        assert!(
+            plan.at(&after, &moves, requested).is_none(),
+            "不能替对手选择配合目标的走法"
+        );
+        let replies = after.legal_moves_with_rules(&moves);
+        assert_eq!(replies.len(), 2);
+        for reply in replies {
+            let mut next = after.clone();
+            let mut next_history = moves.clone();
+            let mover = next.side_to_move();
+            let captured = next.piece_at(reply.to as usize);
+            next.make_move(reply);
+            next_history.push(next.rule_history_entry_after_moved(mover, reply, captured));
+            assert_eq!(plan.at(&next, &next_history, requested).unwrap().plies, 1);
+            assert!(
+                plan.at(&next, &next.initial_rule_history(), requested)
+                    .is_none()
+            );
+            let mut fresh = alphazero_search_with_rules(
+                &next,
+                Some(next_history.clone()),
+                None,
+                &model,
+                AzSearchLimits {
+                    simulations: 1,
+                    mating_goal: requested,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                plan.apply(&next, &next_history, requested, &mut fresh)
+                    .is_some()
+            );
+            let last = fresh.best_move.unwrap();
+            next.make_move(last);
+            assert!(requested.matches_mate(&next.classify_mate().unwrap()));
+        }
+        let ordinary = position.parse_uci_move("a8e8").unwrap();
+        let mut constrained = alphazero_search_with_rules(
+            &position,
+            Some(history.clone()),
+            Some(vec![ordinary]),
+            &model,
+            AzSearchLimits {
+                simulations: 1,
+                mating_goal: requested,
+                ..Default::default()
+            },
+        );
+        assert!(
+            plan.apply(&position, &history, requested, &mut constrained)
+                .is_none(),
+            "尊重 GUI searchmoves 限制"
+        );
+        assert_eq!(constrained.best_move, Some(ordinary));
+    }
+
+    #[test]
+    fn goal_urgency_is_off_before_a_clear_advantage_and_when_mlh_is_disabled() {
+        let mut model = AzNnue::random(8, 1922);
+        model.moves_left_active = true;
+        let mut tree = two_move_tree(&Position::startpos(), &model, Color::Red);
+        for (i, child) in tree.node_children_mut(0).iter_mut().enumerate() {
+            child.visits = 100;
+            child.goal_value_sum = 80.0;
+            child.moves_left_sum = 100.0 * if i == 0 { 150.0 } else { 10.0 };
+        }
+        let children = tree.node_children(0);
+        for q in [-1.0, 0.0, 0.6, model.moves_left_params.threshold] {
+            for child in children {
+                assert_eq!(tree.goal_child_utility(child, q), tree.goal_utility(q, 0.8));
+            }
+        }
+        assert!(
+            tree.goal_child_utility(&children[1], 1.0) > tree.goal_child_utility(&children[0], 1.0)
+        );
+        drop(tree);
+        for disabled in [0, 1, 2] {
+            let mut no_mlh = model.clone();
+            match disabled {
+                0 => no_mlh.moves_left_active = false,
+                1 => no_mlh.moves_left_params.enabled = false,
+                _ => no_mlh.moves_left_params.max_effect = 0.0,
+            }
+            let mut tree = two_move_tree(&Position::startpos(), &no_mlh, Color::Red);
+            let child = &mut tree.node_children_mut(0)[0];
+            child.visits = 100;
+            child.goal_value_sum = 80.0;
+            child.moves_left_sum = 15000.0;
+            assert_eq!(
+                tree.goal_child_utility(&tree.node_children(0)[0], 1.0),
+                tree.goal_utility(1.0, 0.8)
+            );
+        }
     }
 
     #[test]

@@ -1740,8 +1740,6 @@ mod tests {
                     MatingTarget::DoubleCannon
                         | MatingTarget::IronBolt
                         | MatingTarget::HorseCannon
-                        | MatingTarget::SmotheredCannon
-                        | MatingTarget::HeavenEarthCannon
                         | MatingTarget::DoubleHorse
                         | MatingTarget::CrossRooks
                         | MatingTarget::TwoGhosts

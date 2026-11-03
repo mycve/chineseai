@@ -2,7 +2,7 @@
 //! 只使用棋盘合法着法，不把长将判负、搜索证明或步数截断当成将死。
 
 use super::{
-    Color, Move, PieceKind, Position, file_of, index, inside_palace, line_between_squares, rank_of,
+    Color, Move, PieceKind, Position, file_of, inside_palace, line_between_squares, rank_of,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,14 +11,12 @@ pub enum MateKind {
     Stalemate,
 }
 
-/// 仅保留已确认的 14 种具名杀法；同一终局可以命中多种。
+/// 仅保留已确认的 12 种具名杀法；同一终局可以命中多种。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum MatingPattern {
     DoubleCannon,
     IronBolt,
     HorseCannon,
-    HeavenEarthCannon,
-    SmotheredCannon,
     WhiteFacedGeneral,
     ElbowHorse,
     PalaceCornerHorse,
@@ -31,12 +29,10 @@ pub enum MatingPattern {
 }
 
 impl MatingPattern {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 12] = [
         Self::DoubleCannon,
         Self::IronBolt,
         Self::HorseCannon,
-        Self::HeavenEarthCannon,
-        Self::SmotheredCannon,
         Self::WhiteFacedGeneral,
         Self::ElbowHorse,
         Self::PalaceCornerHorse,
@@ -53,8 +49,6 @@ impl MatingPattern {
             Self::DoubleCannon => "重炮",
             Self::HorseCannon => "马后炮",
             Self::IronBolt => "铁门栓",
-            Self::SmotheredCannon => "闷宫",
-            Self::HeavenEarthCannon => "天地炮",
             Self::TwoGhosts => "二鬼拍门",
             Self::WhiteFacedGeneral => "白脸将",
             Self::ElbowHorse => "卧槽马",
@@ -147,17 +141,6 @@ impl MateContext<'_> {
         } else {
             9 - rank_of(square)
         }
-    }
-
-    fn square(&self, file: usize, rank: usize) -> usize {
-        index(
-            file,
-            if self.winner == Color::Red {
-                rank
-            } else {
-                9 - rank
-            },
-        )
     }
 
     fn kind(&self, square: usize) -> PieceKind {
@@ -257,29 +240,6 @@ impl MateContext<'_> {
                 }) && self
                     .pieces(PieceKind::Cannon)
                     .any(|sq| self.central_pin(sq))
-            }
-            SmotheredCannon => {
-                self.rank(self.king) == 0
-                    && file_of(self.king) == 4
-                    && self.has(
-                        self.square(4, 1),
-                        PieceKind::Advisor,
-                        self.winner.opposite(),
-                    )
-                    && self.checking(PieceKind::Cannon).any(|sq| {
-                        self.rank(sq) == 0
-                            && self.screen(sq).is_some_and(|s| {
-                                matches!(file_of(s), 3 | 5)
-                                    && self.has(s, PieceKind::Advisor, self.winner.opposite())
-                            })
-                    })
-            }
-            HeavenEarthCannon => {
-                self.checking(PieceKind::Cannon)
-                    .any(|sq| self.rank(sq) == 0)
-                    && self
-                        .pieces(PieceKind::Cannon)
-                        .any(|sq| self.central_pin(sq))
             }
             TwoGhosts => {
                 let door_piece = |sq| {

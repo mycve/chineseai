@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 mod eval_cache;
 mod goal;
+pub(crate) use goal::GoalPlan;
 
 #[path = "uci_search.rs"]
 mod uci_search;
@@ -358,7 +359,7 @@ pub fn alphazero_search(
     alphazero_search_with_rules(position, None, None, model, limits)
 }
 
-pub(super) struct AzSearchWorkspace<'a> {
+pub struct AzSearchWorkspace<'a> {
     model: &'a AzNnue,
     previous_limits: Option<AzSearchLimits>,
     pub(super) last_nn_evaluations: usize,
@@ -370,10 +371,11 @@ pub(super) struct AzSearchWorkspace<'a> {
     root_raw_priors: Vec<f32>,
     eval_scratch: Option<AzEvalScratch>,
     rule_history_scratch: Vec<RuleHistoryEntry>,
+    goal_plan: Option<GoalPlan>,
 }
 
 impl<'a> AzSearchWorkspace<'a> {
-    pub(super) fn new(model: &'a AzNnue) -> Self {
+    pub fn new(model: &'a AzNnue) -> Self {
         Self {
             model,
             previous_limits: None,
@@ -386,7 +388,18 @@ impl<'a> AzSearchWorkspace<'a> {
             root_raw_priors: Vec::new(),
             eval_scratch: Some(AzEvalScratch::new(model.arch)),
             rule_history_scratch: Vec::new(),
+            goal_plan: None,
         }
+    }
+
+    pub fn search(
+        &mut self,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+        root_moves: Vec<Move>,
+        limits: AzSearchLimits,
+    ) -> AzSearchResult {
+        alphazero_search_with_rules_reusing(position, history, root_moves, limits, self)
     }
 }
 
@@ -428,7 +441,17 @@ pub(super) fn alphazero_search_with_rules_reusing(
         }
         used
     };
-    let result = tree.search_result(used);
+    let mut result = tree.search_result(used);
+    GoalPlan::retain_shorter(
+        &mut workspace.goal_plan,
+        tree.goal_plan(),
+        position,
+        rule_history,
+        limits.mating_goal,
+    );
+    if let Some(plan) = &workspace.goal_plan {
+        plan.apply(position, rule_history, limits.mating_goal, &mut result);
+    }
     workspace.last_nn_evaluations = tree.nn_evaluations;
     workspace.last_cache_hits = tree.cache_hits;
     tree.recycle_into(workspace);
@@ -534,8 +557,10 @@ struct AzNode {
     moves_left_sum: f32,
     goal_value_sum: f32,
     goal_value: f32,
-    /// 仅记录真实终局或必要条件失败；目标概率不做 AND/OR 证明传播。
+    /// 真实终局或严格目标证明；网络概率不能充当证明。
     goal_outcome: Option<bool>,
+    goal_plies: u32,
+    goal_min_plies: u32,
     value: f32,
     value_wdl: [f32; 3],
     moves_left: f32,
@@ -656,6 +681,9 @@ impl<'a> AzTree<'a> {
             proven_moves_left: if self.goal_turn(self.root) {
                 self.best_root_child(self.root).and_then(|index| {
                     let child = &root_children[index];
+                    if let Some(distance) = self.child_goal_proven_distance(child) {
+                        return Some(distance);
+                    }
                     (self.child_solved(child) == root_node.solved)
                         .then(|| {
                             child
@@ -822,6 +850,8 @@ impl<'a> AzTree<'a> {
             goal_value_sum: 0.0,
             goal_value: 0.0,
             goal_outcome: None,
+            goal_plies: 0,
+            goal_min_plies: 0,
             value: 0.0,
             value_wdl: [0.0, 1.0, 0.0],
             moves_left: 0.0,
@@ -1167,9 +1197,7 @@ impl<'a> AzTree<'a> {
         }
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
-        self.nodes[node_index].moves_left = self.nodes[node_index]
-            .proven_moves_left
-            .map_or(eval.moves_left, |distance| distance as f32);
+        self.nodes[node_index].moves_left = self.evaluation_moves_left(node_index, eval.moves_left);
         self.nodes[node_index].goal_value = eval.goal_value;
         self.nodes[node_index].expanded = true;
         if let Some(index) = self.immediate_mate_child(node_index) {
@@ -1228,7 +1256,8 @@ impl<'a> AzTree<'a> {
         crate::scope_profile!("az.search.simulate");
         if self.nodes[node_index].solved.is_some()
             && (!self.goal_at(node_index).enabled()
-                || self.nodes[node_index].goal_outcome.is_some())
+                || (self.nodes[node_index].goal_outcome == Some(true)
+                    && self.nodes[node_index].goal_min_plies >= self.nodes[node_index].goal_plies))
         {
             let eval = self.node_eval(node_index);
             self.add_node_visit(node_index, eval);
@@ -1351,6 +1380,8 @@ impl<'a> AzTree<'a> {
                     goal_value_sum: 0.0,
                     goal_value: 0.0,
                     goal_outcome: None,
+                    goal_plies: 0,
+                    goal_min_plies: 0,
                     value: 0.0,
                     value_wdl: [0.0, 1.0, 0.0],
                     moves_left: 0.0,
@@ -1384,6 +1415,8 @@ impl<'a> AzTree<'a> {
             let mut solved = self.node_eval(node_index);
             if self.mating_goal.enabled() && self.nodes[node_index].goal_outcome.is_none() {
                 solved.goal_value = eval.goal_value;
+                // 普通胜负证明不代表当前目标策略会沿同一条短杀路线走。
+                solved.moves_left = eval.moves_left;
             }
             solved
         } else {
@@ -1465,9 +1498,7 @@ impl<'a> AzTree<'a> {
         eval.value *= self.value_scale;
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
-        self.nodes[node_index].moves_left = self.nodes[node_index]
-            .proven_moves_left
-            .map_or(eval.moves_left, |distance| distance as f32);
+        self.nodes[node_index].moves_left = self.evaluation_moves_left(node_index, eval.moves_left);
         self.nodes[node_index].goal_value = eval.goal_value;
         self.with_proven_wdl(node_index, eval)
     }
@@ -1542,7 +1573,7 @@ impl<'a> AzTree<'a> {
         let cpuct = self.compute_cpuct(node.visits, is_root);
         let goal_active = self.goal_turn(node_index);
         // 目标偏好不取消高胜负把握时的收尾约束，减少估计值相近时的绕路。
-        // 沿用既有门槛和有界 MLH 加分，目标证明优先级及目标效用保持不变。
+        // 沿用既有胜势门槛和有界 MLH 收尾加分。
         let moves_left = self.moves_left_context(node_index);
         // 一趟同时取"证明优先级 → PUCT 分数 → 先验"的字典序最大值。
         // 原实现先扫一遍找已证明胜的子节点、再扫一遍求最高优先级、最后在最高
@@ -1550,7 +1581,23 @@ impl<'a> AzTree<'a> {
         // `self.nodes`）。`proof_priority` 把 `Some(1)` 映到最高的 2，所以
         // "第一个已证明胜的子节点"就是"第一个 priority == 2"，顺序语义不变。
         let mut best: Option<(usize, u8, f32, f32)> = None;
+        let improve = self.nodes[node_index].goal_outcome == Some(true)
+            && self.nodes[node_index].goal_min_plies < self.nodes[node_index].goal_plies;
+        let can_improve = |child: &AzChild| {
+            if goal_active {
+                self.goal_child_lower_bound(node_index, child)
+                    .saturating_add(1)
+                    < self.nodes[node_index].goal_plies
+            } else {
+                self.child_goal_proven_distance(child)
+                    == Some(self.nodes[node_index].goal_plies as usize)
+            }
+        };
+        let improve = improve && children.iter().any(&can_improve);
         for (index, child) in children.iter().enumerate() {
+            if improve && !can_improve(child) {
+                continue;
+            }
             let solved = self.child_solved(child);
             let proof = proof_priority(solved);
             if proof == 2 && !goal_active {
@@ -1559,7 +1606,16 @@ impl<'a> AzTree<'a> {
             // 搜索阶段允许未证明路线与已证明胜路线共同探索；已证明败始终排在后面。
             // 指定目标时，最终选着与该目标效用下的访问分布一致。
             let priority = if goal_active {
-                self.goal_child_priority(child, solved)
+                let priority = self.goal_child_priority(child, solved);
+                if priority == 2
+                    && self
+                        .child_goal_proven_distance(child)
+                        .is_some_and(|distance| distance > 1)
+                {
+                    1
+                } else {
+                    priority
+                }
             } else {
                 proof
             };
@@ -1577,7 +1633,15 @@ impl<'a> AzTree<'a> {
                 } else {
                     fpu_value
                 };
-                self.goal_utility(q, self.child_goal_value(child)) - q
+                let finish_bonus = if solved.is_some() && child.visits > 0 {
+                    // 已证明普通必胜的分支仍需比较目标策略的实际预计耗时。
+                    moves_left
+                        .as_ref()
+                        .map_or(0.0, |context| self.moves_left_bonus(context, child, q))
+                } else {
+                    0.0
+                };
+                self.goal_child_utility(child, q) - q + finish_bonus
             } else {
                 0.0
             };
@@ -1701,9 +1765,20 @@ impl<'a> AzTree<'a> {
             }
         };
         let priority = children.iter().map(&child_priority).max().unwrap_or(0);
+        let shortest_goal = goal_turn
+            .then(|| {
+                children
+                    .iter()
+                    .filter(|child| child_priority(child) == 2)
+                    .filter_map(|child| self.child_goal_proven_distance(child))
+                    .min()
+            })
+            .flatten();
         let eligible = |child: &AzChild| {
             child_priority(child) == priority
                 && (goal_turn || self.follows_proven_distance(node_index, child))
+                && shortest_goal
+                    .is_none_or(|distance| self.child_goal_proven_distance(child) == Some(distance))
         };
         let total_visits = children
             .iter()
@@ -1806,8 +1881,11 @@ impl<'a> AzTree<'a> {
     }
 
     fn child_moves_left(&self, child: &AzChild) -> f32 {
+        if let Some(distance) = self.child_goal_proven_distance(child) {
+            return distance as f32;
+        }
         if let Some(index) = child.child_node() {
-            if self.nodes[index].solved.is_some() {
+            if self.nodes[index].solved.is_some() && !self.goal_pending(index) {
                 return self.nodes[index].moves_left + 1.0;
             }
         }
@@ -1883,12 +1961,15 @@ impl<'a> AzTree<'a> {
             return;
         };
         self.set_proven(child_node, -1);
-        self.nodes[child_node].moves_left = solution.plies.saturating_sub(1) as f32;
+        if !self.goal_pending(child_node) {
+            self.nodes[child_node].moves_left = solution.plies.saturating_sub(1) as f32;
+        }
         self.nodes[child_node].proven_moves_left = Some(solution.plies.saturating_sub(1));
         self.update_solved(self.root);
     }
 
     fn update_solved(&mut self, node_index: usize) {
+        self.update_goal_proof(node_index);
         // 只复用已确认的失败结论，不增加任何目标证明搜索。
         // 全部可选路线都已不能完成目标时，恢复普通争胜，包括强度 1。
         if self.mating_goal.enabled()
@@ -1903,6 +1984,7 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].goal_outcome = Some(false);
             self.nodes[node_index].goal_value = 0.0;
             self.nodes[node_index].goal_value_sum = 0.0;
+            self.nodes[node_index].goal_min_plies = u32::MAX;
         }
         if let Some(value) = self.nodes[node_index].solved {
             self.set_proven(node_index, value);
@@ -1956,11 +2038,10 @@ impl<'a> AzTree<'a> {
             distances.into_iter().flatten().min()
         }
         .or(self.nodes[node_index].proven_moves_left);
+        self.nodes[node_index].proven_moves_left = distance;
+        let moves_left = self.evaluation_moves_left(node_index, self.nodes[node_index].moves_left);
         let node = &mut self.nodes[node_index];
-        node.proven_moves_left = distance;
-        if let Some(distance) = distance {
-            node.moves_left = distance as f32;
-        }
+        node.moves_left = moves_left;
         // 已有胜负证明后，独立连杀证明仍可能补充更短的获胜路线。
         if previous.is_some() {
             return;

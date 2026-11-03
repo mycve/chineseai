@@ -1,0 +1,17 @@
+# 构造对照：兵保护侵入底线的车，并控制将的逃格；用于诊断，不作训练胜负标签。
+[[cases]]
+name = "pawn_rook_joint_threat"
+fen = "1R1aka3/3P1P3/9/9/9/r8/9/9/4A4/5K3 b - - 0 1"
+
+[[cases]]
+name = "remove_critical_d8_pawn"
+fen = "1R1aka3/5P3/9/9/9/r8/9/9/4A4/5K3 b - - 0 1"
+
+[[cases]]
+name = "remove_other_f8_pawn"
+fen = "1R1aka3/3P5/9/9/9/r8/9/9/4A4/5K3 b - - 0 1"
+
+[[cases]]
+name = "critical_pawn_before_river"
+# 过河前只能留在原始兵路，取合法的 c4；d4 不可由未过河兵到达。
+fen = "1R1aka3/5P3/9/9/9/r1P6/9/9/4A4/5K3 b - - 0 1"

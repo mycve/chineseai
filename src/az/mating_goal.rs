@@ -13,6 +13,48 @@ pub(crate) fn goal_imitation_discount(plies: f32) -> f32 {
     0.997_f32.powf(plies)
 }
 
+fn horse_finish_distances() -> &'static [[u8; 90]; MATING_TARGET_COUNT * 2] {
+    static TABLE: std::sync::OnceLock<[[u8; 90]; MATING_TARGET_COUNT * 2]> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [[0; 90]; MATING_TARGET_COUNT * 2];
+        for color in [Color::Red, Color::Black] {
+            for target in MatingTarget::ALL {
+                let squares: &[(usize, usize)] = match target {
+                    MatingTarget::ElbowHorse => &[(2, 1), (6, 1)],
+                    MatingTarget::PalaceCornerHorse => &[(3, 2), (5, 2)],
+                    MatingTarget::AnglerHorse => &[(2, 2), (6, 2)],
+                    MatingTarget::HighAnglerHorse => &[(2, 3), (6, 3)],
+                    MatingTarget::OctagonalHorse => &[(3, 0), (5, 0), (3, 2), (5, 2)],
+                    _ => continue,
+                };
+                let row = usize::from(color == Color::Black) * MATING_TARGET_COUNT
+                    + target.index().unwrap();
+                table[row].fill(u8::MAX);
+                let mut queue = std::collections::VecDeque::new();
+                for &(file, rank) in squares {
+                    let sq = (if color == Color::Red { rank } else { 9 - rank }) * 9 + file;
+                    table[row][sq] = 0;
+                    queue.push_back(sq);
+                }
+                while let Some(sq) = queue.pop_front() {
+                    for (_, (dx, dy)) in crate::xiangqi::HORSE_STEPS {
+                        let (x, y) = ((sq % 9) as i32 + dx, (sq / 9) as i32 + dy);
+                        if (0..9).contains(&x) && (0..10).contains(&y) {
+                            let next = (y * 9 + x) as usize;
+                            if table[row][next] == u8::MAX {
+                                table[row][next] = table[row][sq] + 1;
+                                queue.push_back(next);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        table
+    })
+}
+
 macro_rules! mating_targets {
     ($($variant:ident => $key:literal),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -21,7 +63,7 @@ macro_rules! mating_targets {
         pub enum MatingTarget { #[default] None, $($variant),+ }
 
         impl MatingTarget {
-            pub const ALL: [Self; 14] = [$(Self::$variant),+];
+            pub const ALL: [Self; 12] = [$(Self::$variant),+];
             pub fn index(self) -> Option<usize> {
                 (self != Self::None).then_some(self as usize).map(|code| code - 1)
             }
@@ -41,11 +83,10 @@ macro_rules! mating_targets {
     };
 }
 
-// 前两项及回放编号保留，后续目标只在末尾追加。
+// 当前 v48 回放的目标顺序；删除两类后已升级格式，禁止旧编号混用。
 mating_targets! {
     DoubleCannon => "double_cannon", IronBolt => "iron_bolt",
-    HorseCannon => "horse_cannon", HeavenEarthCannon => "heaven_earth_cannon",
-    SmotheredCannon => "smothered_cannon",
+    HorseCannon => "horse_cannon",
     WhiteFacedGeneral => "white_faced_general", ElbowHorse => "elbow_horse",
     PalaceCornerHorse => "palace_corner_horse", AnglerHorse => "angler_horse",
     OctagonalHorse => "octagonal_horse", HighAnglerHorse => "high_angler_horse",
@@ -124,6 +165,37 @@ impl AzMatingGoal {
         self.target != MatingTarget::None && self.strength > 0.0 && self.validate().is_ok()
     }
 
+    /// 非终局的乐观完成步数下界；忽略蹩腿和占位，只用于排除不可能更短的证明。
+    pub(crate) fn minimum_finish_plies(self, position: &Position) -> u32 {
+        let distance = if matches!(
+            self.target,
+            MatingTarget::ElbowHorse
+                | MatingTarget::PalaceCornerHorse
+                | MatingTarget::AnglerHorse
+                | MatingTarget::OctagonalHorse
+                | MatingTarget::HighAnglerHorse
+        ) {
+            let row = usize::from(self.side == Color::Black) * MATING_TARGET_COUNT
+                + self.target.index().unwrap();
+            position
+                .occupied_squares()
+                .filter(|&sq| {
+                    position
+                        .piece_at(sq)
+                        .is_some_and(|p| p.color == self.side && p.kind == PieceKind::Horse)
+                })
+                .map(|sq| horse_finish_distances()[row][sq])
+                .min()
+                .unwrap_or(u8::MAX)
+        } else {
+            0
+        };
+        if distance == u8::MAX {
+            return u32::MAX;
+        }
+        2 * u32::from(distance.max(1)) - u32::from(position.side_to_move() == self.side)
+    }
+
     /// 只用必要条件认定不可达，不能把搜索暂时没找到杀法视为不可能。
     pub fn effective(self, position: &Position) -> Self {
         if !self.enabled()
@@ -135,7 +207,6 @@ impl AzMatingGoal {
         let mut cannons = 0;
         let mut finishers = 0;
         let mut defenders = 0;
-        let mut defending_advisors = 0;
         let mut horses = 0;
         let mut rooks = 0;
         let mut attackers = 0;
@@ -150,7 +221,6 @@ impl AzMatingGoal {
                     usize::from(matches!(piece.kind, PieceKind::Rook | PieceKind::Soldier));
             } else {
                 defenders += usize::from(piece.kind != PieceKind::General);
-                defending_advisors += usize::from(piece.kind == PieceKind::Advisor);
             }
         }
         let possible = match self.target {
@@ -158,8 +228,6 @@ impl AzMatingGoal {
             MatingTarget::DoubleCannon => cannons >= 2,
             MatingTarget::IronBolt => cannons >= 1 && finishers >= 1 && defenders >= 1,
             MatingTarget::HorseCannon => cannons >= 1 && horses >= 1,
-            MatingTarget::HeavenEarthCannon => cannons >= 2 && defenders >= 1,
-            MatingTarget::SmotheredCannon => cannons >= 1 && defending_advisors >= 2,
             MatingTarget::TwoGhosts => finishers >= 2,
             MatingTarget::DoubleHorse => horses >= 2,
             MatingTarget::CrossRooks => rooks >= 2,
@@ -285,10 +353,22 @@ impl AzMatingGoal {
                         } else {
                             9 - rank
                         };
-                        let score = files
-                            .into_iter()
-                            .map(|f| closeness(sq, f, rank))
-                            .fold(0.0, f32::max);
+                        let score = if matches!(
+                            self.target,
+                            MatingTarget::ElbowHorse
+                                | MatingTarget::PalaceCornerHorse
+                                | MatingTarget::AnglerHorse
+                                | MatingTarget::HighAnglerHorse
+                        ) {
+                            let row = usize::from(self.side == Color::Black) * MATING_TARGET_COUNT
+                                + self.target.index().unwrap();
+                            1.0 / (1.0 + f32::from(horse_finish_distances()[row][sq]))
+                        } else {
+                            files
+                                .into_iter()
+                                .map(|f| closeness(sq, f, rank))
+                                .fold(0.0, f32::max)
+                        };
                         horse = horse.max(score);
                         horse_sum += score;
                     }
@@ -352,23 +432,6 @@ impl AzMatingGoal {
                     .fold(0.0, f32::max);
                 0.5 * horse + 0.3 * cannon
             }
-            MatingTarget::HeavenEarthCannon => {
-                let central = cannons
-                    .iter()
-                    .map(|&sq| closeness(sq, 4, king / 9))
-                    .fold(0.0, f32::max);
-                let bottom = cannons
-                    .iter()
-                    .map(|&sq| closeness(sq, king_file, home))
-                    .fold(0.0, f32::max);
-                0.4 * central + 0.4 * bottom
-            }
-            MatingTarget::SmotheredCannon => {
-                0.8 * cannons[..cannon_count]
-                    .iter()
-                    .map(|&sq| closeness(sq, king_file, home))
-                    .fold(0.0, f32::max)
-            }
             MatingTarget::ElbowHorse
             | MatingTarget::PalaceCornerHorse
             | MatingTarget::AnglerHorse
@@ -388,6 +451,28 @@ impl AzMatingGoal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horse_prior_uses_real_knight_steps_instead_of_manhattan_distance() {
+        let position = Position::from_fen("4k4/5R3/3a5/9/7N1/9/9/3K5/9/3A1A3 w").unwrap();
+        let goal = AzMatingGoal {
+            target: MatingTarget::HighAnglerHorse,
+            side: Color::Red,
+            strength: 0.4,
+        };
+        let closer = position.parse_uci_move("h5f4").unwrap();
+        let misleading = position.parse_uci_move("h5f6").unwrap();
+        assert!(position.legal_moves().contains(&closer));
+        assert!(position.legal_moves().contains(&misleading));
+        assert_eq!(goal.minimum_finish_plies(&position), 3);
+        for (mv, expected) in [(closer, 2), (misleading, 6)] {
+            let mut next = position.clone();
+            next.make_move(mv);
+            assert_eq!(goal.minimum_finish_plies(&next), expected);
+        }
+        assert!(goal.policy_bias(&position, closer) > 0.0);
+        assert!(goal.policy_bias(&position, misleading) < 0.0);
+    }
 
     #[test]
     fn every_target_has_unique_role_encoding_and_symmetric_finite_opening_prior() {
@@ -433,6 +518,10 @@ mod tests {
             "smothered_mate",
             "double_rook",
             "three_pieces_to_side",
+            "heaven_earth_cannon",
+            "smothered_cannon",
+            "天地炮",
+            "闷宫",
         ] {
             assert!(removed.parse::<MatingTarget>().is_err());
         }

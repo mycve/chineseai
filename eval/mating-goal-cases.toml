@@ -21,20 +21,6 @@ target = "horse_cannon"
 side = "red"
 
 [[cases]]
-name = "天地炮一步杀"
-stage = "mate_in_one"
-fen = "2b1k4/1P2a4/4b4/9/4C4/9/C8/9/9/4K4 w"
-target = "heaven_earth_cannon"
-side = "red"
-
-[[cases]]
-name = "闷宫一步杀"
-stage = "mate_in_one"
-fen = "4ka3/4a4/9/9/9/6C2/9/9/9/5K3 w"
-target = "smothered_cannon"
-side = "red"
-
-[[cases]]
 name = "白脸将一步杀"
 stage = "mate_in_one"
 fen = "3k2b2/9/1N1P5/9/9/9/9/9/9/4K4 w"

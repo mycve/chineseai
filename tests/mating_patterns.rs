@@ -171,12 +171,6 @@ scene!(
     ["h2h8", "e8e9", "a1a9"],
     [CrossRooks]
 );
-scene!(
-    smothered_cannon,
-    "4ka3/4a4/9/9/9/6C2/9/9/9/5K3 w",
-    ["g4g9"],
-    [SmotheredCannon]
-);
 // 此例来自“海底捞月”教学，但单个终局不能证明完整残局过程，只要求实际的车杀标签。
 scene!(
     cannon_protects_checking_rook,
@@ -189,12 +183,6 @@ scene!(
     "2b1kab2/3P1P3/9/9/9/9/9/9/9/5K3 w",
     ["f8f9"],
     [TwoGhosts]
-);
-scene!(
-    heaven_earth_cannon,
-    "2b1k4/1P2a4/4b4/9/4C4/9/C8/9/9/4K4 w",
-    ["a3a9"],
-    [HeavenEarthCannon]
 );
 scene!(
     white_faced_general,
@@ -423,7 +411,6 @@ fn central_cannon_without_a_real_pin_is_not_iron_bolt() {
     let report = position.classify_mate().unwrap();
     assert!(report.patterns.contains(&MatingPattern::CrossRooks));
     assert!(!report.patterns.contains(&MatingPattern::IronBolt));
-    assert!(!report.patterns.contains(&MatingPattern::HeavenEarthCannon));
 }
 
 #[test]
@@ -485,16 +472,6 @@ fn every_named_goal_has_a_causal_piece_and_correct_owner_in_all_orientations() {
             MatingTarget::HorseCannon,
             "4k4/9/4N4/9/9/9/4C4/9/9/4K4 b",
             "e7",
-        ),
-        (
-            MatingTarget::HeavenEarthCannon,
-            "C1b1k4/1P2a4/4b4/9/4C4/9/9/9/9/4K4 b",
-            "e5",
-        ),
-        (
-            MatingTarget::SmotheredCannon,
-            "4kaC2/4a4/9/9/9/9/9/9/9/5K3 b",
-            "f9",
         ),
         (
             MatingTarget::WhiteFacedGeneral,
@@ -693,9 +670,9 @@ fn capturing_the_checking_cannon_is_a_defense_even_if_the_king_has_no_escape() {
 }
 
 #[test]
-fn an_unrelated_second_cannon_does_not_turn_smothered_mate_into_double_cannon() {
+fn an_unrelated_second_cannon_does_not_create_double_cannon() {
     let fen = "4kaC2/4a4/9/9/9/7C1/9/9/9/5K3 b";
-    assert_scene(fen, &[], &[MatingPattern::SmotheredCannon]);
+    assert_scene(fen, &[], &[]);
     let position = Position::from_fen(fen).unwrap();
     for position in [
         position.clone(),
@@ -704,7 +681,6 @@ fn an_unrelated_second_cannon_does_not_turn_smothered_mate_into_double_cannon() 
     ] {
         let report = position.classify_mate().unwrap();
         assert!(!report.patterns.contains(&MatingPattern::DoubleCannon));
-        assert!(!report.patterns.contains(&MatingPattern::HeavenEarthCannon));
     }
 }
 

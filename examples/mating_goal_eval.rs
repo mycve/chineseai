@@ -1,6 +1,9 @@
 //! 固定模型、局面、预算的配对实战评测；不改写权重，不生成训练标签。
 use chineseai::{
-    az::{AzMatingGoal, AzNnue, AzSearchLimits, MatingTarget, alphazero_search_with_rules},
+    az::{
+        AzMatingGoal, AzNnue, AzSearchLimits, AzSearchWorkspace, MatingTarget,
+        alphazero_search_with_rules,
+    },
     xiangqi::{Color, Position, RuleHistoryEntry, RuleOutcome},
 };
 use clap::Parser;
@@ -28,6 +31,12 @@ struct Args {
     max_plies: usize,
     #[arg(long, default_value_t = 0.8)]
     strength: f32,
+    /// 只评测指定杀法；省略时保留用例文件的完整目标列表。
+    #[arg(long)]
+    target: Option<MatingTarget>,
+    /// 对手不读取杀法指令，始终按普通争胜搜索。
+    #[arg(long)]
+    ordinary_opponent: bool,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +127,7 @@ struct Report {
     simulations_per_move: usize,
     max_plies: usize,
     strength: f32,
+    ordinary_opponent: bool,
     note: &'static str,
     pairs: Vec<Pair>,
 }
@@ -208,6 +218,7 @@ fn play(
     let mode = if enabled { "conditioned" } else { "ordinary" };
     let mut moves = Vec::new();
     let mut simulations = 0;
+    let mut owner_search = AzSearchWorkspace::new(model);
     for ply in 0..=args.max_plies {
         let outcome = position.rule_outcome_with_history(&history);
         if outcome.is_some() {
@@ -255,20 +266,29 @@ fn play(
         } else {
             legal
         };
-        let result = alphazero_search_with_rules(
-            &position,
-            Some(history.clone()),
-            Some(root_moves.clone()),
-            model,
-            AzSearchLimits {
-                simulations: args.simulations,
-                seed: ply as u64,
-                // 普通组与目标组共用预算，关闭噪声、温度采样、KLD 提前收敛。
-                // 规则终局及已证明的结果仍按现有搜索正常停止。
-                mating_goal: if enabled { goal } else { AzMatingGoal::NONE },
-                ..AzSearchLimits::default()
+        let limits = AzSearchLimits {
+            simulations: args.simulations,
+            seed: ply as u64,
+            mating_goal: if enabled
+                && (!args.ordinary_opponent || position.side_to_move() == goal.side)
+            {
+                goal
+            } else {
+                AzMatingGoal::NONE
             },
-        );
+            ..AzSearchLimits::default()
+        };
+        let result = if enabled && position.side_to_move() == goal.side {
+            owner_search.search(&position, &history, root_moves.clone(), limits)
+        } else {
+            alphazero_search_with_rules(
+                &position,
+                Some(history.clone()),
+                Some(root_moves.clone()),
+                model,
+                limits,
+            )
+        };
         simulations += result.simulations;
         let mv = result
             .best_move
@@ -388,7 +408,11 @@ fn run(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err(invalid("拒绝覆盖已有评测报告").into());
     }
     let suite: Suite = toml::from_str(&fs::read_to_string(&args.cases)?)?;
-    let cases = suite.expand()?;
+    let cases = suite
+        .expand()?
+        .into_iter()
+        .filter(|case| args.target.is_none_or(|target| case.target == target))
+        .collect::<Vec<_>>();
     if cases.is_empty() {
         return Err(invalid("评测局面为空").into());
     }
@@ -445,6 +469,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         );
     }
     let report = Report {
+        ordinary_opponent: args.ordinary_opponent,
         model: args.model.canonicalize()?.display().to_string(),
         model_bytes: fs::metadata(&args.model)?.len(),
         simulations_per_move: args.simulations,
@@ -508,6 +533,8 @@ mod tests {
         other.target = MatingTarget::HorseCannon;
         assert_eq!(baseline_key(&case), baseline_key(&other));
         let args = Args {
+            target: None,
+            ordinary_opponent: false,
             model: PathBuf::new(),
             cases: PathBuf::new(),
             output: PathBuf::new(),
@@ -528,9 +555,12 @@ mod tests {
     #[test]
     fn paired_suites_expand_without_illegal_or_terminal_starts() {
         for (text, expected) in [
-            (include_str!("../eval/mating-goal-paired.toml"), 56),
-            (include_str!("../eval/mating-goal-book.toml"), 224),
-            (include_str!("../eval/mating-goal-endgame.toml"), 43),
+            (include_str!("../eval/mating-goal-paired.toml"), 48),
+            (include_str!("../eval/mating-goal-book.toml"), 192),
+            (include_str!("../eval/mating-goal-validation.toml"), 192),
+            (include_str!("../eval/mating-goal-speed-holdout.toml"), 96),
+            (include_str!("../eval/mating-goal-user-history.toml"), 3),
+            (include_str!("../eval/mating-goal-endgame.toml"), 37),
         ] {
             let cases = toml::from_str::<Suite>(text).unwrap().expand().unwrap();
             assert_eq!(cases.len(), expected);

@@ -1,11 +1,11 @@
 use crate::az::{
     AzCandidate, AzMatingGoal, AzMovesLeftParams, AzNnue, AzSearchControl, AzSearchLimits,
-    AzUciSearchResult, MatingTarget, SplitMix64, cp_from_q, search_uci,
+    AzUciSearchResult, GoalPlan, MatingTarget, SplitMix64, cp_from_q, search_uci,
 };
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
 use std::io::{self, BufRead, Write};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -79,6 +79,7 @@ struct UciState {
     moves_left_params: AzMovesLeftParams,
     mating_goal: AzMatingGoal,
     mating_side_mode: MatingSideMode,
+    goal_plan: Arc<Mutex<Option<GoalPlan>>>,
 }
 
 impl Default for UciState {
@@ -117,6 +118,7 @@ impl Default for UciState {
                 ..AzMatingGoal::NONE
             },
             mating_side_mode: MatingSideMode::Auto(None),
+            goal_plan: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -131,6 +133,7 @@ impl UciState {
     }
 
     fn reset_mating_owner(&mut self) {
+        *self.goal_plan.lock().unwrap() = None;
         if let MatingSideMode::Auto(bound) = &mut self.mating_side_mode {
             *bound = None;
         }
@@ -765,7 +768,19 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     // 已经打印过的节点数：用来判断"最后一次 info 是否已经报过"，避免重复行。
     // 连杀证明/规则终局会在第一轮模拟之前就让循环 break，此时它仍是 None。
     let mut last_reported_nodes = None;
+    let mut goal_plan = state.goal_plan.lock().unwrap().clone();
     let mut report_progress = |progress: &AzUciSearchResult| {
+        let adjusted = goal_plan.as_ref().map(|plan| {
+            let mut result = progress.clone();
+            result.use_goal_plan(
+                plan,
+                &state.position,
+                &state.rule_history,
+                state.mating_goal,
+            );
+            result
+        });
+        let progress = adjusted.as_ref().unwrap_or(progress);
         if let Some(proven) = high_score_source(progress) {
             if last_score_source != Some(proven) {
                 print_high_score_source(progress, proven);
@@ -776,7 +791,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         last_reported_nodes = Some(progress.search.simulations);
         flush();
     };
-    let report = search_uci(
+    let mut report = search_uci(
         &state.position,
         state.rule_history.clone(),
         legal,
@@ -806,6 +821,24 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         state.multipv,
         &mut report_progress,
     );
+    GoalPlan::retain_shorter(
+        &mut goal_plan,
+        report.goal_plan.take(),
+        &state.position,
+        &state.rule_history,
+        state.mating_goal,
+    );
+    if let Some(plan) = &goal_plan {
+        if report.use_goal_plan(
+            plan,
+            &state.position,
+            &state.rule_history,
+            state.mating_goal,
+        ) {
+            last_reported_nodes = None;
+        }
+    }
+    *state.goal_plan.lock().unwrap() = goal_plan;
     let result = &report.search;
     if let Some(proven) = high_score_source(&report) {
         if last_score_source != Some(proven) {
@@ -911,6 +944,11 @@ fn print_high_score_source(report: &AzUciSearchResult, proven: bool) {
 ///
 /// 此前这三种情况在 GUI 里完全无法区分（都只是"什么都没发生"）。
 fn print_mate_diagnostic(report: &AzUciSearchResult) {
+    if report.goal_plan.is_some() {
+        if let Some(plies) = report.search.proven_moves_left {
+            println!("info string mating proof plies={plies} source=goal-proof");
+        }
+    }
     if let Some(mate) = report.search.mate_search {
         println!("info string {}", mate.uci_diagnostic());
     }
@@ -1345,7 +1383,7 @@ mod tests {
         let definition = mating_target_option();
         assert!(definition.starts_with("option name MatingTarget type combo default 铁门栓 var "));
         let values = definition.split(" var ").skip(1).collect::<Vec<_>>();
-        assert_eq!(values.len(), 15);
+        assert_eq!(values.len(), 13);
         let mut state = UciState::default();
         assert_eq!(state.mating_goal.strength, 0.8);
         assert!(state.mating_goal.enabled());
