@@ -1165,6 +1165,19 @@ mod tests {
             let last = fresh.best_move.unwrap();
             next.make_move(last);
             assert!(requested.matches_mate(&next.classify_mate().unwrap()));
+            let samples = crate::az::samples_from_mating_trajectory(
+                position.clone(),
+                history.clone(),
+                &[setup, reply, last],
+                requested,
+                1960,
+            )
+            .unwrap();
+            for (index, sample) in samples.iter().enumerate() {
+                assert_eq!(sample.goal_target, 1.0);
+                assert_eq!(sample.moves_left, (3 - index) as f32);
+                assert_eq!(sample.value, sample.side_sign);
+            }
         }
         let ordinary = position.parse_uci_move("a8e8").unwrap();
         let mut constrained = alphazero_search_with_rules(

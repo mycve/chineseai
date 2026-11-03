@@ -21,7 +21,7 @@ pub(crate) struct Cli {
 pub(crate) enum CliCommand {
     /// Create a random AZ-NNUE model.
     AzInit(AzInitArgs),
-    /// 将 v54 至 v58 模型升级为 4 类目标，保留其余权重。
+    /// 将 v54 至 v59 模型迁移为四类目标速度微调模型，冻结普通棋力参数。
     AzUpgradeMatingTargets(AzUpgradeMatingTargetsArgs),
     /// Scale one policy component for structural ablation.
     AzPolicyScale(AzPolicyScaleArgs),

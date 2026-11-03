@@ -131,7 +131,7 @@ impl GpuTrainer {
                 GpuReplica::new_cpu(model)?
             }
         };
-        let (vars, decay) = replica.model.all_vars_with_decay();
+        let (vars, decay) = replica.model.trainable_vars_with_decay();
         let optimizer = AzAdamW::new(vars, decay, lr as f64)?;
 
         Ok(Self {
@@ -145,7 +145,9 @@ impl GpuTrainer {
     }
 
     fn matches(&self, model: &AzNnue, optimizer_kind: AzTrainOptimizer) -> bool {
-        self.arch == model.arch && self.optimizer_kind == optimizer_kind
+        self.arch == model.arch
+            && self.optimizer_kind == optimizer_kind
+            && self.replica.model.goal_adaptation_only() == model.goal_adaptation_only
     }
 
     fn set_learning_rate(&mut self, lr: f32) {
@@ -731,6 +733,71 @@ fn dataloader_error(error: super::dataloader::DataLoaderError) -> candle_core::E
 #[cfg(test)]
 mod monitoring_tests {
     use super::*;
+
+    fn check_frozen_base(use_cuda: bool) {
+        let mut model = AzNnue::random(8, 1960);
+        model.goal_adaptation_only = true;
+        model.goal_hidden.fill(0.02);
+        let baseline = model.clone();
+        let replica = if use_cuda {
+            GpuReplica::new(&model, 0).unwrap()
+        } else {
+            GpuReplica::new_cpu(&model).unwrap()
+        };
+        if use_cuda {
+            assert!(replica.device.is_cuda());
+        }
+        let (vars, decay) = replica.model.trainable_vars_with_decay();
+        assert_eq!(vars.len(), 4);
+        let mut optimizer = AzAdamW::new(vars, decay, 0.01).unwrap();
+        let mut sample = goal_sample();
+        sample.mating_goal.side = crate::xiangqi::Color::Red;
+        sample.goal_target = 1.0;
+        for _ in 0..8 {
+            let batch = BatchTensors::from_packed(
+                PackedBatch::from_indices(&[sample.clone()], &[0]),
+                &replica.device,
+            )
+            .unwrap();
+            let output = replica
+                .compute_batch_loss(&batch, 1, 1.0, 1.0, 0.1, 1.0)
+                .unwrap();
+            optimizer
+                .step(&output.loss_tensor.backward().unwrap())
+                .unwrap();
+        }
+        replica.model.copy_to_model(&mut model).unwrap();
+        macro_rules! unchanged {
+            ($field:ident, [$($dim:expr),+], $decay:expr) => {
+                if !matches!(
+                    stringify!($field),
+                    "goal_hidden" | "goal_scale" | "goal_output" | "goal_bias"
+                ) {
+                    assert_eq!(model.$field, baseline.$field, "{}", stringify!($field));
+                }
+            };
+        }
+        crate::az::arch::az_weight_tensors!(unchanged, 8);
+        assert_ne!(model.goal_bias, baseline.goal_bias);
+        let position = crate::xiangqi::Position::startpos();
+        let history = position.initial_rule_history();
+        let legal = position.legal_moves();
+        assert_eq!(
+            model.evaluate_with_goal(&position, &history, &legal, crate::az::AzMatingGoal::NONE),
+            baseline.evaluate_with_goal(&position, &history, &legal, crate::az::AzMatingGoal::NONE)
+        );
+    }
+
+    #[test]
+    fn goal_adaptation_freezes_all_ordinary_weights_and_predictions() {
+        check_frozen_base(false);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn goal_adaptation_freezes_all_ordinary_weights_on_cuda() {
+        check_frozen_base(true);
+    }
 
     fn goal_sample() -> AzTrainingSample {
         let position = crate::xiangqi::Position::startpos();

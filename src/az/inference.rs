@@ -450,6 +450,8 @@ pub(crate) fn visit_value_threat_entries_from(
 pub struct AzNnue {
     pub hidden_size: usize,
     pub arch: AzNnueArch,
+    /// 迁移后的目标微调模型只更新目标参数；普通棋力参数保持冻结。
+    pub(crate) goal_adaptation_only: bool,
     pub input_hidden: Vec<f32>,
     pub context_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
@@ -526,6 +528,7 @@ impl Clone for AzNnue {
         Self {
             hidden_size: self.hidden_size,
             arch: self.arch,
+            goal_adaptation_only: self.goal_adaptation_only,
             input_hidden: self.input_hidden.clone(),
             context_hidden: self.context_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
@@ -636,6 +639,7 @@ impl AzNnue {
             hidden_size,
             arch,
             input_hidden,
+            goal_adaptation_only: false,
             context_hidden,
             hidden_bias,
             shared_hidden,
@@ -688,6 +692,10 @@ impl AzNnue {
         Self::random_with_arch(AzNnueArch::with_hidden_size(hidden_size), seed)
     }
 
+    pub fn is_goal_adaptation_only(&self) -> bool {
+        self.goal_adaptation_only
+    }
+
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let h = self.hidden_size;
         let varmap = VarMap::new();
@@ -695,6 +703,12 @@ impl AzNnue {
             &varmap,
             "az_model_format_version",
             &[MODEL_FORMAT_VERSION],
+            (1,),
+        )?;
+        insert_candle_var(
+            &varmap,
+            "az_goal_adaptation_only",
+            &[f32::from(u8::from(self.goal_adaptation_only))],
             (1,),
         )?;
         macro_rules! save_tensor {
@@ -796,7 +810,7 @@ impl AzNnue {
             candle_core::safetensors::MmapedSafetensors::new(path.as_ref())
                 .map_err(candle_io_error)?
         };
-        let mut expected_tensors = vec!["az_model_format_version"];
+        let mut expected_tensors = vec!["az_model_format_version", "az_goal_adaptation_only"];
         macro_rules! expect_tensor {
             ($field:ident, [$($dim:expr),+], $decay:expr) => {
                 expected_tensors.push(stringify!($field));
@@ -830,6 +844,13 @@ impl AzNnue {
             ));
         }
         let hidden_bias = load_candle_f32_tensor(&tensors, "hidden_bias")?;
+        let adaptation = load_candle_f32_tensor(&tensors, "az_goal_adaptation_only")?;
+        if adaptation != [0.0] && adaptation != [1.0] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "无效的目标微调训练范围",
+            ));
+        }
         let hidden_size = hidden_bias.len();
         let arch = AzNnueArch { hidden_size };
         let policy_accumulator_hidden =
@@ -838,6 +859,7 @@ impl AzNnue {
         let mut model = Self {
             hidden_size,
             arch,
+            goal_adaptation_only: adaptation == [1.0],
             input_hidden: load_candle_f32_tensor(&tensors, "input_hidden")?,
             context_hidden: load_candle_f32_tensor(&tensors, "context_hidden")?,
             hidden_bias,

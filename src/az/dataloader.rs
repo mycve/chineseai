@@ -433,7 +433,15 @@ impl PackedBatch {
                     .copy_from_slice(&sample.mating_targets);
                 packed.mating_weights[row] = sample.mating_weight;
             }
-            if sample.moves_left.is_finite()
+            let conditioned = packed.goal_features
+                [row * super::GOAL_CONTEXT_SIZE..(row + 1) * super::GOAL_CONTEXT_SIZE]
+                .iter()
+                .any(|&value| value != 0.0);
+            let goal_finished = packed.goal_weights[row] > 0.0 && packed.goal_targets[row] == 1.0;
+            // 条件距离只学到指定杀法的真实距离；失败局的普通终局不是该任务的到达时间。
+            // 在打包处屏蔽，因此旧v50回放也可正确复用，不需要丢弃已有正例。
+            if (!conditioned || goal_finished)
+                && sample.moves_left.is_finite()
                 && sample.moves_left >= 0.0
                 && sample.moves_left_weight.is_finite()
             {
@@ -1111,6 +1119,46 @@ mod tests {
         loader.join().unwrap();
         assert_eq!(sizes, vec![2, 2, 2, 1]);
     }
+    #[test]
+    fn goal_distance_only_uses_actual_goal_success_and_preserves_ordinary_or_fallback_rows() {
+        use crate::az::{AzMatingGoal, MatingTarget};
+        let make = |position: &Position| {
+            let mut row = sample(0);
+            row.features = crate::az::nnue::extract_sparse_features_az(position);
+            row.move_indices = position
+                .legal_moves()
+                .into_iter()
+                .map(crate::az::dense_move_index)
+                .collect();
+            row.policy = vec![1.0 / row.move_indices.len() as f32; row.move_indices.len()];
+            row.moves_left = 20.0;
+            row.moves_left_weight = 1.0;
+            row.mating_goal = AzMatingGoal {
+                target: MatingTarget::DoubleCannon,
+                side: Color::Red,
+                strength: 0.4,
+            };
+            row.goal_target = 1.0;
+            row.goal_weight = 1.0;
+            row
+        };
+        let success = make(&Position::startpos());
+        let mut failed = success.clone();
+        failed.goal_target = 0.0;
+        let mut unknown = success.clone();
+        unknown.goal_weight = 0.0;
+        let mut ordinary = success.clone();
+        ordinary.mating_goal = AzMatingGoal::NONE;
+        let fallback = make(&Position::from_fen("4k4/9/9/4C4/9/9/9/9/9/4K4 w").unwrap());
+        let packed = PackedBatch::from_indices(
+            &[success, failed, unknown, ordinary, fallback],
+            &[0, 1, 2, 3, 4],
+        );
+        assert_eq!(packed.moves_left_weights, [1.0, 0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(&packed.value_weights, &[1.0; 5]);
+        assert_eq!(&packed.goal_targets[..3], &[1.0, 0.0, 0.0]);
+    }
+
     #[test]
     fn successful_goal_actions_are_balanced_by_target_without_relabeling_value_tasks() {
         use crate::az::{AzMatingGoal, MatingTarget};

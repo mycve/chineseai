@@ -13,7 +13,9 @@ const OLD_HEADS: [Option<usize>; MATING_HEAD_SIZE] = [Some(0), Some(2), Some(1),
 const V56_HEADS: [usize; MATING_TARGET_COUNT] = [0, 1, 2, 10];
 
 fn retained_heads(version: f32) -> (usize, Vec<usize>) {
-    if version == 57.0 || version == 58.0 {
+    if version == 59.0 {
+        (4, (0..4).collect())
+    } else if version == 57.0 || version == 58.0 {
         (if version == 57.0 { 12 } else { 11 }, vec![0, 1, 2, 8])
     } else {
         (14, V56_HEADS.to_vec())
@@ -71,10 +73,14 @@ impl AzNnue {
         };
         let version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
         let legacy = version == [54.0];
-        if !legacy && ![55.0, 56.0, 57.0, 58.0].iter().any(|&v| version == [v]) {
+        if !legacy
+            && ![55.0, 56.0, 57.0, 58.0, 59.0]
+                .iter()
+                .any(|&v| version == [v])
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "杀法升级仅接受 v54/v55/v56/v57/v58 模型",
+                "杀法升级仅接受 v54 至 v59 模型",
             ));
         }
         let (old_count, heads) = retained_heads(version[0]);
@@ -116,6 +122,7 @@ impl AzNnue {
         let vars = VarMap::new();
         for (name, _) in tensors.tensors() {
             match name.as_str() {
+                "az_goal_adaptation_only" => {}
                 "az_model_format_version" => insert_candle_var(
                     &vars,
                     &name,
@@ -173,6 +180,7 @@ impl AzNnue {
                 }
             }
         }
+        insert_candle_var(&vars, "az_goal_adaptation_only", &[1.0], (1,))?;
         if legacy || version == [55.0] {
             insert_candle_var(
                 &vars,
@@ -299,7 +307,7 @@ mod tests {
     }
     #[test]
     fn upgrades_preserve_remaining_weights_and_learned_gates() {
-        for version in [55.0, 56.0, 57.0, 58.0] {
+        for version in [55.0, 56.0, 57.0, 58.0, 59.0] {
             let (old_count, heads) = retained_heads(version);
             let goal_rows = goal_rows(old_count, &heads);
             let base = std::env::temp_dir().join(format!(
@@ -308,7 +316,7 @@ mod tests {
             ));
             let current = base.with_extension("current.safetensors");
             let old = base.with_extension(format!("v{version}.safetensors"));
-            let output = base.with_extension("v59.safetensors");
+            let output = base.with_extension("v60.safetensors");
             let mut model = AzNnue::random(8, 1903);
             if version >= 56.0 {
                 model.goal_scale.fill(0.3);
@@ -373,6 +381,7 @@ mod tests {
             assert!(AzNnue::load(&old).is_err());
             AzNnue::upgrade_mating_targets(&old, &output).unwrap();
             let upgraded = AzNnue::load(&output).unwrap();
+            assert!(upgraded.is_goal_adaptation_only());
             macro_rules! unchanged {
                 ($field:ident, [$($dim:expr),+], $decay:expr) => {
                     assert_eq!(model.$field, upgraded.$field, "{}", stringify!($field));

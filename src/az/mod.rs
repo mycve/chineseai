@@ -105,6 +105,7 @@ pub use mate::{
 };
 pub use mating_goal::{AzMatingGoal, GOAL_CONTEXT_SIZE, MATING_TARGET_COUNT, MatingTarget};
 pub use mating_stats::AzMatingStats;
+pub use play::samples_from_mating_trajectory;
 pub use sample::{
     AzHoldoutReport, AzLoopConfig, AzLoopReport, AzPhaseValueReport, AzPolicyGroupStats,
     AzSampleMeta, AzStartSource, AzTrainLossWeights, AzTrainStats, AzTrainingSample,

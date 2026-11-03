@@ -900,6 +900,91 @@ fn insert_top2(value: f32, top: &mut [f32; 2]) {
     }
 }
 
+/// 将真实终局轨迹转成目标微调样本；策略为实际走子的监督标签，搜索模拟数为0。
+pub fn samples_from_mating_trajectory(
+    mut position: Position,
+    mut history: Vec<RuleHistoryEntry>,
+    moves: &[Move],
+    goal: AzMatingGoal,
+    game_id: u64,
+) -> Result<Vec<AzTrainingSample>, String> {
+    goal.validate()?;
+    if !goal.enabled() || moves.is_empty() {
+        return Err("轨迹需要非空的具名目标与实际走子".into());
+    }
+    let mut samples = Vec::with_capacity(moves.len());
+    for (ply, &mv) in moves.iter().enumerate() {
+        if position.rule_outcome_with_history(&history).is_some() {
+            return Err(format!("轨迹在第 {ply} 半回合已经终局"));
+        }
+        let legal = position.legal_moves_with_rules(&history);
+        let played_index = legal
+            .iter()
+            .position(|&candidate| candidate == mv)
+            .ok_or_else(|| format!("轨迹第 {ply} 半回合非法：{mv}"))?;
+        let candidates = legal
+            .into_iter()
+            .map(|candidate| AzCandidate {
+                mv: candidate,
+                visits: 0,
+                q: 0.0,
+                raw_prior: 0.0,
+                prior: 0.0,
+                policy: f32::from(u8::from(candidate == mv)),
+                solved: None,
+                moves_left: None,
+                goal_value: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let mut sample = make_training_sample(
+            &position,
+            &history,
+            &candidates,
+            0.0,
+            [0.0, 1.0, 0.0],
+            false,
+            AzSampleMeta {
+                game_id,
+                ply: ply as u16,
+                played_index: played_index as u16,
+                played_visits: 1,
+                ..Default::default()
+            },
+            0,
+            0.0,
+        );
+        sample.mating_goal = goal;
+        samples.push(sample);
+        history.push(position.rule_history_entry_after_move(mv));
+        position.make_move(mv);
+    }
+    let classification = position.classify_mate();
+    let outcome = position
+        .rule_outcome_with_history(&history)
+        .or_else(|| {
+            classification
+                .as_ref()
+                .map(|mate| RuleOutcome::Win(mate.winner))
+        })
+        .ok_or("只接收实际终局轨迹，不把任意前缀当成失败")?;
+    let result = match outcome {
+        RuleOutcome::Win(Color::Red) => 1.0,
+        RuleOutcome::Win(Color::Black) => -1.0,
+        RuleOutcome::Draw(_) => 0.0,
+    };
+    let classification = classification.filter(|mate| outcome == RuleOutcome::Win(mate.winner));
+    finalize_value_targets(&mut samples, &vec![None; moves.len()], Some(result));
+    finalize_mating_targets(&mut samples, classification.as_ref(), true);
+    finalize_moves_left_targets(&mut samples, Some(moves.len()));
+    finalize_goal_targets(&mut samples, classification.as_ref(), true);
+    if super::mating_stats::goal_succeeded(goal, classification.as_ref()) {
+        for sample in &mut samples {
+            sample.policy_weight = 1.0;
+        }
+    }
+    Ok(samples)
+}
+
 fn make_training_sample(
     position: &Position,
     rule_history: &[RuleHistoryEntry],

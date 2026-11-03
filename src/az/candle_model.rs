@@ -18,6 +18,7 @@ const RMS_NORM_EPS: f64 = 1.0e-6;
 #[derive(Debug)]
 pub(super) struct AzCandleModel {
     arch: AzNnueArch,
+    goal_adaptation_only: bool,
     input_hidden: Var,
     context_hidden: Var,
     hidden_bias: Var,
@@ -432,6 +433,7 @@ impl AzCandleModel {
         let arch = model.arch;
         let hidden = arch.hidden_size;
         Ok(Self {
+            goal_adaptation_only: model.goal_adaptation_only,
             arch,
             input_hidden: var_from_slice(
                 &model.input_hidden,
@@ -557,13 +559,33 @@ impl AzCandleModel {
     }
 
     /// 查表参数和偏置不衰减；分组与张量形状共用结构清单。
+    #[cfg(test)]
     pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
+        self.vars_with_decay(false)
+    }
+
+    pub(super) fn goal_adaptation_only(&self) -> bool {
+        self.goal_adaptation_only
+    }
+
+    pub(super) fn trainable_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
+        self.vars_with_decay(self.goal_adaptation_only)
+    }
+
+    fn vars_with_decay(&self, goals_only: bool) -> (Vec<Var>, Vec<bool>) {
         let mut vars = Vec::new();
         let mut decay = Vec::new();
         macro_rules! collect {
             ($field:ident, [$($dim:expr),+], $decay:expr) => {
-                vars.push(self.$field.clone());
-                decay.push($decay);
+                if !goals_only
+                    || matches!(
+                        stringify!($field),
+                        "goal_hidden" | "goal_scale" | "goal_output" | "goal_bias"
+                    )
+                {
+                    vars.push(self.$field.clone());
+                    decay.push($decay);
+                }
             };
         }
         az_weight_tensors!(collect, self.arch.hidden_size);

@@ -1,6 +1,6 @@
 # 指定杀法：四类控制与自博弈训练
 
-2026-11-03 用户最终确认：只保留**重炮、铁门栓、马后炮、高钓马**，其他杀法全部退出识别器、训练、统计和 UCI。模型 v59、回放 v50；四个辅助杀法头，八维执行方／目标编码。配置格式仍为 v34，进度格式仍为 v8。
+2026-11-03 用户最终确认：只保留**重炮、铁门栓、马后炮、高钓马**，其他杀法全部退出识别器、训练、统计和 UCI。模型 v60、回放仍为 v50；四个辅助杀法头，八维执行方／目标编码。配置格式仍为 v34，进度格式仍为 v8。
 
 ## 固定名单
 
@@ -21,7 +21,7 @@
 
 ```text
 uci
-setoption name EvalFile value model-v59.safetensors
+setoption name EvalFile value goal-adapt.safetensors
 setoption name MatingTarget value 高钓马
 setoption name MatingStrength value 0.4
 setoption name MatingSide value red
@@ -33,18 +33,22 @@ go nodes 20000
 
 等待 `readyok` 后搜索。`MatingSide` 默认 auto，在本盘第一次 go 绑定引擎执子方，直到 ucinewgame 才重新绑定；也可显式 red/black。目标与强度跨回合保留。强度 0 或 none 关闭目标。
 
-## 自博弈与重训
+## 从现有权重微调，保留普通棋力
 
-在新目录初始化新模型，使用新配置路径、经验池和优化器。不要把旧权重、旧 best、旧优化器或旧回放自动续入。示例先创建 style4 目录，再运行：
+不重新初始化全模型。显式迁移现有 v59 权重，输出文件必须不存在：
 
 ```text
-chineseai az-init 96 style4/model.safetensors 20261103
+chineseai az-upgrade-mating-targets best.safetensors goal-adapt.safetensors
 ```
 
-原配置字段不变。为观察精简名单的效果，先保留用户现用强度 0.4、目标损失 0.1：
+迁移不改变任何已训练张量，增加持久化的“仅目标微调”标记。训练器只更新 `goal_hidden`、`goal_scale`、`goal_output`、`goal_bias`；96宽模型共1633个参数。普通棋盘编码、策略、WDL、距离读出及辅助杀法参数全部冻结。CPU和CUDA回归验证普通参数及普通模式输出保持逐位一致。这保证普通模式的原有能力，不保证每种目标策略的胜率不变。
+
+使用新的训练配置路径，避免误读旧的全模型优化器与进度；不使用 `az-init`。v50经验池可复用：将原 `旧配置.toml.replay.lz4` 复制为 `新配置.toml.replay.lz4`。只重建目标分支优化器的状态，无需丢弃已有网络或成功样本。保留其余已有配置，模型路径指向迁移文件，例如：
 
 ```toml
 format_version = 34
+model_path = "goal-adapt.safetensors"
+hidden_size = 96
 selfplay_opening_book = "book.pgn.gz"
 mating_goal_mix = true
 mating_loss_weight = 0.1
@@ -56,11 +60,19 @@ side = "red"
 strength = 0.4
 ```
 
+迁移模型会自动跳过普通竞技场：普通参数不变时，它无法衡量目标分支的改进。自博弈仍按新目标参数发布；推理使用模型路径下的当前文件或最新检查点，不用普通竞技场遗留的旧 best。普通40%对局仍保留为争胜对照，冻结模式下不更新普通参数。
+
+### 距离监督修正
+
+条件距离头原先也学习目标失败局的普通终局距离，例如“很快输掉”或“很快以其他杀法获胜”。这与搜索需要的“距指定杀法还有几步”不一致。现在仅在必要资源仍满足、原指令实际成功、距离已知时监督条件距离；失败和未知目标样本屏蔽该距离损失。普通模式和已恢复普通争胜的资源不足后缀，保持原距离监督。修正放在样本打包处，因此旧v50回放也能正确使用；距离配对损失同步遵守屏蔽。
+
+目标价值仍学习真实命中概率，WDL仍学习实际胜负。本轮没有引入0.99回报折扣，没有修改搜索收益公式或既有模仿权重。搜索沿用原有的目标证明与收尾规则，读取修正后的条件距离。
+
 目标混合按用户选择改为约 60% 目标局、40% 普通争胜；在起局仍具备必要资源的四类中均匀采样。标准起局全部具备时，每类约占总对局的 15%。不额外随机红黑，执行方固定按配置，目标和执行方盘内不变。对手使用普通争胜收益，不配合目标。关闭混合时使用固定指令。
 
 资源不足立即关闭条件偏好：重炮需两炮；铁门栓需炮、车或兵以及可被牵制的防守子；马后炮需马炮；高钓马需马及其他攻击子。关闭后继续正常争胜，不终止棋局。原目标前缀按失败监督，资源丢失后的样本关闭目标条件；WDL 使用真实结果。暂未搜到、低预测概率或几步没进展不能当成不可达。
 
-策略从第一步读取指令，MCTS 策略训练回条件策略；目标价值学习原指令实际成功／失败，四个辅助头学习杀法标签。WDL 保留，成功轨迹还有按完成距离降权的额外策略监督。正常用尽步数预算记目标失败，未观察的 WDL 仍屏蔽。不开新损失或采样参数。CE 下降不等于实际命中率提高。
+策略从第一步读取指令，MCTS 策略训练回条件策略；目标价值学习原指令实际成功／失败，四个辅助头继续提供杀法标签读出。WDL 保留，成功轨迹还有按完成距离降权的额外策略监督。正常用尽步数预算记目标失败，未观察的 WDL 仍屏蔽。不开新损失或采样参数。CE 下降不等于实际命中率提高。
 
 ## 搜索收束与局限
 
@@ -77,16 +89,40 @@ strength = 0.4
 只为推理对照提供显式迁移，输出路径必须不存在：
 
 ```text
-chineseai az-upgrade-mating-targets best.safetensors target/best-mating4-v59.safetensors
-cargo run --profile fast --offline --example mating_goal_eval -- target/best-mating4-v59.safetensors --cases eval/mating-goal-user-history.toml --ordinary-opponent --target 高钓马 --simulations 20000 --max-plies 120 --strength 0.4 --output high-angler-eval.toml
-cargo run --profile fast --offline --example pawn_threat_probe -- target/best-mating4-v59.safetensors --output pawn-threat.toml
+chineseai az-upgrade-mating-targets best.safetensors goal-adapt.safetensors
+cargo run --profile fast --offline --example mating_goal_eval -- goal-adapt.safetensors --cases eval/mating-goal-user-history.toml --ordinary-opponent --target 高钓马 --simulations 20000 --max-plies 180 --strength 0.4 --output high-angler-eval.toml
+cargo run --profile fast --offline --example pawn_threat_probe -- goal-adapt.safetensors --output pawn-threat.toml
 ```
 
-v54 至 v58 可显式迁移到 v59，仅保留当前目标对应参数。v56 的四类行来自旧辅助头 0、1、2、10；v57/v58 来自 0、1、2、8。执行方两组编码分别映射，已训练门控保留；v54/v55 缺失门控补零。普通加载器严格检查版本。此次选择重新训练，不迁移旧经验池或优化器。
+v54至v59可显式迁移到v60；保留对应目标行与其余已训练权重，v59全部张量逐位保留。v54/v55缺失门控补零。普通加载器严格检查版本和微调标记；新随机初始化模型仍可全参数训练，迁移模型自动采用冻结模式。
 
 保留四类的一步杀、关键参与子移除、无杀／无关子反例、镜像、红黑翻转、资源关闭、完整目标证明、历史与 searchmoves 限制、模型迁移和 CPU/CUDA 一致性检查。开局留出集固定起点，不按结果筛选；用例展开只含当前四类。
 
-四类版本 fast 编译通过，完整回归 409 项通过、4 项跳过，另行启用的 CPU/CUDA 条件输出一致性检查通过。真实 v56 直接裁剪与经过 v58 后再裁剪的全部张量逐字节一致。用户三个高钓马完整历史在强度 0.4、20000 次模拟、固定普通黑方下仍分别用 26／12／8 半回合完成，与精简前相同；这验证保留目标行为，没有宣称四类重训已经提高成功率。
+## 2026-11-03：现权重微调对照
+
+输入为用户最新v59权重，SHA256 `d5eaeee46813db6a9de6635e65bd7711e724ede6e72205c38be5d2b31f49ef1e`。本地候选仅微调4个目标张量：63条真实终局轨迹、6497个样本，其中216个成功状态，40轮；同一完整起点、历史及指令，只保留更短的已验证成功示范。轨迹包含旧快速目标实战、当前实战、16个训练开局的已完成目标对局与四类一步杀；不伪造未知前缀的失败标签，示范策略为实际走子的one-hot标签，不冒充原MCTS访问分布。
+
+同冻结普通黑方、强度0.4、每步20000次模拟、完整UCI历史，三个用户高钓马残局：
+
+| 起点 | 原模型完成长度 | 候选完成长度 |
+| --- | ---: | ---: |
+| 149半回合 | 132 | 52 |
+| 169半回合 | 12 | 16 |
+| 197半回合 | 24 | 16 |
+
+长度为半回合；有退步，不能宣称根治。用户残局参与了微调，只能作为专项兑现测试。
+
+未参与微调的两组固定起局，1024次模拟、240半回合、固定普通对手：8个起局×4目标，命中2→5，目标局胜10→10、负9→10、和6→5、截断7→7；另16个起局×4目标，命中3→3，胜14→21、负23→24、和14→11、截断13→8。普通模式全部棋谱、结果和模拟统计逐项一致。部分旧命中丢失，新命中出现；命中对局组成不同，不能把均长变化当作相同对局普遍加快。两组只含24个独立起点。
+
+候选另存为 `goal-adapt-v60-candidate.safetensors`，不覆盖原best。它是可复测候选，不是所有杀法的通用提升证明；完整服务器微调仍需观察各类命中、长度、胜负及截断。源权重和全部普通张量未改，CPU/CUDA冻结与条件输出一致性测试通过。
+
+轨迹微调工具示例（仅接受已实际结束且合法的轨迹，成功示范按相同完整起点取最短）：
+
+```text
+cargo run --profile fast --offline --example goal_speed_finetune -- goal-adapt.safetensors trajectories.toml candidate.safetensors --epochs 40
+```
+
+该工具使用既有训练器，保存冻结标记；它不替代服务器自博弈。目标轨迹文件每项包含 `name`、`fen`、`prefix_moves`、`moves`、`target`、`side`。
 
 过河兵输入已有位置、王与子关系、攻击及保护特征。原权重在四个构造兵车对照中已表现出组合响应并避开送一手杀；不能据此证明长期威胁全部解决，也没有据猜测增加固定兵价值或新网络头。
 

@@ -103,7 +103,7 @@ mod tests {
 
 pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     let config_path = cmd.config;
-    let Some(config) = load_or_create_az_loop_config(&config_path) else {
+    let Some(mut config) = load_or_create_az_loop_config(&config_path) else {
         return false;
     };
     let target_update = cmd.target_update.map(|update| update.max(1));
@@ -152,6 +152,12 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         (AzNnue::random_with_arch(config_arch, config.seed), false)
     };
     model.moves_left_params = config.moves_left_params();
+    if model.is_goal_adaptation_only() {
+        config.arena_interval = 0;
+        println!(
+            "training : 目标分支微调，普通棋力参数冻结；普通竞技场不选目标模型。使用当前模型路径或最新检查点推理。"
+        );
+    }
     let optimizer_state_path = PathBuf::from(format!("{config_path}.adamw.safetensors"));
     let model_optimizer_path = optimizer_checkpoint_path(model_path);
     let restore_path = if model_optimizer_path.exists() {
