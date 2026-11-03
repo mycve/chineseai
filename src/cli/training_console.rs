@@ -262,8 +262,17 @@ fn mating_line(report: &AzLoopReport) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let successes = stats.goal_successes.iter().sum::<usize>();
+    let mean_success_plies = if successes > 0 {
+        format!(
+            "{:.1}",
+            stats.goal_success_plies.iter().sum::<usize>() as f32 / successes as f32
+        )
+    } else {
+        "NA".into()
+    };
     format!(
-        "本批杀法：实际将死={} 困毙={} 未知={} 覆盖={} CE={}/{} 目标CE={}/{} 轨迹CE={:.4}/{} 目标执行红/黑={}/{} 目标局胜/负/和/未知={}/{}/{}/{}(胜率={},胜局命中={}) 普通局红/黑/和/未知={}/{}/{}/{} {} 计数(批内全部%/批内将死%)：{}",
+        "本批杀法：实际将死={} 困毙={} 未知={} 覆盖={} CE={}/{} 目标CE={}/{} 轨迹CE={:.4}/{} 目标执行红/黑={}/{} 目标局胜/负/和/未知={}/{}/{}/{}(胜率={},胜局命中={}) 命中均长={}半回合 普通局红/黑/和/未知={}/{}/{}/{} {} 计数(批内全部%/批内将死%)：{}",
         stats.checkmates,
         stats.stalemates,
         stats.unknown_games,
@@ -282,6 +291,7 @@ fn mating_line(report: &AzLoopReport) -> String {
         goal_unknown,
         goal_win_rate,
         success_given_win,
+        mean_success_plies,
         plain_red,
         plain_black,
         plain_draws,
@@ -324,12 +334,16 @@ mod tests {
         report.mating.games = 13;
         report.mating.goal_attempts[0] = 10;
         report.mating.goal_successes[0] = 1;
+        report.mating.goal_success_plies[0] = 30;
         report.mating.goal_results[0] = [2, 6, 1, 1];
         report.mating.ordinary_results = [1, 1, 0, 1];
         let line = mating_line(&report);
         assert!(line.contains("目标局胜/负/和/未知=2/6/1/1(胜率=20.0%,胜局命中=50.0%)"));
         assert!(line.contains("普通局红/黑/和/未知=1/1/0/1"));
+        assert!(line.contains("命中均长=30.0半回合"));
         report.mating.goal_results[0][0] = 0;
         assert!(mating_line(&report).contains("胜局命中=NA"));
+        report.mating.goal_successes[0] = 0;
+        assert!(mating_line(&report).contains("命中均长=NA半回合"));
     }
 }

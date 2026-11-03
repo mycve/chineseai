@@ -15,6 +15,8 @@ pub struct AzMatingStats {
     /// 按 MatingTarget::ALL 排序；尝试分母保留失败和未知结局。
     pub goal_attempts: [usize; MATING_TARGET_COUNT],
     pub goal_successes: [usize; MATING_TARGET_COUNT],
+    /// 成功对局从本盘指令起点到实际将死的半回合数总和。
+    pub goal_success_plies: [usize; MATING_TARGET_COUNT],
     pub goal_unknown: [usize; MATING_TARGET_COUNT],
     /// [红方执行、黑方执行]，用于检查目标执行方的实际分布。
     pub goal_side_attempts: [usize; 2],
@@ -37,6 +39,7 @@ impl AzMatingStats {
         for i in 0..MATING_TARGET_COUNT {
             self.goal_attempts[i] += other.goal_attempts[i];
             self.goal_successes[i] += other.goal_successes[i];
+            self.goal_success_plies[i] += other.goal_success_plies[i];
             self.goal_unknown[i] += other.goal_unknown[i];
             for result in 0..4 {
                 self.goal_results[i][result] += other.goal_results[i][result];
@@ -108,6 +111,7 @@ impl AzMatingStats {
         goal: AzMatingGoal,
         classification: Option<&MateClassification>,
         observed: bool,
+        plies: usize,
     ) {
         if !goal.enabled() {
             return;
@@ -119,8 +123,9 @@ impl AzMatingStats {
         self.goal_side_attempts[usize::from(goal.side == crate::xiangqi::Color::Black)] += 1;
         if !observed {
             self.goal_unknown[index] += 1;
-        } else {
-            self.goal_successes[index] += usize::from(goal_succeeded(goal, classification));
+        } else if goal_succeeded(goal, classification) {
+            self.goal_successes[index] += 1;
+            self.goal_success_plies[index] += plies;
         }
     }
 }
@@ -150,13 +155,14 @@ mod tests {
             strength: 1.0,
         };
         let mut stats = AzMatingStats::default();
-        stats.record_goal(goal, Some(&mate), true);
-        stats.record_goal(goal, None, true);
-        stats.record_goal(goal, None, false);
+        stats.record_goal(goal, Some(&mate), true, 30);
+        stats.record_goal(goal, None, true, 100);
+        stats.record_goal(goal, None, false, 200);
         let mut merged = AzMatingStats::default();
         merged.add_assign(&stats);
         assert_eq!(merged.goal_attempts[..2], [3, 0]);
         assert_eq!(merged.goal_successes[..2], [1, 0]);
+        assert_eq!(merged.goal_success_plies[..2], [30, 0]);
         assert_eq!(merged.goal_unknown[..2], [1, 0]);
         stats.record_goal(
             AzMatingGoal {
@@ -165,6 +171,7 @@ mod tests {
             },
             Some(&mate),
             true,
+            40,
         );
         assert_eq!(stats.goal_successes[..2], [1, 0]);
     }

@@ -7,6 +7,12 @@ use crate::xiangqi::{
     Color, MateClassification, MateKind, MatingPattern, Move, PieceKind, Position,
 };
 
+/// 仅用于成功轨迹的策略模仿；不改目标概率、MCTS 价值或 WDL 标签。
+/// 100 半回合约为 0.74，200 半回合约为 0.55，不把长轨迹一刀切丢弃。
+pub(crate) fn goal_imitation_discount(plies: f32) -> f32 {
+    0.997_f32.powf(plies)
+}
+
 macro_rules! mating_targets {
     ($($variant:ident => $key:literal),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

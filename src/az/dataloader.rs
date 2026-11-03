@@ -451,7 +451,7 @@ impl PackedBatch {
             packed.value_source_phase_masks
                 [row * 9 + sample.meta.start_source.index() * 3 + phase] = 1.0;
         }
-        // 每个有成功轨迹的目标贡献相等，避免常见杀法淹没稀有杀法；不改变 WDL/BCE 分布。
+        // 按成功目标的样本数平衡；保留效率降权，避免重新归一化抵消它。
         let mut counts = [0usize; super::MATING_TARGET_COUNT];
         for (row, &index) in batch.iter().enumerate() {
             if packed.goal_imitation_weights[row] > 0.0 {
@@ -595,7 +595,17 @@ impl PackedBatch {
                     && sample.policy_weight > 0.0
                 {
                     self.goal_imitation_indices[row] = policy_offset as u32;
-                    self.goal_imitation_weights[row] = goal.strength * sample.policy_weight;
+                    let efficiency = if sample.moves_left_weight.is_finite()
+                        && sample.moves_left_weight > 0.0
+                        && sample.moves_left.is_finite()
+                        && sample.moves_left >= 0.0
+                    {
+                        crate::az::mating_goal::goal_imitation_discount(sample.moves_left)
+                    } else {
+                        1.0
+                    };
+                    self.goal_imitation_weights[row] =
+                        goal.strength * sample.policy_weight * efficiency;
                 }
                 if let Some(prior) = &mut goal_prior {
                     if let Some((from, to)) = dense_move_squares(move_index) {
@@ -1152,6 +1162,17 @@ mod tests {
         );
         assert_eq!(packed.goal_weights[0], 1.0);
         assert_eq!(packed.goal_targets[0], 1.0);
+        // 只降低长成功轨迹的策略模仿，不改目标成败、WDL 或常规 MCTS 策略。
+        let mut delayed = good.clone();
+        delayed.moves_left = 200.0;
+        delayed.moves_left_weight = 1.0;
+        let discounted = PackedBatch::from_indices(&[good.clone(), delayed], &[0, 1]);
+        assert_eq!(discounted.goal_imitation_indices, [1, 1]);
+        assert_eq!(
+            discounted.goal_imitation_weights,
+            [1.0, crate::az::mating_goal::goal_imitation_discount(200.0)]
+        );
+        assert_eq!(discounted.goal_targets, [1.0, 1.0]);
         let mut baseline = good.clone();
         baseline.meta.played_visits = 0;
         let baseline = PackedBatch::from_indices(&[baseline], &[0]);

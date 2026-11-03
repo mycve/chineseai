@@ -350,6 +350,12 @@ pub(crate) fn mating_count_metrics(
                 stats.goal_successes[i] as f32 / attempts,
             ));
         }
+        if stats.goal_successes[i] > 0 {
+            metrics.push((
+                format!("{prefix}/goal/{name}/mean_success_plies"),
+                stats.goal_success_plies[i] as f32 / stats.goal_successes[i] as f32,
+            ));
+        }
     }
     let goal_results = stats.goal_result_totals();
     for (result, count) in ["wins", "losses", "draws", "unfinished"]
@@ -545,6 +551,7 @@ mod tests {
         let mut stats = chineseai::az::AzMatingStats::default();
         stats.goal_attempts[0] = 10;
         stats.goal_successes[0] = 1;
+        stats.goal_success_plies[0] = 30;
         stats.goal_results[0] = [2, 6, 1, 1];
         stats.ordinary_results = [1, 1, 0, 1];
         let metrics = mating_count_metrics(&stats, "mating")
@@ -553,6 +560,7 @@ mod tests {
         assert_eq!(metrics["mating/goal/重炮/win_rate"], 0.2);
         assert_eq!(metrics["mating/goal/重炮/success_rate"], 0.1);
         assert_eq!(metrics["mating/goal/重炮/success_given_win"], 0.5);
+        assert_eq!(metrics["mating/goal/重炮/mean_success_plies"], 30.0);
         assert_eq!(metrics["mating/goal_owner/unfinished"], 1.0);
         assert_eq!(metrics["mating/ordinary/red_wins"], 1.0);
     }

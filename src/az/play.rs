@@ -757,10 +757,20 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             && position.has_general(Color::Black);
         let classification = mating_observed.then(|| position.classify_mate()).flatten();
         // 步数预算用尽时，本盘指令已失败；胜负与杀形仍未知，不能伪造 WDL/杀形标签。
-        // 搜索异常不属于正常超时，继续排除目标监督。
-        let goal_outcome_known = mating_observed || goal_timed_out;
+        // 资源必要条件已失败时，目标轨迹可以先于整盘棋结算。
+        // 搜索异常本身不能提供负标签，但不能抹掉已确认的资源失败。
+        let goal_resource_failed = mating_goal.enabled()
+            && position.has_general(Color::Red)
+            && position.has_general(Color::Black)
+            && !mating_goal.effective(&position).enabled();
+        let goal_outcome_known = mating_observed || goal_timed_out || goal_resource_failed;
         mating.record(classification.as_ref(), mating_observed);
-        mating.record_goal(mating_goal, classification.as_ref(), goal_outcome_known);
+        mating.record_goal(
+            mating_goal,
+            classification.as_ref(),
+            goal_outcome_known,
+            played_plies,
+        );
         mating.record_result(mating_goal, terminal_result);
         let result: f32 = terminal_result.unwrap_or(0.0);
         match result.total_cmp(&0.0) {
@@ -1619,6 +1629,30 @@ mod tests {
                 .iter()
                 .all(|s| s.goal_target == 1.0 && s.goal_weight == 1.0)
         );
+    }
+
+    #[test]
+    fn resource_failure_masks_goal_suffix_but_keeps_full_game_wdl() {
+        let goal = AzMatingGoal {
+            target: MatingTarget::DoubleCannon,
+            side: Color::Red,
+            strength: 0.4,
+        };
+        let before = Position::startpos();
+        let after = Position::from_fen("4k4/9/9/4C4/9/9/9/9/9/4K4 w").unwrap();
+        let mut samples = vec![goal_sample(&before, goal), goal_sample(&after, goal)];
+        // 资源已丢失，即使后面的普通棋未知，也可以监督此前的目标失败。
+        finalize_goal_targets(&mut samples, None, true);
+        assert_eq!((samples[0].goal_target, samples[0].goal_weight), (0.0, 1.0));
+        assert_eq!((samples[1].goal_target, samples[1].goal_weight), (0.0, 0.0));
+        // 整盘后来仍可获胜，不能把目标失败当作 WDL 认输。
+        finalize_value_targets(&mut samples, &[None, None], Some(1.0));
+        assert!(
+            samples
+                .iter()
+                .all(|s| s.value == 1.0 && s.value_weight == 1.0)
+        );
+        assert!(samples.iter().all(|s| s.goal_target == 0.0));
     }
 
     #[test]
