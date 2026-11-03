@@ -1541,11 +1541,9 @@ impl<'a> AzTree<'a> {
         };
         let cpuct = self.compute_cpuct(node.visits, is_root);
         let goal_active = self.goal_turn(node_index);
-        let moves_left = if goal_active {
-            None
-        } else {
-            self.moves_left_context(node_index)
-        };
+        // 目标偏好不取消高胜负把握时的收尾约束，减少估计值相近时的绕路。
+        // 沿用既有门槛和有界 MLH 加分，目标证明优先级及目标效用保持不变。
+        let moves_left = self.moves_left_context(node_index);
         // 一趟同时取"证明优先级 → PUCT 分数 → 先验"的字典序最大值。
         // 原实现先扫一遍找已证明胜的子节点、再扫一遍求最高优先级、最后在最高
         // 优先级里比分数，每个子节点要查三次 `child_solved`（每次都随机访问

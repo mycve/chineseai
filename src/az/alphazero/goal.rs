@@ -742,6 +742,37 @@ mod tests {
     }
 
     #[test]
+    fn goal_keeps_bounded_finish_preference_without_overriding_goal_utility() {
+        let mut model = AzNnue::random(8, 1915);
+        model.moves_left_active = true;
+        let mut tree = two_move_tree(&Position::startpos(), &model, Color::Red);
+        tree.mating_goal.strength = 0.4;
+        tree.nodes[0].visits = 200;
+        tree.nodes[0].value_wdl_sum = [200.0, 0.0, 0.0];
+        tree.nodes[0].moves_left_sum = 200.0 * 30.0;
+        for (index, child) in tree.node_children_mut(0).iter_mut().enumerate() {
+            child.visits = 100;
+            child.prior = 0.5;
+            child.value_wdl_sum = [100.0, 0.0, 0.0];
+            child.goal_value_sum = 50.0;
+            child.moves_left_sum = 100.0 * if index == 0 { 80.0 } else { 4.0 };
+        }
+        assert_eq!(tree.select_child(0), 1, "同目标效用下应保留收尾偏好");
+        tree.node_children_mut(0)[0].goal_value_sum = 90.0;
+        tree.node_children_mut(0)[1].goal_value_sum = 10.0;
+        assert_eq!(
+            tree.select_child(0),
+            0,
+            "有界距离加分不能压过明显更好的目标路线"
+        );
+        tree.nodes[0].value_wdl_sum = [100.0, 0.0, 100.0];
+        assert!(
+            tree.moves_left_context(0).is_none(),
+            "胜负不明确时仍关闭距离加分"
+        );
+    }
+
+    #[test]
     fn tiny_goal_prediction_differences_do_not_erase_root_visit_evidence() {
         let model = AzNnue::random(8, 1911);
         let mut tree = two_move_tree(&Position::startpos(), &model, Color::Red);

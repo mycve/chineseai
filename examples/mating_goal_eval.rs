@@ -487,6 +487,7 @@ mod tests {
         for (text, expected) in [
             (include_str!("../eval/mating-goal-paired.toml"), 56),
             (include_str!("../eval/mating-goal-book.toml"), 224),
+            (include_str!("../eval/mating-goal-endgame.toml"), 43),
         ] {
             let cases = toml::from_str::<Suite>(text).unwrap().expand().unwrap();
             assert_eq!(cases.len(), expected);
