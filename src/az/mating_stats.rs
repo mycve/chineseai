@@ -177,8 +177,8 @@ mod tests {
     }
 
     #[test]
-    fn merging_keeps_multilabel_counts_and_both_rate_denominators() {
-        let mate = Position::from_fen("4ka3/6N2/2N6/9/9/9/9/9/9/3K5 b")
+    fn merging_keeps_pattern_counts_and_both_rate_denominators() {
+        let mate = Position::from_fen("2bakab2/9/9/4C4/9/4C4/9/9/9/4K4 b")
             .unwrap()
             .classify_mate()
             .unwrap();
@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(second.labeled_games, 2);
         assert_eq!(second.unknown_games, 1);
         assert_eq!(second.checkmates, 1);
-        for pattern in [MatingPattern::DoubleHorse, MatingPattern::ElbowHorse] {
+        for pattern in [MatingPattern::DoubleCannon] {
             let index = MatingPattern::ALL
                 .iter()
                 .position(|&p| p == pattern)

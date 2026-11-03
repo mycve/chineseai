@@ -40,3 +40,4 @@ docs
 docs/*
 !docs/吃子共享关系扩展.md
 !docs/mating-patterns.md
+!docs/mating-patterns-history.md

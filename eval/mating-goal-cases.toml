@@ -21,59 +21,10 @@ target = "horse_cannon"
 side = "red"
 
 [[cases]]
-name = "白脸将一步杀"
-stage = "mate_in_one"
-fen = "3k2b2/9/1N1P5/9/9/9/9/9/9/4K4 w"
-target = "white_faced_general"
-side = "red"
-
-[[cases]]
-name = "卧槽马一步杀"
-stage = "mate_in_one"
-fen = "3ak1b2/4a4/9/7N1/9/5R3/9/9/9/4K4 w"
-target = "elbow_horse"
-side = "red"
-
-[[cases]]
-name = "挂角马一步杀"
-stage = "mate_in_one"
-fen = "3aka3/3P5/9/9/6N2/9/9/9/9/3K5 w"
-target = "palace_corner_horse"
-side = "red"
-
-[[cases]]
-name = "钓鱼马一步杀"
-stage = "mate_in_one"
-fen = "4k4/9/6N2/9/9/9/9/9/3R5/3K5 w"
-target = "angler_horse"
-side = "red"
-
-[[cases]]
-name = "八角马一步杀"
-stage = "mate_in_one"
-fen = "3k5/9/5N3/9/9/9/9/9/2R6/5K3 w"
-target = "octagonal_horse"
-side = "red"
-
-[[cases]]
 name = "高钓马一步杀"
 stage = "mate_in_one"
 fen = "3k5/1R7/9/2N6/9/9/9/9/9/4K4 w"
 target = "high_angler_horse"
-side = "red"
-
-[[cases]]
-name = "双马饮泉一步杀"
-stage = "mate_in_one"
-fen = "4ka3/9/2N1N4/9/9/9/9/9/9/3K5 w"
-target = "double_horse"
-side = "red"
-
-[[cases]]
-name = "双车错一步杀"
-stage = "mate_in_one"
-fen = "4k4/7R1/9/9/9/9/9/9/R8/3K5 w"
-target = "cross_rooks"
 side = "red"
 
 [[cases]]

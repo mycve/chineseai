@@ -1,6 +1,6 @@
 # 固定配对评测局面：每个局面展开到全部具名目标。
 # 来源：现有 book.pgn.gz，共3210663局面，Python Random(20261103) 无放回 reservoir 抽取16个；不按对局结果筛选。
-targets = ["double_cannon", "iron_bolt", "horse_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks"]
+targets = ["double_cannon", "iron_bolt", "horse_cannon", "high_angler_horse"]
 
 [[cases]]
 name = "book-191556"

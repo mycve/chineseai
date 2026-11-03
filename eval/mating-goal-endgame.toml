@@ -1,5 +1,5 @@
 # 用户提供的完整197半回合棋谱；固定三个后半盘快照，保留完整规则历史。
-targets = ["double_cannon", "iron_bolt", "horse_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks"]
+targets = ["double_cannon", "iron_bolt", "horse_cannon", "high_angler_horse"]
 
 [[cases]]
 name = "user-ply149"

@@ -1409,12 +1409,12 @@ mod tests {
         let definition = mating_target_option();
         assert!(definition.starts_with("option name MatingTarget type combo default 铁门栓 var "));
         let values = definition.split(" var ").skip(1).collect::<Vec<_>>();
-        assert_eq!(values.len(), 12);
+        assert_eq!(values.len(), 5);
         let mut state = UciState::default();
         assert_eq!(state.mating_goal.strength, 0.8);
         assert!(state.mating_goal.enabled());
         assert_eq!(state.mating_goal.target, MatingTarget::IronBolt);
-        state.mating_goal.target = MatingTarget::CrossRooks;
+        state.mating_goal.target = MatingTarget::HighAnglerHorse;
         for value in values {
             handle_setoption(
                 &format!("setoption name MatingTarget value {value}"),

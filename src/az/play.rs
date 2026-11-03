@@ -1700,7 +1700,7 @@ mod tests {
         };
         config.mating_goal_mix = true;
         let mut rng = SplitMix64::new(17);
-        let mut counts = [0; crate::az::MATING_TARGET_COUNT + 1];
+        let mut counts = [0usize; crate::az::MATING_TARGET_COUNT + 1];
         for _ in 0..3000 {
             let goal = choose_selfplay_goal(&config, &Position::startpos(), &mut rng);
             assert_eq!(goal.side, Color::Black);
@@ -1708,7 +1708,12 @@ mod tests {
             counts[goal.target.index().map_or(0, |index| index + 1)] += 1;
         }
         assert!((230..370).contains(&counts[0]));
-        assert!(counts[1..].iter().all(|&count| (100..300).contains(&count)));
+        let expected = 2700 / crate::az::MATING_TARGET_COUNT;
+        assert!(
+            counts[1..]
+                .iter()
+                .all(|&count| count.abs_diff(expected) < 100)
+        );
         config.mating_goal_mix = false;
         config.mating_goal.target = MatingTarget::HorseCannon;
         for _ in 0..100 {
@@ -1737,15 +1742,11 @@ mod tests {
                 seen[goal.target.index().unwrap()] = true;
                 assert!(!matches!(
                     goal.target,
-                    MatingTarget::DoubleCannon
-                        | MatingTarget::IronBolt
-                        | MatingTarget::HorseCannon
-                        | MatingTarget::DoubleHorse
-                        | MatingTarget::CrossRooks
+                    MatingTarget::DoubleCannon | MatingTarget::IronBolt | MatingTarget::HorseCannon
                 ));
             }
         }
-        assert!(seen.iter().filter(|&&v| v).count() >= 4);
+        assert_eq!(seen.iter().filter(|&&v| v).count(), 1);
         let bare = Position::from_fen("4k4/9/9/9/9/9/9/9/9/3K5 w").unwrap();
         for _ in 0..100 {
             assert!(!choose_selfplay_goal(&config, &bare, &mut rng).enabled());
@@ -1801,16 +1802,6 @@ mod tests {
                 "4k4/9/9/9/9/9/6n2/9/7r1/5K3 b",
                 MatingTarget::HighAnglerHorse,
                 Color::Black,
-            ),
-            (
-                "4ka3/9/2N6/7N1/9/9/9/9/9/3K5 w",
-                MatingTarget::DoubleHorse,
-                Color::Red,
-            ),
-            (
-                "4k4/R6R1/9/9/9/9/9/9/9/3K5 w",
-                MatingTarget::CrossRooks,
-                Color::Red,
             ),
         ] {
             let position = Position::from_fen(fen).unwrap();
@@ -2541,13 +2532,13 @@ mod tests {
     }
 
     #[test]
-    fn mating_targets_use_the_winning_side_and_preserve_overlapping_patterns() {
-        let position = Position::from_fen("4ka3/6N2/2N6/9/9/9/9/9/9/3K5 b").unwrap();
+    fn mating_targets_use_the_winning_side_and_mask_unknown_results() {
+        let position = Position::from_fen("2bakab2/9/9/4C4/9/4C4/9/9/9/4K4 b").unwrap();
         let classification = position.classify_mate().unwrap();
         let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
         finalize_mating_targets(&mut samples, Some(&classification), true);
         assert!(samples.iter().all(|sample| sample.mating_weight == 1.0));
-        for pattern in [MatingPattern::DoubleHorse, MatingPattern::ElbowHorse] {
+        for pattern in [MatingPattern::DoubleCannon] {
             let index = MatingPattern::ALL
                 .iter()
                 .position(|&p| p == pattern)

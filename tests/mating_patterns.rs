@@ -157,19 +157,19 @@ scene!(
     elbow_horse,
     "3ak1b2/4a4/9/7N1/9/5R3/9/9/9/4K4 w",
     ["h6g8"],
-    [ElbowHorse]
+    []
 );
 scene!(
     palace_corner_horse,
     "3aka3/3P5/9/9/6N2/9/9/9/9/3K5 w",
     ["g5f7"],
-    [PalaceCornerHorse]
+    []
 );
 scene!(
     double_rook,
     "9/4k4/9/4P4/9/9/9/7R1/R8/4K4 w",
     ["h2h8", "e8e9", "a1a9"],
-    [CrossRooks]
+    []
 );
 // 此例来自“海底捞月”教学，但单个终局不能证明完整残局过程，只要求实际的车杀标签。
 scene!(
@@ -188,7 +188,7 @@ scene!(
     white_faced_general,
     "3k2b2/9/1N1P5/9/9/9/9/9/9/4K4 w",
     ["d7d8"],
-    [WhiteFacedGeneral]
+    []
 );
 scene!(
     double_check,
@@ -209,34 +209,6 @@ fn high_angler_horse_requires_an_actual_escape_block() {
     assert!(!report.patterns.contains(&MatingPattern::HighAnglerHorse));
     assert_eq!(report.kind, MateKind::Checkmate);
     let without = Position::from_fen("1R1k5/9/9/9/9/9/9/9/9/4K4 b").unwrap();
-    assert!(without.classify_mate().is_none());
-}
-
-#[test]
-fn double_horse_requires_both_horses_to_participate() {
-    assert_scene(
-        "4ka3/6N2/2N6/9/9/9/9/9/9/3K5 b",
-        &[],
-        &[MatingPattern::DoubleHorse],
-    );
-    let redundant = Position::from_fen("4ka3/R5N2/2N6/9/9/9/9/9/3R5/3K5 b").unwrap();
-    let report = redundant.classify_mate().unwrap();
-    assert!(!report.patterns.contains(&MatingPattern::DoubleHorse));
-    let without = Position::from_fen("4ka3/6N2/9/9/9/9/9/9/9/3K5 b").unwrap();
-    assert!(without.classify_mate().is_none());
-}
-
-#[test]
-fn cross_rooks_require_staggered_lines_and_real_support() {
-    assert_scene(
-        "R3k4/7R1/9/9/9/9/9/9/9/3K5 b",
-        &[],
-        &[MatingPattern::CrossRooks],
-    );
-    let same_file = Position::from_fen("3k5/3R5/9/9/9/9/9/9/3R5/4K4 b").unwrap();
-    let report = same_file.classify_mate().unwrap();
-    assert!(!report.patterns.contains(&MatingPattern::CrossRooks));
-    let without = Position::from_fen("R3k4/9/9/9/9/9/9/9/9/3K5 b").unwrap();
     assert!(without.classify_mate().is_none());
 }
 
@@ -305,125 +277,11 @@ fn captured_general_is_not_a_pattern_label() {
 }
 
 #[test]
-fn several_labels_can_describe_the_same_mate() {
-    let position = Position::from_fen("4ka3/6N2/2N6/9/9/9/9/9/9/3K5 b").unwrap();
-    let report = position.classify_mate().unwrap();
-    for pattern in [
-        MatingPattern::DoubleHorse,
-        MatingPattern::ElbowHorse,
-        MatingPattern::AnglerHorse,
-    ] {
-        assert!(report.patterns.contains(&pattern));
-    }
-    assert_eq!(report.checkers.len(), 1);
-}
-
-#[test]
-fn smothered_mate_requires_own_pieces_on_every_palace_exit() {
-    // 自构：两士和未过河的卒占住全部宫内相邻点，无法挡住 f7 马的将军。
-    let position = Position::from_fen("3aka3/4p4/5N3/9/9/9/9/9/9/3K5 b").unwrap();
-    let report = position.classify_mate().unwrap();
-    assert_eq!(report.kind, MateKind::Checkmate);
-    assert!(report.patterns.contains(&MatingPattern::PalaceCornerHorse));
-
-    let open_exit = Position::from_fen("3ak4/4p4/5N3/9/9/9/9/9/9/3K5 b").unwrap();
-    assert!(!open_exit.legal_moves().is_empty());
-    assert!(open_exit.classify_mate().is_none());
-}
-
-#[test]
-fn angler_horse_must_really_control_an_escape_square() {
-    // 自构：g7 马不直接将军，但独自控制 e8 逃点；d9 车受 d0 帅保护。
-    let position = Position::from_fen("3Rk4/9/6N2/9/9/9/9/9/9/3K5 b").unwrap();
-    let report = position.classify_mate().unwrap();
-    assert!(report.patterns.contains(&MatingPattern::AnglerHorse));
-    assert!(
-        report
-            .checkers
-            .iter()
-            .all(|&sq| position.piece_at(sq).unwrap().kind != PieceKind::Horse)
-    );
-    assert_same_patterns(&report, &position.mirror_files().classify_mate().unwrap());
-    assert_same_patterns(
-        &report,
-        &rotate_and_swap(&position).classify_mate().unwrap(),
-    );
-
-    // 同在 g7 的马只是重复控制 e8；h8 车已经封住该逃点，不应按站位贴标签。
-    let redundant = Position::from_fen("R3k4/7R1/6N2/4P4/9/9/9/9/9/4K4 b").unwrap();
-    let report = redundant.classify_mate().unwrap();
-    assert!(
-        report
-            .checkers
-            .iter()
-            .any(|&sq| redundant.piece_at(sq).unwrap().kind == PieceKind::Rook)
-    );
-    assert!(!report.patterns.contains(&MatingPattern::AnglerHorse));
-}
-
-#[test]
-fn octagonal_horse_support_is_distinct_from_a_corner_horse_check() {
-    // 自构：f7 马独自控制 e9，d1 车将军并控制 d8。
-    let position = Position::from_fen("3k5/9/5N3/9/9/9/9/9/3R5/5K3 b").unwrap();
-    let report = position.classify_mate().unwrap();
-    assert!(report.patterns.contains(&MatingPattern::OctagonalHorse));
-    assert!(!report.patterns.contains(&MatingPattern::PalaceCornerHorse));
-    assert!(
-        report
-            .checkers
-            .iter()
-            .all(|&sq| position.piece_at(sq).unwrap().kind != PieceKind::Horse)
-    );
-    assert_same_patterns(&report, &position.mirror_files().classify_mate().unwrap());
-    assert_same_patterns(
-        &report,
-        &rotate_and_swap(&position).classify_mate().unwrap(),
-    );
-
-    let without_horse = Position::from_fen("3k5/9/9/9/9/9/9/9/3R5/5K3 b").unwrap();
-    assert!(!without_horse.legal_moves().is_empty());
-    assert!(without_horse.classify_mate().is_none());
-
-    // 马在宫角并封逃格仍不足：敌将必须在九宫对角，不能把普通马助杀误算八角马。
-    let not_diagonal = Position::from_fen("5R3/4k4/5N3/9/9/9/9/9/4R4/3K5 b").unwrap();
-    let report = not_diagonal.classify_mate().unwrap();
-    assert_eq!(report.kind, MateKind::Checkmate);
-    assert!(!report.patterns.contains(&MatingPattern::OctagonalHorse));
-
-    // 反向对角同样成立：马在底宫角，对方将在宫顶另一角。
-    let bottom_corner = Position::from_fen("5N3/9/3k5/9/9/9/9/9/3R5/5K3 b").unwrap();
-    let report = bottom_corner.classify_mate().unwrap();
-    assert!(report.patterns.contains(&MatingPattern::OctagonalHorse));
-    assert_same_patterns(
-        &report,
-        &bottom_corner.mirror_files().classify_mate().unwrap(),
-    );
-    assert_same_patterns(
-        &report,
-        &rotate_and_swap(&bottom_corner).classify_mate().unwrap(),
-    );
-}
-
-#[test]
 fn central_cannon_without_a_real_pin_is_not_iron_bolt() {
     // 自构：双车已封死黑将，中炮仅挡住将帅照面，没有钉住任何防守子。
     let position = Position::from_fen("R3k4/7R1/9/9/4C4/9/9/9/9/4K4 b").unwrap();
     let report = position.classify_mate().unwrap();
-    assert!(report.patterns.contains(&MatingPattern::CrossRooks));
     assert!(!report.patterns.contains(&MatingPattern::IronBolt));
-}
-
-#[test]
-fn two_soldiers_near_the_palace_are_not_enough_without_real_support() {
-    // 自构：f9 兵参与将军，d8 兵的控格全部被车重复覆盖，并非二鬼配合。
-    let position = Position::from_fen("R3kP3/3P3R1/9/9/4C4/9/9/9/9/4K4 b").unwrap();
-    let report = position.classify_mate().unwrap();
-    assert!(
-        report
-            .checkers
-            .iter()
-            .any(|&sq| position.piece_at(sq).unwrap().kind == PieceKind::Soldier)
-    );
 }
 
 #[test]
@@ -473,44 +331,9 @@ fn every_named_goal_has_a_causal_piece_and_correct_owner_in_all_orientations() {
             "e7",
         ),
         (
-            MatingTarget::WhiteFacedGeneral,
-            "3k2b2/3P5/1N7/9/9/9/9/9/9/4K4 b",
-            "e0",
-        ),
-        (
-            MatingTarget::ElbowHorse,
-            "3ak1b2/4a1N2/9/9/9/5R3/9/9/9/4K4 b",
-            "g8",
-        ),
-        (
-            MatingTarget::PalaceCornerHorse,
-            "3aka3/3P5/5N3/9/9/9/9/9/9/3K5 b",
-            "f7",
-        ),
-        (
-            MatingTarget::AnglerHorse,
-            "3Rk4/9/6N2/9/9/9/9/9/9/3K5 b",
-            "g7",
-        ),
-        (
-            MatingTarget::OctagonalHorse,
-            "3k5/9/5N3/9/9/9/9/9/3R5/5K3 b",
-            "f7",
-        ),
-        (
             MatingTarget::HighAnglerHorse,
             "1R1k5/9/9/2N6/9/9/9/9/9/4K4 b",
             "c6",
-        ),
-        (
-            MatingTarget::DoubleHorse,
-            "4ka3/6N2/2N6/9/9/9/9/9/9/3K5 b",
-            "c7",
-        ),
-        (
-            MatingTarget::CrossRooks,
-            "R3k4/7R1/9/9/9/9/9/9/9/3K5 b",
-            "h8",
         ),
     ];
     assert_eq!(cases.map(|case| case.0), MatingTarget::ALL);
@@ -532,27 +355,22 @@ fn every_named_goal_has_a_causal_piece_and_correct_owner_in_all_orientations() {
                 } else {
                     position.piece_at(index)
                 };
-                // 白脸将保留双将合法性，把帅从 e0 移到 f0，解除对 e 路的控制。
-                let symbol = if target == MatingTarget::WhiteFacedGeneral && index == 86 {
-                    Some('K')
-                } else {
-                    piece.map(|piece| {
-                        let c = match piece.kind {
-                            PieceKind::General => 'k',
-                            PieceKind::Advisor => 'a',
-                            PieceKind::Elephant => 'b',
-                            PieceKind::Horse => 'n',
-                            PieceKind::Rook => 'r',
-                            PieceKind::Cannon => 'c',
-                            PieceKind::Soldier => 'p',
-                        };
-                        if piece.color == Color::Red {
-                            c.to_ascii_uppercase()
-                        } else {
-                            c
-                        }
-                    })
-                };
+                let symbol = piece.map(|piece| {
+                    let c = match piece.kind {
+                        PieceKind::General => 'k',
+                        PieceKind::Advisor => 'a',
+                        PieceKind::Elephant => 'b',
+                        PieceKind::Horse => 'n',
+                        PieceKind::Rook => 'r',
+                        PieceKind::Cannon => 'c',
+                        PieceKind::Soldier => 'p',
+                    };
+                    if piece.color == Color::Red {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                });
                 if let Some(symbol) = symbol {
                     if empty > 0 {
                         altered.push(char::from(b'0' + empty));
@@ -622,10 +440,10 @@ fn reported_rook_protected_by_g7_horse_is_angler_not_high_angler() {
     use chineseai::az::{AzMatingGoal, MatingTarget};
     // 用户实战反馈：另一 App 称“列马车”；g7 马保 f9 车并封 e8，不在 g6 高钓位。
     let fen = "4kR3/9/6N2/9/2b1P1b2/9/9/9/4K4/2B2A3 b - - 0 1";
-    assert_scene(fen, &[], &[MatingPattern::AnglerHorse]);
+    assert_scene(fen, &[], &[]);
     let position = Position::from_fen(fen).unwrap();
     let report = position.classify_mate().unwrap();
-    assert_eq!(report.patterns, [MatingPattern::AnglerHorse]);
+    assert!(report.patterns.is_empty());
     let goal = AzMatingGoal {
         target: MatingTarget::HighAnglerHorse,
         side: Color::Red,
@@ -634,13 +452,6 @@ fn reported_rook_protected_by_g7_horse_is_angler_not_high_angler() {
     assert!(
         !goal.matches_mate(&report),
         "指定高钓马不能把普通钓鱼马算成功"
-    );
-    assert!(
-        AzMatingGoal {
-            target: MatingTarget::AnglerHorse,
-            ..goal
-        }
-        .matches_mate(&report)
     );
 }
 

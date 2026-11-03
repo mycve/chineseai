@@ -11,35 +11,21 @@ pub enum MateKind {
     Stalemate,
 }
 
-/// 仅保留已确认的 11 种具名杀法；同一终局可以命中多种。
+/// 仅保留已确认的 4 种具名杀法；同一终局可以命中多种。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum MatingPattern {
     DoubleCannon,
     IronBolt,
     HorseCannon,
-    WhiteFacedGeneral,
-    ElbowHorse,
-    PalaceCornerHorse,
-    AnglerHorse,
-    OctagonalHorse,
     HighAnglerHorse,
-    DoubleHorse,
-    CrossRooks,
 }
 
 impl MatingPattern {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 4] = [
         Self::DoubleCannon,
         Self::IronBolt,
         Self::HorseCannon,
-        Self::WhiteFacedGeneral,
-        Self::ElbowHorse,
-        Self::PalaceCornerHorse,
-        Self::AnglerHorse,
-        Self::OctagonalHorse,
         Self::HighAnglerHorse,
-        Self::DoubleHorse,
-        Self::CrossRooks,
     ];
 
     pub fn name(self) -> &'static str {
@@ -47,14 +33,7 @@ impl MatingPattern {
             Self::DoubleCannon => "重炮",
             Self::HorseCannon => "马后炮",
             Self::IronBolt => "铁门栓",
-            Self::WhiteFacedGeneral => "白脸将",
-            Self::ElbowHorse => "卧槽马",
-            Self::PalaceCornerHorse => "挂角马",
-            Self::AnglerHorse => "钓鱼马",
-            Self::OctagonalHorse => "八角马",
             Self::HighAnglerHorse => "高钓马",
-            Self::DoubleHorse => "双马饮泉",
-            Self::CrossRooks => "双车错",
         }
     }
 }
@@ -238,49 +217,11 @@ impl MateContext<'_> {
                     .pieces(PieceKind::Cannon)
                     .any(|sq| self.central_pin(sq))
             }
-            WhiteFacedGeneral => {
-                self.denies_escape(self.position.general_square(self.winner).unwrap())
-            }
-            ElbowHorse => self
-                .checking(PieceKind::Horse)
-                .any(|sq| matches!(file_of(sq), 2 | 6) && self.rank(sq) == 1),
-            PalaceCornerHorse => self
-                .checking(PieceKind::Horse)
-                .any(|sq| matches!(file_of(sq), 3 | 5) && self.rank(sq) == 2),
-            AnglerHorse => self.pieces(PieceKind::Horse).any(|sq| {
-                matches!(file_of(sq), 2 | 6)
-                    && self.rank(sq) == 2
-                    && !self.checkers.contains(&sq)
-                    && self.denies_escape(sq)
-            }),
-            OctagonalHorse => self.pieces(PieceKind::Horse).any(|sq| {
-                matches!(file_of(sq), 3 | 5)
-                    && matches!(self.rank(sq), 0 | 2)
-                    && self.rank(self.king) == 2 - self.rank(sq)
-                    && file_of(self.king) == 8 - file_of(sq)
-                    && !self.checkers.contains(&sq)
-                    && self.denies_escape(sq)
-            }),
             HighAnglerHorse => self.pieces(PieceKind::Horse).any(|sq| {
                 matches!(file_of(sq), 2 | 6)
                     && self.rank(sq) == 3
                     && !self.checkers.contains(&sq)
                     && self.denies_escape(sq)
-            }),
-            DoubleHorse => self.checking(PieceKind::Horse).any(|checker| {
-                self.pieces(PieceKind::Horse).any(|support| {
-                    support != checker
-                        && (self.checkers.contains(&support) || self.denies_escape(support))
-                })
-            }),
-            // 识别双车交错两线的最终杀形，不声称证明此前反复交替将军的过程。
-            CrossRooks => self.checking(PieceKind::Rook).any(|checker| {
-                self.pieces(PieceKind::Rook).any(|support| {
-                    !self.checkers.contains(&support)
-                        && file_of(checker) != file_of(support)
-                        && rank_of(checker) != rank_of(support)
-                        && self.denies_escape(support)
-                })
             }),
         }
     }

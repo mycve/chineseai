@@ -7,26 +7,14 @@ use candle_nn::VarMap;
 use super::inference::{candle_io_error, insert_candle_var, load_candle_f32_tensor};
 use super::{AzNnue, GOAL_CONTEXT_SIZE, MATING_HEAD_SIZE, MATING_TARGET_COUNT};
 
-// v54 的 18 个统计头映射到确认后的 11 类；高钓马、双马饮泉从零初始化。
-const OLD_HEADS: [Option<usize>; MATING_HEAD_SIZE] = [
-    Some(0),
-    Some(2),
-    Some(1),
-    Some(6),
-    Some(7),
-    Some(8),
-    Some(9),
-    Some(10),
-    None,
-    None,
-    Some(11),
-];
+// v54 的 18 个统计头映射到确认后的 4 类；高钓马从零初始化。
+const OLD_HEADS: [Option<usize>; MATING_HEAD_SIZE] = [Some(0), Some(2), Some(1), None];
 
-const V56_HEADS: [usize; MATING_TARGET_COUNT] = [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12];
+const V56_HEADS: [usize; MATING_TARGET_COUNT] = [0, 1, 2, 10];
 
 fn retained_heads(version: f32) -> (usize, Vec<usize>) {
-    if version == 57.0 {
-        (12, (0..MATING_TARGET_COUNT).collect())
+    if version == 57.0 || version == 58.0 {
+        (if version == 57.0 { 12 } else { 11 }, vec![0, 1, 2, 8])
     } else {
         (14, V56_HEADS.to_vec())
     }
@@ -83,10 +71,10 @@ impl AzNnue {
         };
         let version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
         let legacy = version == [54.0];
-        if !legacy && version != [55.0] && version != [56.0] && version != [57.0] {
+        if !legacy && ![55.0, 56.0, 57.0, 58.0].iter().any(|&v| version == [v]) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "杀法升级仅接受 v54/v55/v56/v57 模型",
+                "杀法升级仅接受 v54/v55/v56/v57/v58 模型",
             ));
         }
         let (old_count, heads) = retained_heads(version[0]);
@@ -310,8 +298,8 @@ mod tests {
         }
     }
     #[test]
-    fn v55_v56_v57_upgrade_preserves_remaining_weights_and_learned_gates() {
-        for version in [55.0, 56.0, 57.0] {
+    fn upgrades_preserve_remaining_weights_and_learned_gates() {
+        for version in [55.0, 56.0, 57.0, 58.0] {
             let (old_count, heads) = retained_heads(version);
             let goal_rows = goal_rows(old_count, &heads);
             let base = std::env::temp_dir().join(format!(
@@ -320,7 +308,7 @@ mod tests {
             ));
             let current = base.with_extension("current.safetensors");
             let old = base.with_extension(format!("v{version}.safetensors"));
-            let output = base.with_extension("v58.safetensors");
+            let output = base.with_extension("v59.safetensors");
             let mut model = AzNnue::random(8, 1903);
             if version >= 56.0 {
                 model.goal_scale.fill(0.3);

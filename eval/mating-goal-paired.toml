@@ -1,5 +1,5 @@
 # 固定配对评测局面：每个局面展开到全部具名目标。
-targets = ["double_cannon", "iron_bolt", "horse_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks"]
+targets = ["double_cannon", "iron_bolt", "horse_cannon", "high_angler_horse"]
 
 [[cases]]
 name = "start"

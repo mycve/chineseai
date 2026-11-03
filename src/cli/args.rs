@@ -21,7 +21,7 @@ pub(crate) struct Cli {
 pub(crate) enum CliCommand {
     /// Create a random AZ-NNUE model.
     AzInit(AzInitArgs),
-    /// 将 v54/v55/v56/v57 模型升级为 11 类目标，保留其余权重。
+    /// 将 v54 至 v58 模型升级为 4 类目标，保留其余权重。
     AzUpgradeMatingTargets(AzUpgradeMatingTargetsArgs),
     /// Scale one policy component for structural ablation.
     AzPolicyScale(AzPolicyScaleArgs),
@@ -195,7 +195,7 @@ pub(crate) struct AzSearchArgs {
     /// Scale non-terminal network values during search; 0 isolates policy priors.
     #[arg(long, default_value_t = 1.0)]
     pub(crate) value_scale: f32,
-    /// 指定杀法，例如 double-cannon、iron-bolt、horse-cannon、elbow-horse；none 关闭。
+    /// 指定杀法：double-cannon、iron-bolt、horse-cannon、high-angler-horse；none 关闭。
     #[arg(long, default_value = "iron-bolt")]
     pub(crate) mating_target: chineseai::az::MatingTarget,
     /// 杀法偏好强度，范围 0..1；0 关闭偏好。

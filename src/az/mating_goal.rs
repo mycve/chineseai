@@ -21,11 +21,7 @@ fn horse_finish_distances() -> &'static [[u8; 90]; MATING_TARGET_COUNT * 2] {
         for color in [Color::Red, Color::Black] {
             for target in MatingTarget::ALL {
                 let squares: &[(usize, usize)] = match target {
-                    MatingTarget::ElbowHorse => &[(2, 1), (6, 1)],
-                    MatingTarget::PalaceCornerHorse => &[(3, 2), (5, 2)],
-                    MatingTarget::AnglerHorse => &[(2, 2), (6, 2)],
                     MatingTarget::HighAnglerHorse => &[(2, 3), (6, 3)],
-                    MatingTarget::OctagonalHorse => &[(3, 0), (5, 0), (3, 2), (5, 2)],
                     _ => continue,
                 };
                 let row = usize::from(color == Color::Black) * MATING_TARGET_COUNT
@@ -63,7 +59,7 @@ macro_rules! mating_targets {
         pub enum MatingTarget { #[default] None, $($variant),+ }
 
         impl MatingTarget {
-            pub const ALL: [Self; 11] = [$(Self::$variant),+];
+            pub const ALL: [Self; 4] = [$(Self::$variant),+];
             pub fn index(self) -> Option<usize> {
                 (self != Self::None).then_some(self as usize).map(|code| code - 1)
             }
@@ -83,14 +79,11 @@ macro_rules! mating_targets {
     };
 }
 
-// 当前 v49 回放的目标顺序；删除类别后已升级格式，禁止旧编号混用。
+// 当前 v50 回放的目标顺序；删除类别后已升级格式，禁止旧编号混用。
 mating_targets! {
     DoubleCannon => "double_cannon", IronBolt => "iron_bolt",
     HorseCannon => "horse_cannon",
-    WhiteFacedGeneral => "white_faced_general", ElbowHorse => "elbow_horse",
-    PalaceCornerHorse => "palace_corner_horse", AnglerHorse => "angler_horse",
-    OctagonalHorse => "octagonal_horse", HighAnglerHorse => "high_angler_horse",
-    DoubleHorse => "double_horse", CrossRooks => "cross_rooks",
+    HighAnglerHorse => "high_angler_horse",
 }
 
 pub const MATING_TARGET_COUNT: usize = MatingTarget::ALL.len();
@@ -167,14 +160,7 @@ impl AzMatingGoal {
 
     /// 非终局的乐观完成步数下界；忽略蹩腿和占位，只用于排除不可能更短的证明。
     pub(crate) fn minimum_finish_plies(self, position: &Position) -> u32 {
-        let distance = if matches!(
-            self.target,
-            MatingTarget::ElbowHorse
-                | MatingTarget::PalaceCornerHorse
-                | MatingTarget::AnglerHorse
-                | MatingTarget::OctagonalHorse
-                | MatingTarget::HighAnglerHorse
-        ) {
+        let distance = if self.target == MatingTarget::HighAnglerHorse {
             let row = usize::from(self.side == Color::Black) * MATING_TARGET_COUNT
                 + self.target.index().unwrap();
             position
@@ -208,14 +194,12 @@ impl AzMatingGoal {
         let mut finishers = 0;
         let mut defenders = 0;
         let mut horses = 0;
-        let mut rooks = 0;
         let mut attackers = 0;
         for sq in position.occupied_squares() {
             let piece = position.piece_at(sq).unwrap();
             if piece.color == self.side {
                 cannons += usize::from(piece.kind == PieceKind::Cannon);
                 horses += usize::from(piece.kind == PieceKind::Horse);
-                rooks += usize::from(piece.kind == PieceKind::Rook);
                 attackers += usize::from(piece.kind != PieceKind::General);
                 finishers +=
                     usize::from(matches!(piece.kind, PieceKind::Rook | PieceKind::Soldier));
@@ -228,13 +212,7 @@ impl AzMatingGoal {
             MatingTarget::DoubleCannon => cannons >= 2,
             MatingTarget::IronBolt => cannons >= 1 && finishers >= 1 && defenders >= 1,
             MatingTarget::HorseCannon => cannons >= 1 && horses >= 1,
-            MatingTarget::DoubleHorse => horses >= 2,
-            MatingTarget::CrossRooks => rooks >= 2,
-            MatingTarget::ElbowHorse | MatingTarget::PalaceCornerHorse => horses >= 1,
-            MatingTarget::AnglerHorse
-            | MatingTarget::OctagonalHorse
-            | MatingTarget::HighAnglerHorse => horses >= 1 && attackers >= 2,
-            MatingTarget::WhiteFacedGeneral => attackers >= 1,
+            MatingTarget::HighAnglerHorse => horses >= 1 && attackers >= 2,
         };
         if possible { self } else { Self::NONE }
     }
@@ -302,9 +280,6 @@ impl AzMatingGoal {
         let mut cannon_count = 0;
         let mut approach = 0.0f32;
         let mut horse = 0.0f32;
-        let mut horse_sum = 0.0f32;
-        let mut rook = 0.0f32;
-        let mut near = 0.0f32;
         let extended = !matches!(
             self.target,
             MatingTarget::DoubleCannon | MatingTarget::IronBolt
@@ -323,56 +298,16 @@ impl AzMatingGoal {
                     cannon_count += 1;
                 }
             }
-            if extended {
-                let proximity = closeness(sq, king_file, king / 9);
-                if piece.kind != PieceKind::General {
-                    near = near.max(proximity);
-                }
-                match piece.kind {
-                    PieceKind::Horse => {
-                        let (files, rank) = match self.target {
-                            MatingTarget::ElbowHorse => ([2, 6], 1),
-                            MatingTarget::OctagonalHorse
-                                if matches!(king_file, 3 | 5)
-                                    && matches!((king / 9).abs_diff(home), 0 | 2) =>
-                            {
-                                ([8 - king_file; 2], 2 - (king / 9).abs_diff(home))
-                            }
-                            MatingTarget::PalaceCornerHorse | MatingTarget::OctagonalHorse => {
-                                ([3, 5], 2)
-                            }
-                            MatingTarget::AnglerHorse => ([2, 6], 2),
-                            MatingTarget::HighAnglerHorse => ([2, 6], 3),
-                            MatingTarget::HorseCannon => ([king_file; 2], 2),
-                            _ => ([king_file; 2], 1),
-                        };
-                        let rank = if self.side == Color::Red {
-                            rank
-                        } else {
-                            9 - rank
-                        };
-                        let score = if matches!(
-                            self.target,
-                            MatingTarget::ElbowHorse
-                                | MatingTarget::PalaceCornerHorse
-                                | MatingTarget::AnglerHorse
-                                | MatingTarget::HighAnglerHorse
-                        ) {
-                            let row = usize::from(self.side == Color::Black) * MATING_TARGET_COUNT
-                                + self.target.index().unwrap();
-                            1.0 / (1.0 + f32::from(horse_finish_distances()[row][sq]))
-                        } else {
-                            files
-                                .into_iter()
-                                .map(|f| closeness(sq, f, rank))
-                                .fold(0.0, f32::max)
-                        };
-                        horse = horse.max(score);
-                        horse_sum += score;
-                    }
-                    PieceKind::Rook => rook += proximity,
-                    _ => {}
-                }
+            if extended && piece.kind == PieceKind::Horse {
+                let score = if self.target == MatingTarget::HighAnglerHorse {
+                    let row = usize::from(self.side == Color::Black) * MATING_TARGET_COUNT
+                        + self.target.index().unwrap();
+                    1.0 / (1.0 + f32::from(horse_finish_distances()[row][sq]))
+                } else {
+                    let rank = if self.side == Color::Red { 2 } else { 7 };
+                    closeness(sq, king_file, rank)
+                };
+                horse = horse.max(score);
             }
             if matches!(piece.kind, PieceKind::Rook | PieceKind::Soldier) {
                 let distance =
@@ -418,17 +353,7 @@ impl AzMatingGoal {
                     .fold(0.0, f32::max);
                 0.5 * horse + 0.3 * cannon
             }
-            MatingTarget::ElbowHorse
-            | MatingTarget::PalaceCornerHorse
-            | MatingTarget::AnglerHorse
-            | MatingTarget::OctagonalHorse
-            | MatingTarget::HighAnglerHorse => 0.8 * horse,
-            MatingTarget::DoubleHorse => 0.4 * horse_sum,
-            MatingTarget::CrossRooks => 0.4 * rook,
-            MatingTarget::WhiteFacedGeneral => {
-                let general = position.general_square(self.side).unwrap();
-                0.4 * (1.0 - (general % 9).abs_diff(king_file) as f32 / 8.0) + 0.4 * near
-            }
+            MatingTarget::HighAnglerHorse => 0.8 * horse,
         }
     }
 }
@@ -510,6 +435,20 @@ mod tests {
             "two_ghosts",
             "two-ghosts",
             "二鬼拍门",
+            "white_faced_general",
+            "白脸将",
+            "elbow_horse",
+            "卧槽马",
+            "palace_corner_horse",
+            "挂角马",
+            "angler_horse",
+            "钓鱼马",
+            "octagonal_horse",
+            "八角马",
+            "double_horse",
+            "双马饮泉",
+            "cross_rooks",
+            "双车错",
         ] {
             assert!(removed.parse::<MatingTarget>().is_err());
         }
