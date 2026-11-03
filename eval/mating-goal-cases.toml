@@ -1,0 +1,121 @@
+# 教学杀局诊断“兑现能力”，不作为全局成功率样本。与 tests/mating_patterns.rs 同源。
+[[cases]]
+name = "重炮一步杀"
+stage = "mate_in_one"
+fen = "2bakab2/9/9/4C4/9/7C1/9/9/9/4K4 w"
+target = "double_cannon"
+side = "red"
+
+[[cases]]
+name = "铁门栓一步杀"
+stage = "mate_in_one"
+fen = "2bak4/4a4/4b4/4C4/9/9/5R3/9/9/5K3 w"
+target = "iron_bolt"
+side = "red"
+
+[[cases]]
+name = "马后炮一步杀"
+stage = "mate_in_one"
+fen = "4k4/9/4N4/9/9/9/7C1/9/9/4K4 w"
+target = "horse_cannon"
+side = "red"
+
+[[cases]]
+name = "天地炮一步杀"
+stage = "mate_in_one"
+fen = "2b1k4/1P2a4/4b4/9/4C4/9/C8/9/9/4K4 w"
+target = "heaven_earth_cannon"
+side = "red"
+
+[[cases]]
+name = "闷宫一步杀"
+stage = "mate_in_one"
+fen = "4ka3/4a4/9/9/9/6C2/9/9/9/5K3 w"
+target = "smothered_cannon"
+side = "red"
+
+[[cases]]
+name = "白脸将一步杀"
+stage = "mate_in_one"
+fen = "3k2b2/9/1N1P5/9/9/9/9/9/9/4K4 w"
+target = "white_faced_general"
+side = "red"
+
+[[cases]]
+name = "卧槽马一步杀"
+stage = "mate_in_one"
+fen = "3ak1b2/4a4/9/7N1/9/5R3/9/9/9/4K4 w"
+target = "elbow_horse"
+side = "red"
+
+[[cases]]
+name = "挂角马一步杀"
+stage = "mate_in_one"
+fen = "3aka3/3P5/9/9/6N2/9/9/9/9/3K5 w"
+target = "palace_corner_horse"
+side = "red"
+
+[[cases]]
+name = "钓鱼马一步杀"
+stage = "mate_in_one"
+fen = "4k4/9/6N2/9/9/9/9/9/3R5/3K5 w"
+target = "angler_horse"
+side = "red"
+
+[[cases]]
+name = "八角马一步杀"
+stage = "mate_in_one"
+fen = "3k5/9/5N3/9/9/9/9/9/2R6/5K3 w"
+target = "octagonal_horse"
+side = "red"
+
+[[cases]]
+name = "高钓马一步杀"
+stage = "mate_in_one"
+fen = "3k5/1R7/9/2N6/9/9/9/9/9/4K4 w"
+target = "high_angler_horse"
+side = "red"
+
+[[cases]]
+name = "双马饮泉一步杀"
+stage = "mate_in_one"
+fen = "4ka3/9/2N1N4/9/9/9/9/9/9/3K5 w"
+target = "double_horse"
+side = "red"
+
+[[cases]]
+name = "双车错一步杀"
+stage = "mate_in_one"
+fen = "4k4/7R1/9/9/9/9/9/9/R8/3K5 w"
+target = "cross_rooks"
+side = "red"
+
+[[cases]]
+name = "二鬼拍门一步杀"
+stage = "mate_in_one"
+fen = "2b1kab2/3P1P3/9/9/9/9/9/9/9/5K3 w"
+target = "two_ghosts"
+side = "red"
+
+[[cases]]
+name = "放过普通一手杀形成重炮"
+stage = "choice_conflict"
+fen = "3aka3/R8/6N2/p3C3p/9/6PC1/9/9/9/4K4 w"
+target = "double_cannon"
+side = "red"
+root_moves = ["a8e8", "h4h3"]
+
+# 初始局面相同，分别关闭和开启这两个目标；不掺入教学杀局的分母。
+[[cases]]
+name = "标准开局重炮"
+stage = "opening"
+fen = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
+target = "double_cannon"
+side = "red"
+
+[[cases]]
+name = "标准开局铁门栓"
+stage = "opening"
+fen = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
+target = "iron_bolt"
+side = "red"

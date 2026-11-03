@@ -1,0 +1,30 @@
+# 固定配对评测局面：每个局面展开到全部具名目标。
+targets = ["double_cannon", "iron_bolt", "horse_cannon", "heaven_earth_cannon", "smothered_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks", "two_ghosts"]
+
+[[cases]]
+name = "start"
+stage = "opening"
+fen = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
+side = "red"
+moves = []
+
+[[cases]]
+name = "central-cannons"
+stage = "opening"
+fen = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
+side = "red"
+moves = ["b2e2", "h7e7", "h0g2", "h9g7", "b0c2", "b9c7", "a0b0", "a9b9"]
+
+[[cases]]
+name = "ordinary-ply24"
+stage = "midgame"
+fen = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
+side = "red"
+moves = ["h2e2", "h7e7", "h0g2", "h9g7", "i0h0", "b9a7", "b0a2", "d9e8", "g3g4", "b7c7", "a0b0", "a9b9", "b2b6", "i9h9", "h0h9", "g7h9", "g2f4", "e7e3", "d0e1", "c7e7", "b6e6", "b9b0", "a2b0", "h9g7"]
+
+[[cases]]
+name = "ordinary-ply48"
+stage = "midgame"
+fen = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
+side = "red"
+moves = ["h2e2", "h7e7", "h0g2", "h9g7", "i0h0", "b9a7", "b0a2", "d9e8", "g3g4", "b7c7", "a0b0", "a9b9", "b2b6", "i9h9", "h0h9", "g7h9", "g2f4", "e7e3", "d0e1", "c7e7", "b6e6", "b9b0", "a2b0", "h9g7", "e6e4", "e3g3", "c3c4", "a6a5", "b0c2", "a7b5", "e4e5", "g3c3", "c4c5", "b5a7", "c5d5", "c6c5", "d5c5", "e9d9", "e2d2", "c3c0", "c2d4", "d9e9", "f4g6", "c0c3", "g4g5", "c3g3", "e0d0", "a7c8"]

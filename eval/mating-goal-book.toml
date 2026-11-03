@@ -1,0 +1,99 @@
+# 固定配对评测局面：每个局面展开到全部具名目标。
+# 来源：现有 book.pgn.gz，共3210663局面，Python Random(20261103) 无放回 reservoir 抽取16个；不按对局结果筛选。
+targets = ["double_cannon", "iron_bolt", "horse_cannon", "heaven_earth_cannon", "smothered_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks", "two_ghosts"]
+
+[[cases]]
+name = "book-191556"
+stage = "book_opening"
+fen = "2bakab2/9/2n2crc1/p3p4/2p2r2p/1R3N3/P1P1P3P/2N1B1C2/4A4/3AK1BR1 w"
+side = "red"
+
+[[cases]]
+name = "book-312292"
+stage = "book_opening"
+fen = "2baka3/c5r2/2n1b1c1n/p3p3p/5Rp2/2pR2P2/P3P3P/C1N1N2r1/6C2/2BAKAB2 w"
+side = "red"
+
+[[cases]]
+name = "book-819395"
+stage = "book_opening"
+fen = "r2akab2/3n4r/2c3nc1/p3p1p1p/2b6/6P1P/P3P4/2C3C2/R8/1NBAKABNR w"
+side = "red"
+
+[[cases]]
+name = "book-1147288"
+stage = "book_opening"
+fen = "1rbaka2r/9/1cn1b2c1/pR2p3p/9/5Np2/P3P3P/2N1B2C1/9/2BAKA2R w"
+side = "red"
+
+[[cases]]
+name = "book-1281253"
+stage = "book_opening"
+fen = "2bak1r2/n3a1c2/4b1n2/p3p3p/6pc1/2PN1R3/3rP1P1P/4C1N2/2C2R3/2BAKAB2 w"
+side = "red"
+
+[[cases]]
+name = "book-1341363"
+stage = "book_opening"
+fen = "1nbakr3/4a4/c3b2c1/p1C1p3p/6p2/2P6/P3P1n1P/C1N3N2/R8/2BAKAB2 w"
+side = "red"
+
+[[cases]]
+name = "book-1461907"
+stage = "book_opening"
+fen = "2bak4/1R2a4/n1cCb4/p1p1p3p/5nr2/P1P1P4/4N3P/3CB1N2/4A4/2BAK2r1 w"
+side = "red"
+
+[[cases]]
+name = "book-1685992"
+stage = "book_opening"
+fen = "r1bakabnr/9/2n5c/p1p1p1p1p/9/9/PcP1P1P1P/NC5C1/4A3R/R1B1KABN1 w"
+side = "red"
+
+[[cases]]
+name = "book-1798620"
+stage = "book_opening"
+fen = "rnbakabnr/9/6c2/p1C1p1p2/8p/9/PcP1P1P1P/1C6N/9/RNBAKAB1R w"
+side = "red"
+
+[[cases]]
+name = "book-2203910"
+stage = "book_opening"
+fen = "rnbakab1r/9/1c6n/p1p1p1p1p/2c6/5C3/P1P1P1P1P/N6C1/9/R1BAKABNR w"
+side = "red"
+
+[[cases]]
+name = "book-2391908"
+stage = "book_opening"
+fen = "rnbakabnr/9/3c4c/pC2p1p1p/2p6/9/P1P1P1P1P/N7C/9/R1BAKABNR w"
+side = "red"
+
+[[cases]]
+name = "book-2447494"
+stage = "book_opening"
+fen = "rnb1kabnr/4a1c2/7c1/p1p1p1p1p/9/9/P1P1P1P1P/N4C3/7C1/R1BAKABNR w"
+side = "red"
+
+[[cases]]
+name = "book-2571049"
+stage = "book_opening"
+fen = "rnbakabnr/9/3c2c2/p3p1p1p/2p6/6P2/P1P1P3P/1C7/8C/RNBAKABNR w"
+side = "red"
+
+[[cases]]
+name = "book-2625429"
+stage = "book_opening"
+fen = "rnbakabnr/9/1c2c4/p3p1p2/2p5p/7C1/P1P1P1P1P/4B2C1/9/RNBAKA1NR w"
+side = "red"
+
+[[cases]]
+name = "book-2696337"
+stage = "book_opening"
+fen = "rnbakab1r/9/4c2cn/p1p1p3p/6p2/8P/P1P1P1P2/7C1/2C6/RNBAKABNR w"
+side = "red"
+
+[[cases]]
+name = "book-2727793"
+stage = "book_opening"
+fen = "1nbakabnr/r8/3c5/p1p1p1p1p/9/6P2/P1P1P2cP/BC3C3/9/RN1AKABNR w"
+side = "red"

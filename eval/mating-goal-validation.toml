@@ -1,0 +1,98 @@
+# 独立验证：排除第一批16个局面，Random(20261104) 无放回抽取；只验证0.4与0.8。
+targets = ["double_cannon", "iron_bolt", "horse_cannon", "heaven_earth_cannon", "smothered_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks", "two_ghosts"]
+
+[[cases]]
+name = "validation-91344"
+stage = "book_validation"
+fen = "2bakab1r/9/n1c3c1n/p3p1p1p/3r5/2p3PN1/P3P3P/BC2B2C1/3N4R/1R1AKA3 w"
+side = "red"
+
+[[cases]]
+name = "validation-287363"
+stage = "book_validation"
+fen = "2baka3/1rc6/nCc1b1n2/4p3p/p5p2/2pN4P/P3P1P2/1R2B1C1N/4A4/4KAB2 w"
+side = "red"
+
+[[cases]]
+name = "validation-293112"
+stage = "book_validation"
+fen = "r2ak1bn1/4a4/n1c1b2c1/p3r1p1p/9/1C3C1R1/P3P1P1P/B2p1NN2/4A4/R3KAB2 w"
+side = "red"
+
+[[cases]]
+name = "validation-331495"
+stage = "book_validation"
+fen = "1r2kab2/4a4/2n1b1c2/p3p4/1cP3pn1/1r7/P3P1P2/2NC1RC1N/4A4/2B1KAB2 w"
+side = "red"
+
+[[cases]]
+name = "validation-434219"
+stage = "book_validation"
+fen = "rnbaka1nr/9/1c2bc3/p1p1p3p/6p2/9/P1P1P1P1P/C3C4/4A4/RNB1KABNR w"
+side = "red"
+
+[[cases]]
+name = "validation-638903"
+stage = "book_validation"
+fen = "rnbakabnr/9/2c6/p3p1p1p/2p6/7C1/PcP1P1P1P/1C7/4A4/RNBAK1BNR w"
+side = "red"
+
+[[cases]]
+name = "validation-691947"
+stage = "book_validation"
+fen = "rnbakabnr/9/1c5c1/4p1p1p/2p6/p8/P1P1P1P1P/2C1B2C1/9/RN1AKABNR w"
+side = "red"
+
+[[cases]]
+name = "validation-955799"
+stage = "book_validation"
+fen = "r1bak1br1/1R2a4/2n2cn2/p3p1p1p/2p6/9/P1P1c1P1P/2NCBCN2/4A4/2BAK3R w"
+side = "red"
+
+[[cases]]
+name = "validation-1360183"
+stage = "book_validation"
+fen = "2baka1r1/5r3/2n1b1n2/p7p/2p1p1c2/1R3N3/P1P1N1c1P/C3C4/9/2BAKABR1 w"
+side = "red"
+
+[[cases]]
+name = "validation-1525192"
+stage = "book_validation"
+fen = "2baka3/9/nCc1b1n2/2pcp3p/p6r1/2P1P4/P3N3P/3CB1N2/9/1RBAKA3 w"
+side = "red"
+
+[[cases]]
+name = "validation-1612937"
+stage = "book_validation"
+fen = "rn1akabnr/9/1c2b4/p1p1p1p1p/9/9/P1P1c1P1P/1C2C3B/4A4/RNBAK2NR w"
+side = "red"
+
+[[cases]]
+name = "validation-1648590"
+stage = "book_validation"
+fen = "rnbak3r/4a4/1c2b1nc1/p1p1p1p1p/9/2P6/P3P1P1P/N3C2C1/9/R1BAKABNR w"
+side = "red"
+
+[[cases]]
+name = "validation-1738063"
+stage = "book_validation"
+fen = "rnbakab1r/9/6n2/p1p1p1p1p/1c7/9/P1P1P1P1P/4B1Cc1/7C1/RN1AKABNR w"
+side = "red"
+
+[[cases]]
+name = "validation-1835855"
+stage = "book_validation"
+fen = "rn1ak1bnr/4a4/1c2b2c1/p3p1p1p/2p6/9/P1P1P1P1P/1C6C/5R3/RNBAKABN1 w"
+side = "red"
+
+[[cases]]
+name = "validation-2207535"
+stage = "book_validation"
+fen = "r2akabnr/3n5/1c2b3c/p1p1p1p1p/9/6P2/P1P1P3P/2C3C2/9/RNBAKABNR w"
+side = "red"
+
+[[cases]]
+name = "validation-2270136"
+stage = "book_validation"
+fen = "rn1akabnr/9/4b2c1/p1p1p3p/6p2/9/P1P1P1P1P/Cc3C3/4A4/RNB1KABNR w"
+side = "red"
