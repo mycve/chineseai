@@ -555,12 +555,12 @@ mod tests {
     #[test]
     fn paired_suites_expand_without_illegal_or_terminal_starts() {
         for (text, expected) in [
-            (include_str!("../eval/mating-goal-paired.toml"), 48),
-            (include_str!("../eval/mating-goal-book.toml"), 192),
-            (include_str!("../eval/mating-goal-validation.toml"), 192),
-            (include_str!("../eval/mating-goal-speed-holdout.toml"), 96),
+            (include_str!("../eval/mating-goal-paired.toml"), 44),
+            (include_str!("../eval/mating-goal-book.toml"), 176),
+            (include_str!("../eval/mating-goal-validation.toml"), 176),
+            (include_str!("../eval/mating-goal-speed-holdout.toml"), 88),
             (include_str!("../eval/mating-goal-user-history.toml"), 3),
-            (include_str!("../eval/mating-goal-endgame.toml"), 37),
+            (include_str!("../eval/mating-goal-endgame.toml"), 34),
         ] {
             let cases = toml::from_str::<Suite>(text).unwrap().expand().unwrap();
             assert_eq!(cases.len(), expected);

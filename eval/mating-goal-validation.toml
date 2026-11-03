@@ -1,5 +1,5 @@
 # 独立验证：排除第一批16个局面，Random(20261104) 无放回抽取；只验证0.4与0.8。
-targets = ["double_cannon", "iron_bolt", "horse_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks", "two_ghosts"]
+targets = ["double_cannon", "iron_bolt", "horse_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks"]
 
 [[cases]]
 name = "validation-91344"

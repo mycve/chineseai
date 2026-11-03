@@ -11,7 +11,7 @@ pub enum MateKind {
     Stalemate,
 }
 
-/// 仅保留已确认的 12 种具名杀法；同一终局可以命中多种。
+/// 仅保留已确认的 11 种具名杀法；同一终局可以命中多种。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum MatingPattern {
     DoubleCannon,
@@ -25,11 +25,10 @@ pub enum MatingPattern {
     HighAnglerHorse,
     DoubleHorse,
     CrossRooks,
-    TwoGhosts,
 }
 
 impl MatingPattern {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::DoubleCannon,
         Self::IronBolt,
         Self::HorseCannon,
@@ -41,7 +40,6 @@ impl MatingPattern {
         Self::HighAnglerHorse,
         Self::DoubleHorse,
         Self::CrossRooks,
-        Self::TwoGhosts,
     ];
 
     pub fn name(self) -> &'static str {
@@ -49,7 +47,6 @@ impl MatingPattern {
             Self::DoubleCannon => "重炮",
             Self::HorseCannon => "马后炮",
             Self::IronBolt => "铁门栓",
-            Self::TwoGhosts => "二鬼拍门",
             Self::WhiteFacedGeneral => "白脸将",
             Self::ElbowHorse => "卧槽马",
             Self::PalaceCornerHorse => "挂角马",
@@ -240,24 +237,6 @@ impl MateContext<'_> {
                 }) && self
                     .pieces(PieceKind::Cannon)
                     .any(|sq| self.central_pin(sq))
-            }
-            TwoGhosts => {
-                let door_piece = |sq| {
-                    self.position.piece_at(sq).is_some_and(|p| {
-                        p.color == self.winner
-                            && matches!(p.kind, PieceKind::Rook | PieceKind::Soldier)
-                    }) && self.rank(sq) <= 1
-                };
-                let active = |sq| self.checkers.contains(&sq) || self.denies_escape(sq);
-                self.position.occupied_squares().any(|left| {
-                    file_of(left) == 3
-                        && door_piece(left)
-                        && active(left)
-                        && self
-                            .position
-                            .occupied_squares()
-                            .any(|right| file_of(right) == 5 && door_piece(right) && active(right))
-                })
             }
             WhiteFacedGeneral => {
                 self.denies_escape(self.position.general_square(self.winner).unwrap())

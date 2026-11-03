@@ -77,13 +77,6 @@ target = "cross_rooks"
 side = "red"
 
 [[cases]]
-name = "二鬼拍门一步杀"
-stage = "mate_in_one"
-fen = "2b1kab2/3P1P3/9/9/9/9/9/9/9/5K3 w"
-target = "two_ghosts"
-side = "red"
-
-[[cases]]
 name = "放过普通一手杀形成重炮"
 stage = "choice_conflict"
 fen = "3aka3/R8/6N2/p3C3p/9/6PC1/9/9/9/4K4 w"

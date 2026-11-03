@@ -63,7 +63,7 @@ macro_rules! mating_targets {
         pub enum MatingTarget { #[default] None, $($variant),+ }
 
         impl MatingTarget {
-            pub const ALL: [Self; 12] = [$(Self::$variant),+];
+            pub const ALL: [Self; 11] = [$(Self::$variant),+];
             pub fn index(self) -> Option<usize> {
                 (self != Self::None).then_some(self as usize).map(|code| code - 1)
             }
@@ -83,14 +83,14 @@ macro_rules! mating_targets {
     };
 }
 
-// 当前 v48 回放的目标顺序；删除两类后已升级格式，禁止旧编号混用。
+// 当前 v49 回放的目标顺序；删除类别后已升级格式，禁止旧编号混用。
 mating_targets! {
     DoubleCannon => "double_cannon", IronBolt => "iron_bolt",
     HorseCannon => "horse_cannon",
     WhiteFacedGeneral => "white_faced_general", ElbowHorse => "elbow_horse",
     PalaceCornerHorse => "palace_corner_horse", AnglerHorse => "angler_horse",
     OctagonalHorse => "octagonal_horse", HighAnglerHorse => "high_angler_horse",
-    DoubleHorse => "double_horse", CrossRooks => "cross_rooks", TwoGhosts => "two_ghosts",
+    DoubleHorse => "double_horse", CrossRooks => "cross_rooks",
 }
 
 pub const MATING_TARGET_COUNT: usize = MatingTarget::ALL.len();
@@ -228,7 +228,6 @@ impl AzMatingGoal {
             MatingTarget::DoubleCannon => cannons >= 2,
             MatingTarget::IronBolt => cannons >= 1 && finishers >= 1 && defenders >= 1,
             MatingTarget::HorseCannon => cannons >= 1 && horses >= 1,
-            MatingTarget::TwoGhosts => finishers >= 2,
             MatingTarget::DoubleHorse => horses >= 2,
             MatingTarget::CrossRooks => rooks >= 2,
             MatingTarget::ElbowHorse | MatingTarget::PalaceCornerHorse => horses >= 1,
@@ -305,7 +304,6 @@ impl AzMatingGoal {
         let mut horse = 0.0f32;
         let mut horse_sum = 0.0f32;
         let mut rook = 0.0f32;
-        let mut soldier = 0.0f32;
         let mut near = 0.0f32;
         let extended = !matches!(
             self.target,
@@ -372,19 +370,7 @@ impl AzMatingGoal {
                         horse = horse.max(score);
                         horse_sum += score;
                     }
-                    PieceKind::Rook => {
-                        rook += proximity;
-                        soldier += [3, 5]
-                            .into_iter()
-                            .map(|f| closeness(sq, f, home))
-                            .fold(0.0, f32::max);
-                    }
-                    PieceKind::Soldier => {
-                        soldier += [3, 5]
-                            .into_iter()
-                            .map(|f| closeness(sq, f, home))
-                            .fold(0.0, f32::max);
-                    }
+                    PieceKind::Rook => rook += proximity,
                     _ => {}
                 }
             }
@@ -439,7 +425,6 @@ impl AzMatingGoal {
             | MatingTarget::HighAnglerHorse => 0.8 * horse,
             MatingTarget::DoubleHorse => 0.4 * horse_sum,
             MatingTarget::CrossRooks => 0.4 * rook,
-            MatingTarget::TwoGhosts => 0.4 * soldier,
             MatingTarget::WhiteFacedGeneral => {
                 let general = position.general_square(self.side).unwrap();
                 0.4 * (1.0 - (general % 9).abs_diff(king_file) as f32 / 8.0) + 0.4 * near
@@ -522,6 +507,9 @@ mod tests {
             "smothered_cannon",
             "天地炮",
             "闷宫",
+            "two_ghosts",
+            "two-ghosts",
+            "二鬼拍门",
         ] {
             assert!(removed.parse::<MatingTarget>().is_err());
         }

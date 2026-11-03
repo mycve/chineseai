@@ -5,7 +5,7 @@ pub(crate) fn upgrade_mating_targets(cmd: AzUpgradeMatingTargetsArgs) {
     AzNnue::upgrade_mating_targets(&cmd.input, &cmd.output)
         .unwrap_or_else(|err| panic!("杀法目标迁移失败: {err}"));
     println!(
-        "模型已转换至 v57、12 种具名杀法：{} -> {}。保留对应已训练权重，缺失目标门控补零；请使用新配置路径重建优化器和 v48 经验池。",
+        "模型已转换至 v58、11 种具名杀法：{} -> {}。保留对应已训练权重，缺失目标门控补零；请使用新配置路径重建优化器和 v49 经验池。",
         cmd.input, cmd.output
     );
 }

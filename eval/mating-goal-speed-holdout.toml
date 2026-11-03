@@ -1,5 +1,5 @@
 # 额外八局面：seed=20261105，均匀reservoir抽样，排除此前32局面，不按结果筛选。
-targets = ["double_cannon", "iron_bolt", "horse_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks", "two_ghosts"]
+targets = ["double_cannon", "iron_bolt", "horse_cannon", "white_faced_general", "elbow_horse", "palace_corner_horse", "angler_horse", "octagonal_horse", "high_angler_horse", "double_horse", "cross_rooks"]
 
 [[cases]]
 name = "speed-holdout-2052729"

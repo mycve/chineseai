@@ -182,7 +182,7 @@ scene!(
     two_soldiers,
     "2b1kab2/3P1P3/9/9/9/9/9/9/9/5K3 w",
     ["f8f9"],
-    [TwoGhosts]
+    []
 );
 scene!(
     white_faced_general,
@@ -241,10 +241,10 @@ fn cross_rooks_require_staggered_lines_and_real_support() {
 }
 
 #[test]
-fn two_ghosts_accept_pawn_rook_combinations_without_requiring_them_to_give_check() {
+fn pawn_rook_combinations_are_still_actual_checkmates() {
     for palace in ["3PPP3", "3RPP3", "3RPR3"] {
         let fen = format!("4k4/{palace}/9/9/9/9/9/9/9/3K5 b");
-        assert_scene(&fen, &[], &[MatingPattern::TwoGhosts]);
+        assert_scene(&fen, &[], &[]);
     }
 }
 
@@ -424,7 +424,6 @@ fn two_soldiers_near_the_palace_are_not_enough_without_real_support() {
             .iter()
             .any(|&sq| position.piece_at(sq).unwrap().kind == PieceKind::Soldier)
     );
-    assert!(!report.patterns.contains(&MatingPattern::TwoGhosts));
 }
 
 #[test]
@@ -512,11 +511,6 @@ fn every_named_goal_has_a_causal_piece_and_correct_owner_in_all_orientations() {
             MatingTarget::CrossRooks,
             "R3k4/7R1/9/9/9/9/9/9/9/3K5 b",
             "h8",
-        ),
-        (
-            MatingTarget::TwoGhosts,
-            "2b1kPb2/3P5/9/9/9/9/9/9/9/5K3 b",
-            "d8",
         ),
     ];
     assert_eq!(cases.map(|case| case.0), MatingTarget::ALL);

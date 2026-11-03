@@ -328,7 +328,11 @@ fn handle_setoption(line: &str, state: &mut UciState) {
     match name.as_str() {
         "matingtarget" => match value.to_ascii_lowercase().parse::<MatingTarget>() {
             Ok(target) => state.mating_goal.target = target,
-            Err(error) => println!("info string {error}"),
+            Err(error) => {
+                state.mating_goal.target = MatingTarget::None;
+                *state.goal_plan.lock().unwrap() = None;
+                println!("info string {error}; mating target disabled, using ordinary play");
+            }
         },
         "matingstrength" => {
             let parsed = value
@@ -1379,11 +1383,33 @@ mod tests {
     }
 
     #[test]
+    fn removed_or_invalid_mating_target_falls_back_to_ordinary_play() {
+        let mut state = UciState::default();
+        for value in [
+            "二鬼拍门",
+            "two-ghosts",
+            "two_ghosts",
+            "天地炮",
+            "闷宫",
+            "unknown",
+        ] {
+            state.mating_goal.target = MatingTarget::IronBolt;
+            handle_setoption(
+                &format!("setoption name MatingTarget value {value}"),
+                &mut state,
+            );
+            assert_eq!(state.mating_goal.target, MatingTarget::None);
+            assert!(!state.mating_goal.enabled());
+            assert!(state.goal_plan.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn advertised_chinese_mating_combo_roundtrips_through_setoption() {
         let definition = mating_target_option();
         assert!(definition.starts_with("option name MatingTarget type combo default 铁门栓 var "));
         let values = definition.split(" var ").skip(1).collect::<Vec<_>>();
-        assert_eq!(values.len(), 13);
+        assert_eq!(values.len(), 12);
         let mut state = UciState::default();
         assert_eq!(state.mating_goal.strength, 0.8);
         assert!(state.mating_goal.enabled());

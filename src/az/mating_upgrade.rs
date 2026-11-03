@@ -1,4 +1,4 @@
-//! v54/v55/v56 检查点的显式一次性升级；普通加载器只接受当前格式。
+//! 旧检查点的显式一次性升级；普通加载器只接受当前格式。
 use std::{fs, io, path::Path};
 
 use candle_core::{Device, Var};
@@ -7,7 +7,7 @@ use candle_nn::VarMap;
 use super::inference::{candle_io_error, insert_candle_var, load_candle_f32_tensor};
 use super::{AzNnue, GOAL_CONTEXT_SIZE, MATING_HEAD_SIZE, MATING_TARGET_COUNT};
 
-// v54 的 18 个统计头映射到确认后的 12 类；高钓马、双马饮泉从零初始化。
+// v54 的 18 个统计头映射到确认后的 11 类；高钓马、双马饮泉从零初始化。
 const OLD_HEADS: [Option<usize>; MATING_HEAD_SIZE] = [
     Some(0),
     Some(2),
@@ -20,10 +20,17 @@ const OLD_HEADS: [Option<usize>; MATING_HEAD_SIZE] = [
     None,
     None,
     Some(11),
-    Some(5),
 ];
 
-const V56_HEADS: [usize; MATING_TARGET_COUNT] = [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+const V56_HEADS: [usize; MATING_TARGET_COUNT] = [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12];
+
+fn retained_heads(version: f32) -> (usize, Vec<usize>) {
+    if version == 57.0 {
+        (12, (0..MATING_TARGET_COUNT).collect())
+    } else {
+        (14, V56_HEADS.to_vec())
+    }
+}
 
 fn gather_rows(values: &[f32], width: usize, rows: &[usize]) -> io::Result<Vec<f32>> {
     if width == 0
@@ -41,9 +48,9 @@ fn gather_rows(values: &[f32], width: usize, rows: &[usize]) -> io::Result<Vec<f
         .collect())
 }
 
-fn v56_goal_rows() -> Vec<usize> {
+fn goal_rows(old_count: usize, heads: &[usize]) -> Vec<usize> {
     (0..2)
-        .flat_map(|role| V56_HEADS.map(|row| role * 14 + row))
+        .flat_map(|role| heads.iter().map(move |&row| role * old_count + row))
         .collect()
 }
 
@@ -65,7 +72,7 @@ fn remap_heads(old: &[f32], width: usize, initial: f32) -> io::Result<Vec<f32>> 
 }
 
 impl AzNnue {
-    /// 保留全部旧权重，新目标的条件编码初始化为零。输出必须不存在。
+    /// 保留剩余目标的旧权重，缺失的条件门控补零。输出必须不存在。
     pub fn upgrade_mating_targets(
         input: impl AsRef<Path>,
         output: impl AsRef<Path>,
@@ -76,17 +83,19 @@ impl AzNnue {
         };
         let version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
         let legacy = version == [54.0];
-        if !legacy && version != [55.0] && version != [56.0] {
+        if !legacy && version != [55.0] && version != [56.0] && version != [57.0] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "杀法升级仅接受 v54/v55/v56 模型",
+                "杀法升级仅接受 v54/v55/v56/v57 模型",
             ));
         }
+        let (old_count, heads) = retained_heads(version[0]);
+        let goal_rows = goal_rows(old_count, &heads);
         let old = tensors
             .load("goal_hidden", &Device::Cpu)
             .map_err(candle_io_error)?;
         let (rows, hidden) = old.dims2().map_err(candle_io_error)?;
-        if rows != if legacy { 4 } else { 28 } || hidden == 0 {
+        if rows != if legacy { 4 } else { 2 * old_count } || hidden == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "旧模型 goal_hidden 形状无效",
@@ -105,8 +114,9 @@ impl AzNnue {
                 (3, MATING_TARGET_COUNT + 1),
             ]
         } else {
-            v56_goal_rows()
-                .into_iter()
+            goal_rows
+                .iter()
+                .copied()
                 .enumerate()
                 .map(|(destination, source)| (source, destination))
                 .collect()
@@ -129,43 +139,43 @@ impl AzNnue {
                 }
                 "mating_output" => {
                     let old = load_candle_f32_tensor(&tensors, &name)?;
-                    if !legacy && old.len() != 14 * hidden {
+                    if !legacy && old.len() != old_count * hidden {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "v55/v56 杀法头应为14行",
+                            "旧杀法头行数无效",
                         ));
                     }
                     let values = if legacy {
                         remap_heads(&old, hidden, 0.0)?
                     } else {
-                        gather_rows(&old, hidden, &V56_HEADS)?
+                        gather_rows(&old, hidden, &heads)?
                     };
                     insert_candle_var(&vars, &name, &values, (MATING_HEAD_SIZE, hidden))?;
                 }
                 "mating_bias" => {
                     let old = load_candle_f32_tensor(&tensors, &name)?;
-                    if !legacy && old.len() != 14 {
+                    if !legacy && old.len() != old_count {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "v55/v56 杀法头应为14行",
+                            "旧杀法偏置行数无效",
                         ));
                     }
                     let values = if legacy {
                         remap_heads(&old, 1, -4.0)?
                     } else {
-                        gather_rows(&old, 1, &V56_HEADS)?
+                        gather_rows(&old, 1, &heads)?
                     };
                     insert_candle_var(&vars, &name, &values, (MATING_HEAD_SIZE,))?;
                 }
                 "goal_scale" => {
                     let old = load_candle_f32_tensor(&tensors, &name)?;
-                    if old.len() != 28 * hidden {
+                    if old.len() != 2 * old_count * hidden {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "v56 条件门控应为28行",
+                            "旧条件门控行数无效",
                         ));
                     }
-                    let values = gather_rows(&old, hidden, &v56_goal_rows())?;
+                    let values = gather_rows(&old, hidden, &goal_rows)?;
                     insert_candle_var(&vars, &name, &values, (GOAL_CONTEXT_SIZE, hidden))?;
                 }
                 _ => {
@@ -175,7 +185,7 @@ impl AzNnue {
                 }
             }
         }
-        if version != [56.0] {
+        if legacy || version == [55.0] {
             insert_candle_var(
                 &vars,
                 "goal_scale",
@@ -300,17 +310,19 @@ mod tests {
         }
     }
     #[test]
-    fn v55_v56_upgrade_preserves_remaining_weights_and_learned_gates() {
-        for version in [55.0, 56.0] {
+    fn v55_v56_v57_upgrade_preserves_remaining_weights_and_learned_gates() {
+        for version in [55.0, 56.0, 57.0] {
+            let (old_count, heads) = retained_heads(version);
+            let goal_rows = goal_rows(old_count, &heads);
             let base = std::env::temp_dir().join(format!(
                 "chineseai-v{version}-gate-upgrade-{}",
                 std::process::id()
             ));
             let current = base.with_extension("current.safetensors");
             let old = base.with_extension(format!("v{version}.safetensors"));
-            let output = base.with_extension("v57.safetensors");
+            let output = base.with_extension("v58.safetensors");
             let mut model = AzNnue::random(8, 1903);
-            if version == 56.0 {
+            if version >= 56.0 {
                 model.goal_scale.fill(0.3);
             }
             for (i, value) in model.goal_hidden.iter_mut().enumerate() {
@@ -333,8 +345,8 @@ mod tests {
                         insert_candle_var(
                             &vars,
                             &name,
-                            &pad_rows(values, 8, &v56_goal_rows(), 28),
-                            (28, 8),
+                            &pad_rows(values, 8, &goal_rows, 2 * old_count),
+                            (2 * old_count, 8),
                         )
                         .unwrap();
                     }
@@ -342,8 +354,8 @@ mod tests {
                         insert_candle_var(
                             &vars,
                             &name,
-                            &pad_rows(&model.mating_output, 8, &V56_HEADS, 14),
-                            (14, 8),
+                            &pad_rows(&model.mating_output, 8, &heads, old_count),
+                            (old_count, 8),
                         )
                         .unwrap();
                     }
@@ -351,8 +363,8 @@ mod tests {
                         insert_candle_var(
                             &vars,
                             &name,
-                            &pad_rows(&model.mating_bias, 1, &V56_HEADS, 14),
-                            (14,),
+                            &pad_rows(&model.mating_bias, 1, &heads, old_count),
+                            (old_count,),
                         )
                         .unwrap();
                     }

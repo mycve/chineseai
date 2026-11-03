@@ -1742,7 +1742,6 @@ mod tests {
                         | MatingTarget::HorseCannon
                         | MatingTarget::DoubleHorse
                         | MatingTarget::CrossRooks
-                        | MatingTarget::TwoGhosts
                 ));
             }
         }
