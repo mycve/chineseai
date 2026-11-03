@@ -78,6 +78,19 @@ fn baseline_key(case: &Case) -> BaselineKey {
     )
 }
 
+fn cycle_stats(history: &[RuleHistoryEntry]) -> (usize, usize) {
+    let mut last = BTreeMap::new();
+    let mut repeats = 0;
+    let mut longest = 0;
+    for (ply, entry) in history.iter().enumerate() {
+        if let Some(previous) = last.insert((entry.hash, entry.side_to_move as u8), ply) {
+            repeats += 1;
+            longest = longest.max(ply - previous);
+        }
+    }
+    (repeats, longest)
+}
+
 #[derive(Serialize)]
 struct Pair {
     name: String,
@@ -85,6 +98,8 @@ struct Pair {
     target: MatingTarget,
     side: Color,
     initial_fen: String,
+    initial_cycle_count: usize,
+    initial_longest_cycle_plies: usize,
     goal_available: bool,
     /// 包含现有几何先验，不能单凭此值声称网络学到了目标表征。
     prior_total_variation: f32,
@@ -322,12 +337,15 @@ fn evaluate(
             .classify_mate()
             .is_some_and(|mate| goal.matches_mate(&mate));
     let conditioned = play(model, &position, &history, case, args, true)?;
+    let (initial_cycle_count, initial_longest_cycle_plies) = cycle_stats(&history);
     Ok(Pair {
         name: case.name.clone(),
         stage: case.stage.clone(),
         target: case.target,
         side: case.side,
         initial_fen: position.to_fen_with_history(&history),
+        initial_cycle_count,
+        initial_longest_cycle_plies,
         goal_available: goal.effective(&position).enabled(),
         prior_total_variation,
         learned_prior_total_variation,
@@ -455,6 +473,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_stats_distinguish_full_returns_from_different_positions_and_sides() {
+        let entry = Position::startpos().rule_history_entry(None);
+        let mut history = [1, 2, 3, 4, 5, 6, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(ply, hash)| RuleHistoryEntry {
+                hash,
+                side_to_move: if ply % 2 == 0 {
+                    Color::Red
+                } else {
+                    Color::Black
+                },
+                ..entry
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cycle_stats(&history), (1, 6));
+        history.push(RuleHistoryEntry {
+            hash: 1,
+            side_to_move: Color::Black,
+            ..entry
+        });
+        assert_eq!(cycle_stats(&history), (1, 6));
+    }
 
     #[test]
     fn shared_ordinary_transcript_is_rescored_for_each_target() {

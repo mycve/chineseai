@@ -734,6 +734,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
         }
+        let mut goal_timed_out = false;
         if result.is_none() && !search_failed {
             // 最后一手也可能形成将死、困毙或规则禁着，不能先记作步数截断。
             if position.legal_moves_with_rules(&rule_history).is_empty() {
@@ -745,6 +746,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 terminal.record_no_legal_moves(&position);
             } else {
                 terminal.max_plies += 1;
+                goal_timed_out = true;
             }
         }
 
@@ -754,8 +756,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             && position.has_general(Color::Red)
             && position.has_general(Color::Black);
         let classification = mating_observed.then(|| position.classify_mate()).flatten();
+        // 步数预算用尽时，本盘指令已失败；胜负与杀形仍未知，不能伪造 WDL/杀形标签。
+        // 搜索异常不属于正常超时，继续排除目标监督。
+        let goal_outcome_known = mating_observed || goal_timed_out;
         mating.record(classification.as_ref(), mating_observed);
-        mating.record_goal(mating_goal, classification.as_ref(), mating_observed);
+        mating.record_goal(mating_goal, classification.as_ref(), goal_outcome_known);
         mating.record_result(mating_goal, terminal_result);
         let result: f32 = terminal_result.unwrap_or(0.0);
         match result.total_cmp(&0.0) {
@@ -769,7 +774,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             crate::scope_profile!("az.selfplay.finalize_game");
             finalize_value_targets(&mut game_samples, &game_proofs, terminal_result);
             finalize_mating_targets(&mut game_samples, classification.as_ref(), mating_observed);
-            finalize_goal_targets(&mut game_samples, classification.as_ref(), mating_observed);
+            finalize_goal_targets(
+                &mut game_samples,
+                classification.as_ref(),
+                goal_outcome_known,
+            );
             finalize_moves_left_targets(
                 &mut game_samples,
                 terminal_result
@@ -1067,13 +1076,13 @@ fn finalize_mating_targets(
 fn finalize_goal_targets(
     samples: &mut [AzTrainingSample],
     classification: Option<&MateClassification>,
-    observed: bool,
+    outcome_known: bool,
 ) {
     for sample in samples {
         sample.goal_target = 0.0;
         sample.goal_weight = 0.0;
         let goal = sample.mating_goal;
-        if !observed || !goal.enabled() {
+        if !outcome_known || !goal.enabled() {
             continue;
         }
         let side = if sample.side_sign > 0.0 {
@@ -1634,12 +1643,17 @@ mod tests {
         assert!(
             data.samples
                 .iter()
-                .all(|s| s.goal_weight == 0.0 && s.goal_target == 0.0)
+                .all(|s| s.goal_weight == 1.0 && s.goal_target == 0.0)
         );
         assert_eq!(data.mating.goal_attempts[..2], [1, 0]);
         assert_eq!(data.mating.goal_result_totals().iter().sum::<usize>(), 1);
         assert_eq!(data.mating.ordinary_results, [0; 4]);
-        assert_eq!(data.mating.goal_unknown[..2], [1, 0]);
+        assert_eq!(data.mating.goal_unknown[..2], [0, 0]);
+        assert_eq!(data.mating.goal_result_totals(), [0, 0, 0, 1]);
+        assert_eq!(data.terminal.max_plies, 1);
+        assert!(data.samples.iter().all(|s| s.value_weight == 0.0));
+        assert!(data.samples.iter().all(|s| s.mating_weight == 0.0));
+        assert!(data.samples.iter().all(|s| s.moves_left_weight == 0.0));
     }
 
     #[test]

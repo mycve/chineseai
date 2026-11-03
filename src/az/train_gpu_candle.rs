@@ -768,6 +768,49 @@ mod monitoring_tests {
     }
 
     #[test]
+    fn supervised_goal_failure_lowers_prediction_without_a_wdl_label() {
+        let mut model = AzNnue::random(8, 1916);
+        model.goal_bias[0] = 1.4;
+        let replica = GpuReplica::new_cpu(&model).unwrap();
+        let mut sample = goal_sample();
+        sample.goal_target = 0.0;
+        sample.goal_weight = 1.0;
+        sample.value_weight = 0.0;
+        sample.policy_weight = 0.0;
+        sample.mating_weight = 0.0;
+        sample.moves_left_weight = 0.0;
+        let batch =
+            BatchTensors::from_packed(PackedBatch::from_indices(&[sample], &[0]), &Device::Cpu)
+                .unwrap();
+        let prediction = || {
+            candle_nn::ops::sigmoid(&replica.model.forward(&batch).unwrap().goal_logits)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()[0]
+        };
+        let before = prediction();
+        let (vars, decay) = replica.model.all_vars_with_decay();
+        let mut optimizer = AzAdamW::new(vars, decay, 0.01).unwrap();
+        for _ in 0..8 {
+            let output = replica
+                .compute_batch_loss(&batch, 1, 0.0, 0.0, 0.0, 0.1)
+                .unwrap();
+            assert_eq!(output.stats.goal_samples, 1);
+            assert_eq!(output.stats.goal_target_sum, 0.0);
+            optimizer
+                .step(&output.loss_tensor.backward().unwrap())
+                .unwrap();
+        }
+        let after = prediction();
+        assert!(
+            after < before - 1e-3,
+            "有效失败标签应压低目标预测：{before} -> {after}"
+        );
+    }
+
+    #[test]
     fn masked_rows_do_not_dilute_goal_learning_strength_or_gradients() {
         let mut model = AzNnue::random(8, 1902);
         model.goal_output.fill(0.1);
