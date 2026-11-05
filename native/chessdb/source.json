@@ -1,0 +1,11 @@
+{
+  "source": "https://github.com/noobpwnftw/chessdb",
+  "paths": [
+    "extensions/ccboard/xiangqi.cpp",
+    "extensions/ccboard/xiangqi.h",
+    "extensions/ccegtbprobe/piece_set.h",
+    "extensions/ccegtbprobe/piece_set.cpp",
+    "extensions/ccegtbprobe/ccegtbprobe.cpp"
+  ],
+  "group_sha256": "bfa5048fa2293ea3da9ebe9e98dcfefd840229add8a303f12a386b3fe1bc2630"
+}

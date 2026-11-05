@@ -1,0 +1,4 @@
+索引与棋盘实现来源：https://github.com/noobpwnftw/chessdb
+上游许可见 LICENSE，来源摘要见 source.json。
+index.cpp 包含本项目的初始化和输入检查封装。
+残局表文件不随源码分发；查询结果采用亚洲规则，不能冒充本项目历史棋规的证明。

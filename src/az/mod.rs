@@ -40,6 +40,8 @@ mod sample;
 mod shared;
 mod simd;
 mod start;
+#[cfg(feature = "endgame")]
+pub mod tablebase;
 #[cfg(test)]
 mod tests;
 mod train;

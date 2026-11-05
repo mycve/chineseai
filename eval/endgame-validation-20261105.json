@@ -1,0 +1,299 @@
+{
+  "date": "2026-11-05",
+  "source_model": {
+    "path": "best.safetensors",
+    "format": 59,
+    "sha256": "d5eaeee46813db6a9de6635e65bd7711e724ede6e72205c38be5d2b31f49ef1e"
+  },
+  "converted_model_sha256": "c049d73413dbd14b8560b5a3048e7b74103e3b70dfdad3c5bdb62abec03e3c71",
+  "candidate": {
+    "path": "target/endgame-final-v60.safetensors",
+    "sha256": "59bcd4d8c2567e2d19a4e32ec415df98f2a2236f7d22a4730361684c7dec69e5",
+    "status": "experimental_only_not_promoted"
+  },
+  "public_table_download": {
+    "materials": 209,
+    "files": 418,
+    "bytes": 298990416,
+    "manifest": "data/tablebases/chessdb/download-up-to-5-pieces.json"
+  },
+  "training": {
+    "source_model": "target/endgame-base-v60.safetensors",
+    "rules": "胜负轨迹采用完整历史证明；三子和棋采用安全闭包证明。其余和棋只接收表引导且由项目完整棋规实际判和的RL回报，策略权重为0；不是极小极大和棋证明。缺表、截断均跳过。",
+    "table_bytes": 381790848,
+    "train": 3496,
+    "train_wdl": [
+      1263,
+      1165,
+      1068
+    ],
+    "held_wdl": [
+      386,
+      480,
+      307
+    ],
+    "anchors": 3496,
+    "raw_wdl": [
+      558,
+      242,
+      507
+    ],
+    "generated_wdl": [
+      1928,
+      4043,
+      1573
+    ],
+    "unverified": 522,
+    "table_misses": 37,
+    "draw_rollout_games": 210,
+    "loss": 2.4760093688964844,
+    "moves_left_pairs": 982,
+    "ordinary_before": [
+      1.6587207167717626,
+      0.3482984026051237,
+      1.1850879742741172
+    ],
+    "ordinary_after": [
+      1.6687621832131656,
+      0.35451727657510845,
+      1.1865206190758877
+    ],
+    "parameters": {
+      "model": "target/endgame-base-v60.safetensors",
+      "tables": "data/tablebases/chessdb",
+      "seeds": "target/endgame-all-local.fens",
+      "output": "target/endgame-final-v60.safetensors",
+      "anchors": "data/data.bin",
+      "per_seed": 2,
+      "epochs": 20,
+      "lr": 1.9999999494757503e-05,
+      "batch_size": 512,
+      "proof_nodes": 512,
+      "evaluate_only": false
+    },
+    "before": {
+      "samples": 1173,
+      "policy_samples": 694,
+      "value_ce": 0.3531028022120371,
+      "value_rmse": 0.3048526881107174,
+      "value_accuracy": 0.8678601875532822,
+      "policy_teacher_mass": 0.4718114077959006,
+      "policy_top1": 0.6296829971181557
+    },
+    "after": {
+      "samples": 1173,
+      "policy_samples": 694,
+      "value_ce": 0.21633221763954594,
+      "value_rmse": 0.2311798676161062,
+      "value_accuracy": 0.9113384484228474,
+      "policy_teacher_mass": 0.49140150400995136,
+      "policy_top1": 0.6368876080691642
+    },
+    "conversion_before": {
+      "games": 16,
+      "wins": 16,
+      "losses": 0,
+      "draws": 0,
+      "cutoffs": 0,
+      "winning_plies": 290,
+      "search_failed": 0,
+      "played_plies": 290,
+      "starts": [
+        "9/9/4k4/9/4C4/9/9/4BA3/9/3K5 w - - 0 1",
+        "9/5k3/9/9/9/9/9/3A5/5N3/2B1K4 w - - 0 1",
+        "5a3/9/3k5/9/9/9/9/3A5/9/5K1C1 w - - 0 1",
+        "9/4k4/3C5/9/9/9/9/3K5/9/5A3 w - - 0 1",
+        "C8/4k4/9/9/2P6/9/9/9/9/3A1K3 w - - 0 1",
+        "9/9/5k3/9/9/9/6N2/9/3K5/5A3 w - - 0 1",
+        "9/9/4k4/5P3/P8/9/9/5A3/5K3/9 w - - 0 1",
+        "2b1k4/9/9/9/9/5R3/9/3K5/4A4/9 w - - 0 1",
+        "5k3/9/9/9/c8/9/7R1/5A3/5K3/9 w - - 0 1",
+        "9/4k4/n8/1R7/9/9/9/5A3/5K3/9 w - - 0 1",
+        "3k5/9/9/9/8P/6B2/9/4BK3/9/9 w - - 0 1",
+        "3C5/4C4/4k4/9/9/2B6/9/9/3K5/9 w - - 0 1",
+        "9/5k3/9/9/9/9/4C4/B2K5/9/7N1 w - - 0 1",
+        "9/9/3k5/9/9/9/9/9/9/2BN1K3 w - - 0 1",
+        "9/3k5/9/P8/9/9/9/B8/9/4K4 w - - 0 1",
+        "6C2/9/3k5/2C6/9/9/9/4K4/4n4/9 w - - 0 1"
+      ],
+      "lengths": [
+        21,
+        53,
+        23,
+        21,
+        7,
+        9,
+        7,
+        9,
+        17,
+        9,
+        21,
+        63,
+        7,
+        9,
+        7,
+        7
+      ],
+      "table_replies": 137,
+      "fallback_replies": 0
+    },
+    "conversion_after": {
+      "games": 16,
+      "wins": 16,
+      "losses": 0,
+      "draws": 0,
+      "cutoffs": 0,
+      "winning_plies": 284,
+      "search_failed": 0,
+      "played_plies": 284,
+      "lengths": [
+        25,
+        7,
+        23,
+        13,
+        7,
+        9,
+        7,
+        9,
+        121,
+        9,
+        17,
+        7,
+        7,
+        9,
+        7,
+        7
+      ],
+      "table_replies": 134,
+      "fallback_replies": 0,
+      "same_starts_as_baseline": true
+    },
+    "ordinary_arena": {
+      "wins": 7,
+      "losses": 3,
+      "draws": 6,
+      "score": 0.625,
+      "ci95": [
+        0.49404197931289673,
+        0.7559580206871033
+      ],
+      "starts": [
+        "rnb1kabnr/4a2c1/1c7/p1p1p3p/6p2/P6C1/2P1P1P1P/1C2B4/9/RNBAKA1NR w - - 0 1",
+        "4kab2/4a4/2n1b3n/p3p1p2/2r1cR2p/3N5/P3P1P1P/3CB1N2/4A4/2BAK4 w - - 0 1",
+        "3akab2/9/5rn1c/p1P5p/2b1p1c2/1R7/P3P1r1P/2N1BCN2/4A4/2BAK1R2 w - - 0 1",
+        "C1bak1bn1/2cRa4/1rN1r4/1C6p/2p3p2/9/P1P3P1P/3A1cN2/9/1R2KA3 w - - 0 1",
+        "2ba1k3/4a4/1c2b1c1n/r7p/p1n1pP3/9/P3P3P/1C1CB1N2/4A4/RN2KAB2 w - - 0 1",
+        "2bak4/4a1r2/2n1b2c1/p1C1p2N1/8R/2pnP3P/P8/N3B4/4A4/3K1AB2 w - - 0 1",
+        "4kab2/n1NraR3/4bc2n/p1C1p4/8P/2P6/R8/4B1C2/4A4/1r2KAB2 w - - 0 1",
+        "2bak2r1/4a4/n1c1b3n/2p1p3p/r5p2/2P4CP/3RP1P2/4B3N/1c1C5/1NBAKA1R1 w - - 0 1"
+      ]
+    },
+    "available_materials": 216,
+    "seed_acceptance_histogram": {
+      "0": 36,
+      "1": 7,
+      "2": 389
+    }
+  },
+  "fresh_random_seed_check": {
+    "note": "重新随机生成起点的功能复测；不声明与训练语料完全独立，均对同一表引导对手。",
+    "baseline": {
+      "games": 16,
+      "wins": 14,
+      "losses": 0,
+      "draws": 2,
+      "cutoffs": 0,
+      "winning_plies": 184,
+      "search_failed": 0,
+      "played_plies": 424,
+      "starts": [
+        "9/9/4k4/9/4N4/9/9/9/5K3/5c3 w - - 0 1",
+        "9/4k4/9/9/4N4/9/9/9/9/5K3 w - - 0 1",
+        "9/4k4/9/C8/9/4P4/9/9/4K4/9 w - - 0 1",
+        "9/4k4/9/9/9/9/9/C4N3/3K5/9 w - - 0 1",
+        "5a3/9/4k1C2/9/9/1N7/9/9/5K3/9 w - - 0 1",
+        "3k5/1C7/4b4/9/9/N8/9/9/4K4/9 w - - 0 1",
+        "9/5P3/5k3/9/9/9/4N4/9/9/3K5 w - - 0 1",
+        "3k5/9/9/9/7P1/9/9/9/4K4/9 w - - 0 1",
+        "P3ka3/9/4P4/9/9/9/9/9/4K4/9 w - - 0 1",
+        "4ka3/9/3a5/9/9/9/9/R4K3/9/9 w - - 0 1",
+        "3a5/4a4/b2k5/9/9/9/5R3/5K3/9/9 w - - 0 1",
+        "4k4/9/3Rba3/9/9/9/9/9/9/5K3 w - - 0 1",
+        "3k5/9/5R3/9/6b2/9/9/9/5K3/9 w - - 0 1",
+        "9/5k3/b2a4b/9/9/9/9/3K5/9/7R1 w - - 0 1",
+        "5k3/4R4/8b/9/2b6/9/9/4K4/9/9 w - - 0 1",
+        "9/9/5k3/9/9/9/8c/9/1R7/3K5 w - - 0 1"
+      ],
+      "lengths": [
+        31,
+        25,
+        9,
+        11,
+        9,
+        17,
+        7,
+        21,
+        9,
+        9,
+        120,
+        7,
+        7,
+        120,
+        7,
+        15
+      ],
+      "table_replies": 205,
+      "fallback_replies": 0
+    },
+    "candidate": {
+      "games": 16,
+      "wins": 16,
+      "losses": 0,
+      "draws": 0,
+      "cutoffs": 0,
+      "winning_plies": 404,
+      "search_failed": 0,
+      "played_plies": 404,
+      "lengths": [
+        19,
+        17,
+        9,
+        9,
+        9,
+        85,
+        7,
+        13,
+        9,
+        9,
+        153,
+        7,
+        7,
+        23,
+        7,
+        21
+      ],
+      "table_replies": 194,
+      "fallback_replies": 0,
+      "same_starts_as_baseline": true
+    },
+    "common_win_plies": {
+      "baseline": 184,
+      "candidate": 228
+    }
+  },
+  "limitations": [
+    "小规模测试，不能证明全局棋力提升。",
+    "独立复测仍有85/153半回合收尾；共同获胜局收尾总长184增至228，不能宣称全面加快。",
+    "普通对弈仅8个交换红黑起点；95%区间仍跨过0.5。",
+    "胜负轨迹和三子保和有严格证明；其他和棋是实际完成的离线教师对局回报，并非极小极大证明。",
+    "只实现离线训练与验证；未接入搜索查表、自动自博弈预热或持续残局监督。"
+  ],
+  "checks": {
+    "all_targets": "cargo test --profile fast --offline --features endgame --all-targets",
+    "regular_passed": 413,
+    "regular_failed": 0,
+    "ignored": 9,
+    "local_tablebase_tests_passed": 7,
+    "default_feature_check": "cargo check --profile fast --offline --all-targets"
+  }
+}

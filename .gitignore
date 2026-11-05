@@ -17,6 +17,8 @@ tools
 !tools/
 tools/*
 !tools/policy_arch_search.py
+!tools/endgame_fetch.py
+!tools/endgame_seeds.py
 eval/*.csv
 eval/*.fens
 eval/*.bin
@@ -41,3 +43,4 @@ docs/*
 !docs/吃子共享关系扩展.md
 !docs/mating-patterns.md
 !docs/mating-patterns-history.md
+!docs/endgames.md
