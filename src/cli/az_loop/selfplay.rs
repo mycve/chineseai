@@ -118,6 +118,7 @@ pub(crate) fn build_async_training_report(
         training_chunks: 0,
         test_chunks: 0,
         holdout_checks: Vec::new(),
+        endgame: None,
         cycle_complete: false,
         games: selfplay_games,
         samples: selfplay_samples,

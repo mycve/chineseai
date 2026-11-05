@@ -32,6 +32,13 @@ eval/*.bin
 eval/*.sqlite
 eval/torch-policy-*/
 eval/*/
+!eval/endgame-corpus/
+eval/endgame-corpus/*
+!eval/endgame-corpus/train.replay.lz4
+!eval/endgame-corpus/held.replay.lz4
+!eval/endgame-corpus/manifest.toml
+!eval/endgame-corpus/source.json
+!eval/endgame-corpus/seeds.fens
 eval/torch/
 POTENTIAL_IMPROVEMENT_PLAN.md
 data

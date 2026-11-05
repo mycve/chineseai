@@ -70,6 +70,8 @@ pub struct AzLoopFileConfig {
     pub replay_recent_games: u32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
+    /// 独立残局监督目录；配置后每批固定混入10%，不占用在线经验池容量。
+    pub endgame_data: String,
     /// 统一使用 AdamW，lr 是预热结束时的峰值学习率。
     pub train_optimizer: AzTrainOptimizer,
     pub mirror_probability: f32,
@@ -157,6 +159,7 @@ impl Default for AzLoopFileConfig {
             replay_recent_games: 7500,
             train_warmup_samples: 600000,
             train_samples_per_update: 120000,
+            endgame_data: String::new(),
             train_optimizer: AzTrainOptimizer::default(),
             mirror_probability: 0.5,
             train_value_weight: 1.0,
@@ -280,6 +283,7 @@ impl AzLoopFileConfig {
         line!("replay_recent_games", self.replay_recent_games);
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
+        line!("endgame_data", q(&self.endgame_data));
         line!("train_optimizer", q(self.train_optimizer.as_str()));
         line!("mirror_probability", f(self.mirror_probability));
         line!("train_value_weight", f(self.train_value_weight));

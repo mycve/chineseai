@@ -16,6 +16,7 @@ mod context;
 #[cfg(all(test, feature = "slow-tests"))]
 mod cuda_test_device;
 mod dataloader;
+pub mod endgame_data;
 mod feature_map;
 mod fused_policy;
 mod fused_sparse_policy;

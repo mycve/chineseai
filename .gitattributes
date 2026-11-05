@@ -1,0 +1,4 @@
+eval/endgame-corpus/*.replay.lz4 binary
+eval/endgame-corpus/*.toml text eol=lf
+eval/endgame-corpus/*.json text eol=lf
+eval/endgame-corpus/*.fens text eol=lf

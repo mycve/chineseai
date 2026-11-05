@@ -1,0 +1,349 @@
+{
+  "date": "2026-11-05",
+  "status": "code_ready_models_not_promoted",
+  "production_best_sha256": "d5eaeee46813db6a9de6635e65bd7711e724ede6e72205c38be5d2b31f49ef1e",
+  "initial_model_sha256": "59bcd4d8c2567e2d19a4e32ec415df98f2a2236f7d22a4730361684c7dec69e5",
+  "corpus_manifest_sha256": "4280f05a52de7217a5747c4a1be1456cc2989ef4e07a20d077c3fd289ab74152",
+  "configuration": {
+    "simulations": 64,
+    "max_plies": 240,
+    "workers": 2,
+    "lr": 2e-05,
+    "batch_size": 128,
+    "train_samples_per_update": 1024,
+    "selfplay_samples_per_update": 2048,
+    "train_warmup_samples": 4096,
+    "replay_capacity": 50000,
+    "mating_goal_mix": false,
+    "mating_loss_weight": 0.0,
+    "goal_loss_weight": 0.0
+  },
+  "corpus": {
+    "train": 3496,
+    "held": 1173,
+    "train_wdl": [
+      1263,
+      1165,
+      1068
+    ],
+    "held_wdl": [
+      386,
+      480,
+      307
+    ]
+  },
+  "logs": {
+    "control": {
+      "updates": 200,
+      "last_update": 200,
+      "batch_rows": [
+        1024
+      ],
+      "teacher_rows": [
+        0
+      ]
+    },
+    "continuous": {
+      "updates": 200,
+      "last_update": 200,
+      "batch_rows": [
+        1024
+      ],
+      "teacher_rows": [
+        102
+      ]
+    }
+  },
+  "held_metrics": {
+    "initial": {
+      "samples": 1173,
+      "wdl": [
+        386,
+        480,
+        307
+      ],
+      "value_ce": 0.21633221763954594,
+      "value_rmse": 0.2311798676161062,
+      "value_accuracy": 0.9113384484228474,
+      "policy_samples": 694,
+      "policy_teacher_mass": 0.49140150400995136,
+      "policy_top1": 0.6368876080691642,
+      "moves_left_samples": 693,
+      "moves_left_rmse": 7.030027910703333,
+      "moves_left_pairs": 566,
+      "moves_left_pair_accuracy": 0.6024734982332155
+    },
+    "control": {
+      "samples": 1173,
+      "wdl": [
+        386,
+        480,
+        307
+      ],
+      "value_ce": 0.32148462688965285,
+      "value_rmse": 0.27969839874935865,
+      "value_accuracy": 0.8670076726342711,
+      "policy_samples": 694,
+      "policy_teacher_mass": 0.47723396145671565,
+      "policy_top1": 0.6628242074927954,
+      "moves_left_samples": 693,
+      "moves_left_rmse": 13.19043441984477,
+      "moves_left_pairs": 566,
+      "moves_left_pair_accuracy": 0.6713780918727915
+    },
+    "continuous": {
+      "samples": 1173,
+      "wdl": [
+        386,
+        480,
+        307
+      ],
+      "value_ce": 0.21325159388007586,
+      "value_rmse": 0.2258706634289181,
+      "value_accuracy": 0.9181585677749361,
+      "policy_samples": 694,
+      "policy_teacher_mass": 0.5032236965256408,
+      "policy_top1": 0.6714697406340058,
+      "moves_left_samples": 693,
+      "moves_left_rmse": 6.930195196970898,
+      "moves_left_pairs": 566,
+      "moves_left_pair_accuracy": 0.598939929328622
+    }
+  },
+  "conversion": {
+    "initial": {
+      "games": 16,
+      "wins": 16,
+      "losses": 0,
+      "draws": 0,
+      "cutoffs": 0,
+      "winning_plies": 284,
+      "search_failed": 0,
+      "played_plies": 284,
+      "starts": [
+        "9/9/4k4/9/4C4/9/9/4BA3/9/3K5 w - - 0 1",
+        "9/5k3/9/9/9/9/9/3A5/5N3/2B1K4 w - - 0 1",
+        "5a3/9/3k5/9/9/9/9/3A5/9/5K1C1 w - - 0 1",
+        "9/4k4/3C5/9/9/9/9/3K5/9/5A3 w - - 0 1",
+        "C8/4k4/9/9/2P6/9/9/9/9/3A1K3 w - - 0 1",
+        "9/9/5k3/9/9/9/6N2/9/3K5/5A3 w - - 0 1",
+        "9/9/4k4/5P3/P8/9/9/5A3/5K3/9 w - - 0 1",
+        "2b1k4/9/9/9/9/5R3/9/3K5/4A4/9 w - - 0 1",
+        "5k3/9/9/9/c8/9/7R1/5A3/5K3/9 w - - 0 1",
+        "9/4k4/n8/1R7/9/9/9/5A3/5K3/9 w - - 0 1",
+        "3k5/9/9/9/8P/6B2/9/4BK3/9/9 w - - 0 1",
+        "3C5/4C4/4k4/9/9/2B6/9/9/3K5/9 w - - 0 1",
+        "9/5k3/9/9/9/9/4C4/B2K5/9/7N1 w - - 0 1",
+        "9/9/3k5/9/9/9/9/9/9/2BN1K3 w - - 0 1",
+        "9/3k5/9/P8/9/9/9/B8/9/4K4 w - - 0 1",
+        "6C2/9/3k5/2C6/9/9/9/4K4/4n4/9 w - - 0 1"
+      ],
+      "lengths": [
+        25,
+        7,
+        23,
+        13,
+        7,
+        9,
+        7,
+        9,
+        121,
+        9,
+        17,
+        7,
+        7,
+        9,
+        7,
+        7
+      ],
+      "outcomes": [
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win"
+      ],
+      "table_replies": 134,
+      "fallback_replies": 0
+    },
+    "control": {
+      "games": 16,
+      "wins": 16,
+      "losses": 0,
+      "draws": 0,
+      "cutoffs": 0,
+      "winning_plies": 262,
+      "search_failed": 0,
+      "played_plies": 262,
+      "lengths": [
+        15,
+        7,
+        25,
+        17,
+        7,
+        9,
+        7,
+        13,
+        95,
+        9,
+        21,
+        7,
+        7,
+        9,
+        7,
+        7
+      ],
+      "outcomes": [
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win"
+      ],
+      "table_replies": 123,
+      "fallback_replies": 0,
+      "same_starts_as_initial": true
+    },
+    "continuous": {
+      "games": 16,
+      "wins": 16,
+      "losses": 0,
+      "draws": 0,
+      "cutoffs": 0,
+      "winning_plies": 182,
+      "search_failed": 0,
+      "played_plies": 182,
+      "lengths": [
+        19,
+        7,
+        21,
+        17,
+        7,
+        7,
+        7,
+        9,
+        25,
+        9,
+        17,
+        7,
+        7,
+        9,
+        7,
+        7
+      ],
+      "outcomes": [
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win",
+        "win"
+      ],
+      "table_replies": 83,
+      "fallback_replies": 0,
+      "same_starts_as_initial": true
+    },
+    "common_win_plies": {
+      "games": 16,
+      "control": 262,
+      "continuous": 182
+    }
+  },
+  "ordinary_arena": {
+    "control": {
+      "wins": 2,
+      "losses": 8,
+      "draws": 6,
+      "score": 0.3125,
+      "ci95": [
+        0.15893810987472534,
+        0.46606189012527466
+      ],
+      "starts": [
+        "rnb1kabnr/4a2c1/1c7/p1p1p3p/6p2/P6C1/2P1P1P1P/1C2B4/9/RNBAKA1NR w - - 0 1",
+        "4kab2/4a4/2n1b3n/p3p1p2/2r1cR2p/3N5/P3P1P1P/3CB1N2/4A4/2BAK4 w - - 0 1",
+        "3akab2/9/5rn1c/p1P5p/2b1p1c2/1R7/P3P1r1P/2N1BCN2/4A4/2BAK1R2 w - - 0 1",
+        "C1bak1bn1/2cRa4/1rN1r4/1C6p/2p3p2/9/P1P3P1P/3A1cN2/9/1R2KA3 w - - 0 1",
+        "2ba1k3/4a4/1c2b1c1n/r7p/p1n1pP3/9/P3P3P/1C1CB1N2/4A4/RN2KAB2 w - - 0 1",
+        "2bak4/4a1r2/2n1b2c1/p1C1p2N1/8R/2pnP3P/P8/N3B4/4A4/3K1AB2 w - - 0 1",
+        "4kab2/n1NraR3/4bc2n/p1C1p4/8P/2P6/R8/4B1C2/4A4/1r2KAB2 w - - 0 1",
+        "2bak2r1/4a4/n1c1b3n/2p1p3p/r5p2/2P4CP/3RP1P2/4B3N/1c1C5/1NBAKA1R1 w - - 0 1"
+      ]
+    },
+    "continuous": {
+      "wins": 5,
+      "losses": 7,
+      "draws": 4,
+      "score": 0.4375,
+      "ci95": [
+        0.3149999976158142,
+        0.5600000023841858
+      ],
+      "starts": [
+        "rnb1kabnr/4a2c1/1c7/p1p1p3p/6p2/P6C1/2P1P1P1P/1C2B4/9/RNBAKA1NR w - - 0 1",
+        "4kab2/4a4/2n1b3n/p3p1p2/2r1cR2p/3N5/P3P1P1P/3CB1N2/4A4/2BAK4 w - - 0 1",
+        "3akab2/9/5rn1c/p1P5p/2b1p1c2/1R7/P3P1r1P/2N1BCN2/4A4/2BAK1R2 w - - 0 1",
+        "C1bak1bn1/2cRa4/1rN1r4/1C6p/2p3p2/9/P1P3P1P/3A1cN2/9/1R2KA3 w - - 0 1",
+        "2ba1k3/4a4/1c2b1c1n/r7p/p1n1pP3/9/P3P3P/1C1CB1N2/4A4/RN2KAB2 w - - 0 1",
+        "2bak4/4a1r2/2n1b2c1/p1C1p2N1/8R/2pnP3P/P8/N3B4/4A4/3K1AB2 w - - 0 1",
+        "4kab2/n1NraR3/4bc2n/p1C1p4/8P/2P6/R8/4B1C2/4A4/1r2KAB2 w - - 0 1",
+        "2bak2r1/4a4/n1c1b3n/2p1p3p/r5p2/2P4CP/3RP1P2/4B3N/1c1C5/1NBAKA1R1 w - - 0 1"
+      ]
+    }
+  },
+  "integration_checks": {
+    "resumed_from_update": 21,
+    "resumed_through_update": 200,
+    "original_weight_direct_activation": "passed",
+    "incompatible_goal_optimizer_rejected_without_file_changes": "passed"
+  },
+  "limitations": [
+    "只是一组低预算64次搜索的短程闭环试验，异步采样并非逐局相同，不足以证明生产棋力提升。",
+    "持续监督后MLH排序正确率约59.9%，未改善；收尾速度的收益不能归因于该头已学会稳定排序。",
+    "普通对弈5胜7负4和，未达到替换原模型的依据。",
+    "固定监督降低遗忘风险，无法保证未覆盖残局；未接入在线查表。",
+    "当前阶段排除固定留出棋盘及镜像，无法回溯旧权重的全部训练历史。"
+  ],
+  "bundled_corpus": "eval/endgame-corpus",
+  "checks": {
+    "regular_passed": 419,
+    "regular_failed": 0,
+    "ignored": 9,
+    "tablebase_manual_passed": 7,
+    "default_feature_check": "passed",
+    "scope_change_preserves_parameters": "passed",
+    "corpus_roundtrip_checksum_and_mirror_isolation": "passed"
+  }
+}

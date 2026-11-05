@@ -80,7 +80,7 @@ impl TrainingConsole {
             report.terminal_search_no_move,
             if checkpoint { " checkpoint=saved" } else { "" }
         );
-        let loss = format!(
+        let mut loss = format!(
             "train: samples={} loss={:.4} WDL={:.4} policy_KL={:.4} MLH={:.4}/{} MLH_pair={:.1}%/{}",
             report.train_samples,
             report.loss,
@@ -91,6 +91,9 @@ impl TrainingConsole {
             report.moves_left_pair_accuracy * 100.0,
             report.moves_left_pairs
         );
+        if let Some(endgame) = &report.endgame {
+            loss.push_str(&format!(" 残局样本={}", endgame.mixed_samples));
+        }
         let value = format!(
             "value: RMSE={:.4} corr={:.3} lr={:.6} sims={:.1} train={:.1}s",
             report.value_mse.max(0.0).sqrt(),

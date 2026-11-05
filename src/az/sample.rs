@@ -55,6 +55,7 @@ pub struct AzLoopReport {
     pub training_chunks: usize,
     pub test_chunks: usize,
     pub holdout_checks: Vec<AzHoldoutReport>,
+    pub endgame: Option<super::endgame_data::EndgameTrainingReport>,
     pub cycle_complete: bool,
     pub games: usize,
     pub samples: usize,

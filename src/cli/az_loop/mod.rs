@@ -152,6 +152,23 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         (AzNnue::random_with_arch(config_arch, config.seed), false)
     };
     model.moves_left_params = config.moves_left_params();
+    let ordinary_scope_changed = !config.endgame_data.is_empty() && model.is_goal_adaptation_only();
+    if ordinary_scope_changed {
+        model.enable_ordinary_training();
+        println!("endgame  : 启用普通参数训练，沿用现有权重数值");
+    }
+    let endgame_data = (!config.endgame_data.is_empty()).then(|| {
+        let data =
+            chineseai::az::endgame_data::EndgameCorpus::load(Path::new(&config.endgame_data))
+                .unwrap_or_else(|e| panic!("残局监督加载失败 `{}`: {e}", config.endgame_data));
+        println!(
+            "endgame  : train={} held={} fixed_mix=10% {}",
+            data.train_len(),
+            data.held_len(),
+            config.endgame_data
+        );
+        data
+    });
     if model.is_goal_adaptation_only() {
         config.arena_interval = 0;
         println!(
@@ -166,6 +183,10 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         &optimizer_state_path
     };
     let optimizer_state_path = restore_path.clone();
+    assert!(
+        !ordinary_scope_changed || !restore_path.exists(),
+        "目标专用优化器不能用于普通残局训练；请复制现有权重到新的model_path并使用新运行配置，保留原优化器与检查点"
+    );
     if restore_path.exists() {
         let checkpoint_update =
             AzNnue::training_state_next_update(restore_path).unwrap_or_else(|err| {
@@ -490,10 +511,20 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 trainer_config.replay_recent_games,
                 &mut rng,
             );
-            let train_data = sampled_batch.samples;
+            let mut train_data = sampled_batch.samples;
             if train_data.is_empty() {
                 continue;
             }
+            let endgame_samples = match endgame_data
+                .as_ref()
+                .map_or(Ok(0), |data| data.mix(&mut train_data, &mut rng))
+            {
+                Ok(count) => count,
+                Err(err) => {
+                    eprintln!("endgame: {err}");
+                    continue;
+                }
+            };
             let train_data_len = train_data.len();
             let target_entropy = policy_target_entropy(&train_data);
             let train_update = trainer_start_update.saturating_add(train_index);
@@ -551,6 +582,12 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             report.training_chunks = training_chunks;
             report.test_chunks = test_chunks;
             report.holdout_checks = trainer_model.take_training_checks();
+            report.endgame = endgame_data.as_ref().map(|data| {
+                chineseai::az::endgame_data::EndgameTrainingReport {
+                    mixed_samples: endgame_samples,
+                    holdout: (need_test || train_index == 0).then(|| data.evaluate(&trainer_model)),
+                }
+            });
             report.cycle_complete = report.training_steps == cycle_end;
             if report.cycle_complete {
                 save_model(&trainer_model, Path::new(&trainer_config.model_path));
@@ -791,6 +828,28 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             true_draws,
             checkpoint_saved.is_some(),
         );
+        if let Some(endgame) = &report.endgame {
+            log_scalar(
+                &mut tb,
+                "endgame/train_samples",
+                report.training_steps,
+                endgame.mixed_samples as f32,
+            );
+            if let Some(check) = &endgame.holdout {
+                console.event(format!("残局留出: step={} samples={} WDL={:.4} RMSE={:.4} 策略命中={:.1}% MLH_RMSE={:.1} MLH_pair={:.1}%/{}",
+                    report.training_steps, check.samples, check.value_ce, check.value_rmse, check.policy_top1*100.,
+                    check.moves_left_rmse, check.moves_left_pair_accuracy*100., check.moves_left_pairs));
+                for (tag, value) in [
+                    ("endgame/value_ce", check.value_ce),
+                    ("endgame/value_rmse", check.value_rmse),
+                    ("endgame/policy_top1", check.policy_top1),
+                    ("endgame/mlh_rmse", check.moves_left_rmse),
+                    ("endgame/mlh_pair_accuracy", check.moves_left_pair_accuracy),
+                ] {
+                    log_scalar(&mut tb, tag, report.training_steps, value as f32);
+                }
+            }
+        }
         for check in &report.holdout_checks {
             console.test(check);
             for (tag, value) in [

@@ -2,6 +2,7 @@
 use chineseai::{
     az::{
         self, AzNnue, AzTrainingSample, SplitMix64,
+        endgame_data::{EndgameCorpus, EndgameMetrics as Metrics, evaluate},
         tablebase::{EndgameTablebases, certified_sample, certified_trajectory, draw_rollout},
     },
     xiangqi::Position,
@@ -21,8 +22,11 @@ struct Args {
     #[arg(long, default_value = "data/tablebases/chessdb")]
     tables: PathBuf,
     /// 每行一个新残局FEN；按完整棋盘及镜像去重划分，历史不从FEN伪造。
+    #[arg(long, conflicts_with = "corpus", required_unless_present = "corpus")]
+    seeds: Option<PathBuf>,
+    /// 复用已导出的固定数据集，跳过查表生成；与--seeds二选一。
     #[arg(long)]
-    seeds: PathBuf,
+    corpus: Option<PathBuf>,
     #[arg(long)]
     output: PathBuf,
     /// 普通Px0对局锚点，防止只拟合残局后遗忘普通局面。
@@ -46,65 +50,6 @@ struct Args {
     opponent: Option<PathBuf>,
 }
 #[derive(Default, Serialize)]
-struct Metrics {
-    samples: usize,
-    policy_samples: usize,
-    value_ce: f64,
-    value_rmse: f64,
-    value_accuracy: f64,
-    policy_teacher_mass: f64,
-    policy_top1: f64,
-}
-fn evaluate(model: &AzNnue, rows: &[AzTrainingSample]) -> Metrics {
-    let mut m = Metrics::default();
-    for row in rows {
-        let Some((wdl, logits)) = az::outputs_for_training_sample(model, row) else {
-            continue;
-        };
-        m.samples += 1;
-        let argmax = |v: &[f32]| {
-            v.iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .unwrap()
-                .0
-        };
-        m.value_accuracy += f64::from(argmax(&wdl) == argmax(&row.value_wdl));
-        m.value_ce -= row
-            .value_wdl
-            .iter()
-            .zip(wdl)
-            .map(|(&t, p)| f64::from(t) * f64::from(p.max(1e-12)).ln())
-            .sum::<f64>();
-        m.value_rmse += f64::from((wdl[0] - wdl[2] - row.value).powi(2));
-        if row.policy_weight <= 0. {
-            continue;
-        }
-        m.policy_samples += 1;
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let probs: Vec<_> = logits.iter().map(|&x| (x - max).exp()).collect();
-        let total = probs.iter().sum::<f32>();
-        m.policy_teacher_mass += f64::from(
-            probs
-                .iter()
-                .zip(&row.policy)
-                .filter(|(_, t)| **t > 0.)
-                .map(|(p, _)| *p)
-                .sum::<f32>()
-                / total,
-        );
-        m.policy_top1 += f64::from(row.policy[argmax(&logits)] > 0.);
-    }
-    let n = m.samples.max(1) as f64;
-    m.value_ce /= n;
-    m.value_rmse = (m.value_rmse / n).sqrt();
-    m.value_accuracy /= n;
-    m.policy_teacher_mass /= m.policy_samples.max(1) as f64;
-    m.policy_top1 /= m.policy_samples.max(1) as f64;
-    m
-}
-
-#[derive(Default, Serialize)]
 struct Conversion {
     games: usize,
     wins: usize,
@@ -117,6 +62,7 @@ struct Conversion {
     /// 每局FEN及实际长度，方便复现，避免相邻同类残局掩盖弱点。
     starts: Vec<String>,
     lengths: Vec<usize>,
+    outcomes: Vec<String>,
     table_replies: usize,
     fallback_replies: usize,
 }
@@ -208,6 +154,7 @@ fn conversion(
         let mut history = p.initial_rule_history();
         result.games += 1;
         let mut finished = false;
+        let mut ending = "cutoff";
         for ply in 0..=160 {
             let outcome = if !p.has_general(Color::Red) {
                 Some(RuleOutcome::Win(Color::Black))
@@ -221,6 +168,11 @@ fn conversion(
                 })
             };
             if let Some(outcome) = outcome {
+                ending = match outcome {
+                    RuleOutcome::Win(Color::Red) => "win",
+                    RuleOutcome::Win(Color::Black) => "loss",
+                    _ => "draw",
+                };
                 match outcome {
                     RuleOutcome::Win(Color::Red) => {
                         result.wins += 1;
@@ -262,6 +214,7 @@ fn conversion(
                 },
             );
             let Some(mv) = search.best_move else {
+                ending = "search_failed";
                 result.search_failed += 1;
                 eprintln!("残局验收搜索失败：{} q={}", p.to_fen(), search.value_q);
                 finished = true;
@@ -275,6 +228,7 @@ fn conversion(
             result.cutoffs += 1;
         }
         result.lengths.push(result.played_plies - played_before);
+        result.outcomes.push(ending.to_owned());
     }
     Ok(result)
 }
@@ -359,7 +313,10 @@ fn hash(s: &str) -> u64 {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = Args::parse();
-    if a.output.exists() || a.output.with_extension("report.toml").exists() {
+    if a.output.exists()
+        || a.output.with_extension("report.toml").exists()
+        || a.output.with_extension("endgame").exists()
+    {
         return Err("输出路径已存在，拒绝覆盖".into());
     }
     if a.per_seed == 0 || a.epochs == 0 || a.batch_size == 0 || !a.lr.is_finite() || a.lr <= 0. {
@@ -368,14 +325,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let attempts = a.per_seed.checked_mul(8).ok_or("采样数量溢出")?;
     let mut model = AzNnue::load(&a.model)?;
     let mut tables = EndgameTablebases::load(&a.tables)?;
-    let seeds: Vec<_> = fs::read_to_string(&a.seeds)?
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-        .map(Position::from_fen)
-        .collect::<Result<_, _>>()?;
-    if seeds.is_empty() {
-        return Err("起点文件为空".into());
-    }
     let mut train = Vec::new();
     let mut held = Vec::new();
     let mut seen = HashSet::new();
@@ -386,111 +335,138 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut accepted_per_seed = Vec::new();
     let mut draw_rollout_games = 0;
     let mut rng = SplitMix64::new(20261105);
-    for (si, seed) in seeds.iter().enumerate() {
-        let mut p = seed.clone();
-        let mut accepted = 0;
-        for step in 0..attempts {
-            if step % 48 == 0
-                || p.rule_outcome_with_history(&p.initial_rule_history())
-                    .is_some()
-            {
-                p = seed.clone();
-            }
-            let key = orbit(&p);
-            if !seen.contains(&key) {
-                seen.insert(key.clone());
-                if let Some(v) = tables.probe(&p)? {
-                    raw[if v.wdl > 0 {
-                        0
-                    } else if v.wdl == 0 {
-                        1
-                    } else {
-                        2
-                    }] += 1;
-                    let rows = if v.wdl == 0 {
-                        // 随机游走仅生成棋盘；作为独立新残局重置自然限着计数。
-                        let fen = p.to_fen();
-                        let mut fields: Vec<_> = fen.split_whitespace().collect();
-                        fields[4] = "0";
-                        let fresh = Position::from_fen(&fields.join(" ")).unwrap();
-                        if let Some(row) = certified_sample(&mut tables, &fresh, a.proof_nodes)? {
-                            Some(vec![row])
+    if let Some(path) = &a.corpus {
+        (train, held) = EndgameCorpus::load(path)?.into_parts();
+    } else {
+        let seeds: Vec<_> = fs::read_to_string(a.seeds.as_ref().unwrap())?
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(Position::from_fen)
+            .collect::<Result<_, _>>()?;
+        if seeds.is_empty() {
+            return Err("起点文件为空".into());
+        }
+        for (si, seed) in seeds.iter().enumerate() {
+            let mut p = seed.clone();
+            let mut accepted = 0;
+            for step in 0..attempts {
+                if step % 48 == 0
+                    || p.rule_outcome_with_history(&p.initial_rule_history())
+                        .is_some()
+                {
+                    p = seed.clone();
+                }
+                let key = orbit(&p);
+                if !seen.contains(&key) {
+                    seen.insert(key.clone());
+                    if let Some(v) = tables.probe(&p)? {
+                        raw[if v.wdl > 0 {
+                            0
+                        } else if v.wdl == 0 {
+                            1
                         } else {
-                            let result = draw_rollout(&mut tables, &fresh)?;
-                            draw_rollout_games += usize::from(result.is_some());
-                            result
-                        }
-                    } else {
-                        certified_trajectory(&mut tables, &p, a.proof_nodes)?
-                    };
-                    if let Some(rows) = rows {
-                        let test = hash(&key) % 5 == 0;
-                        for row in rows {
-                            counts[if row.value > 0. {
-                                0
-                            } else if row.value == 0. {
-                                1
+                            2
+                        }] += 1;
+                        let rows = if v.wdl == 0 {
+                            // 随机游走仅生成棋盘；作为独立新残局重置自然限着计数。
+                            let fen = p.to_fen();
+                            let mut fields: Vec<_> = fen.split_whitespace().collect();
+                            fields[4] = "0";
+                            let fresh = Position::from_fen(&fields.join(" ")).unwrap();
+                            if let Some(row) = certified_sample(&mut tables, &fresh, a.proof_nodes)?
+                            {
+                                Some(vec![row])
                             } else {
-                                2
-                            }] += 1;
-                            if test {
-                                held.push(row);
-                            } else {
-                                train.push(row);
+                                let result = draw_rollout(&mut tables, &fresh)?;
+                                draw_rollout_games += usize::from(result.is_some());
+                                result
                             }
-                        }
-                        accepted += 1;
-                        if accepted >= a.per_seed {
-                            break;
+                        } else {
+                            certified_trajectory(&mut tables, &p, a.proof_nodes)?
+                        };
+                        if let Some(rows) = rows {
+                            let test = hash(&key) % 5 == 0;
+                            for row in rows {
+                                counts[if row.value > 0. {
+                                    0
+                                } else if row.value == 0. {
+                                    1
+                                } else {
+                                    2
+                                }] += 1;
+                                if test {
+                                    held.push(row);
+                                } else {
+                                    train.push(row);
+                                }
+                            }
+                            accepted += 1;
+                            if accepted >= a.per_seed {
+                                break;
+                            }
+                        } else {
+                            unknown += 1;
                         }
                     } else {
-                        unknown += 1;
+                        table_misses += 1;
                     }
+                }
+                let moves = p.legal_moves();
+                if moves.is_empty() {
+                    p = seed.clone();
                 } else {
-                    table_misses += 1;
+                    p.make_move(moves[rng.next_u64() as usize % moves.len()]);
                 }
             }
-            let moves = p.legal_moves();
-            if moves.is_empty() {
-                p = seed.clone();
+            println!(
+                "起点 {}/{} 已接收={} 累计训练={} 留出={}",
+                si + 1,
+                seeds.len(),
+                accepted,
+                train.len(),
+                held.len()
+            );
+            accepted_per_seed.push(accepted);
+        }
+        let held_keys: HashSet<_> = held
+            .iter()
+            .map(|r| orbit(&az::position_for_training_sample(r).unwrap()))
+            .collect();
+        train
+            .retain(|r| !held_keys.contains(&orbit(&az::position_for_training_sample(r).unwrap())));
+        let mut unique_train = HashSet::new();
+        train.retain(|r| unique_train.insert(orbit(&az::position_for_training_sample(r).unwrap())));
+        let mut unique_test = HashSet::new();
+        held.retain(|r| unique_test.insert(orbit(&az::position_for_training_sample(r).unwrap())));
+        // 和棋收尾通常很长，按固定棋盘键抽取，训练行中和棋至多约1/3。
+        let draw_limit = train.iter().filter(|r| r.value != 0.).count() / 2;
+        train.sort_by_key(|r| hash(&orbit(&az::position_for_training_sample(r).unwrap())));
+        let mut draws = 0;
+        train.retain(|r| {
+            if r.value == 0. {
+                draws += 1;
+                draws <= draw_limit
             } else {
-                p.make_move(moves[rng.next_u64() as usize % moves.len()]);
+                true
             }
-        }
-        println!(
-            "起点 {}/{} 已证明={} 累计训练={} 留出={}",
-            si + 1,
-            seeds.len(),
-            accepted,
-            train.len(),
-            held.len()
-        );
-        accepted_per_seed.push(accepted);
+        });
     }
-    let held_keys: HashSet<_> = held
-        .iter()
-        .map(|r| orbit(&az::position_for_training_sample(r).unwrap()))
-        .collect();
-    train.retain(|r| !held_keys.contains(&orbit(&az::position_for_training_sample(r).unwrap())));
-    let mut unique_train = HashSet::new();
-    train.retain(|r| unique_train.insert(orbit(&az::position_for_training_sample(r).unwrap())));
-    let mut unique_test = HashSet::new();
-    held.retain(|r| unique_test.insert(orbit(&az::position_for_training_sample(r).unwrap())));
-    // 和棋收尾通常很长，按固定棋盘键抽取，训练行中和棋至多约1/3。
-    let draw_limit = train.iter().filter(|r| r.value != 0.).count() / 2;
-    train.sort_by_key(|r| hash(&orbit(&az::position_for_training_sample(r).unwrap())));
-    let mut draws = 0;
-    train.retain(|r| {
-        if r.value == 0. {
-            draws += 1;
-            draws <= draw_limit
-        } else {
-            true
-        }
-    });
     if train.is_empty() || held.is_empty() {
         return Err("可证明训练/留出不足，未训练、未保存模型".into());
     }
+    let corpus_path = a.output.with_extension("endgame");
+    EndgameCorpus::save(
+        &corpus_path,
+        &train,
+        &held,
+        "胜负轨迹及三子保和经证明；其他和棋为项目完整棋规下实际完成的教师回报，只监督WDL。",
+    )?;
+    println!(
+        "固定残局监督={} train={} held={}",
+        corpus_path.display(),
+        train.len(),
+        held.len()
+    );
     let before = evaluate(&model, &held);
     let baseline = a
         .opponent
@@ -567,6 +543,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let ordinary_after =
         (!ordinary_test.is_empty()).then(|| az::px0_data::evaluate(&model, &ordinary_test));
+    let common_wins = conversion_after.as_ref().map(|after| {
+        assert_eq!(
+            conversion_before.starts, after.starts,
+            "兑现前后起点必须一致"
+        );
+        let mut common = CommonWins {
+            games: 0,
+            before_plies: 0,
+            after_plies: 0,
+        };
+        for i in 0..after.games {
+            if conversion_before.outcomes[i] == "win" && after.outcomes[i] == "win" {
+                common.games += 1;
+                common.before_plies += conversion_before.lengths[i];
+                common.after_plies += after.lengths[i];
+            }
+        }
+        common
+    });
     let ordinary_arena = if !a.evaluate_only || a.opponent.is_some() {
         ordinary_arena(&model, &baseline, &ordinary_test)
     } else {
@@ -576,6 +571,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = toml::to_string_pretty(&Report {
         parameters: a.clone(),
         source_model: a.model.display().to_string(),
+        corpus_path: corpus_path.display().to_string(),
         rules: "胜负轨迹采用完整历史证明；三子和棋采用安全闭包证明。其余和棋只接收表引导且由项目完整棋规实际判和的RL回报，策略权重为0；不是极小极大和棋证明。缺表、截断均跳过。"
             .into(),
         materials: tables.materials(),
@@ -594,6 +590,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         after,
         conversion_before,
         conversion_after,
+        common_wins,
         loss,
         moves_left_pairs,
         ordinary_before: ordinary_before
@@ -627,6 +624,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct Report {
     parameters: Args,
     source_model: String,
+    corpus_path: String,
     rules: String,
     materials: Vec<String>,
     table_bytes: usize,
@@ -644,9 +642,16 @@ struct Report {
     after: Metrics,
     conversion_before: Conversion,
     conversion_after: Option<Conversion>,
+    common_wins: Option<CommonWins>,
     loss: Option<f32>,
     moves_left_pairs: usize,
     ordinary_before: Option<[f64; 3]>,
     ordinary_after: Option<[f64; 3]>,
     ordinary_arena: Option<OrdinaryArena>,
+}
+#[derive(Serialize)]
+struct CommonWins {
+    games: usize,
+    before_plies: usize,
+    after_plies: usize,
 }

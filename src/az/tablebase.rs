@@ -569,7 +569,7 @@ pub fn train_endgame(
     batch: usize,
     rng: &mut super::SplitMix64,
 ) -> Result<super::AzTrainStats, String> {
-    model.goal_adaptation_only = false;
+    model.enable_ordinary_training();
     super::train_samples_weighted(
         model,
         samples,

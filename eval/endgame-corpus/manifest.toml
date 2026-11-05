@@ -1,0 +1,7 @@
+format = 1
+kind = "chineseai-endgame"
+train_rows = 3496
+held_rows = 1173
+train_sha256 = "8681f6995af4b11d92cecf7b2303805696c47c800ec4b9b124f8d0cd8c7d2faa"
+held_sha256 = "d3659d28ee6b423787762f3afd58c8751e5fbf77c0cc9393edcb15a8e600ffa4"
+rules = "胜负轨迹及三子保和经证明；其他和棋为项目完整棋规下实际完成的教师回报，只监督WDL。"

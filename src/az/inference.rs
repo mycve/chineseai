@@ -695,6 +695,10 @@ impl AzNnue {
     pub fn is_goal_adaptation_only(&self) -> bool {
         self.goal_adaptation_only
     }
+    /// 显式启用普通参数训练；保留全部现有权重数值。
+    pub fn enable_ordinary_training(&mut self) {
+        self.goal_adaptation_only = false;
+    }
 
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let h = self.hidden_size;
