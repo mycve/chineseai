@@ -6,6 +6,7 @@ mod az_loop;
 mod az_loop_config;
 mod az_policy_scale;
 mod az_search;
+mod az_train;
 mod dispatch;
 mod reporting;
 mod training_console;

@@ -31,6 +31,8 @@ pub(crate) enum CliCommand {
     AzBench(AzBenchArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
+    /// 启动已配好本地残局教师的训练流程。
+    AzTrain(crate::cli::az_train::AzTrainArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
 }

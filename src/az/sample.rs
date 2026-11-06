@@ -35,6 +35,12 @@ pub struct AzLoopConfig {
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub opening_positions: Arc<[AzStartSnapshot]>,
+    pub deblunder: DeblunderConfig,
+    pub restart_fraction: f32,
+    pub restart_archive: Option<Arc<AzRestartArchive>>,
+    pub tablebase: Option<Arc<AzTablebase>>,
+    pub endgame_teacher: Option<Arc<AzEndgameTeacherPool>>,
+    pub stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub mirror_probability: f32,
     pub record_fens: bool,
     /// 根节点连杀证明搜索的最大半回合数（0 = 关闭）。详见 `AzNnue::mate_search_plies`。
@@ -48,6 +54,13 @@ pub struct AzLoopConfig {
 
 #[derive(Clone, Debug, Default)]
 pub struct AzLoopReport {
+    pub teacher_games: usize,
+    pub teacher_samples: usize,
+    pub teacher_completed: usize,
+    pub deblunder_triggers: usize,
+    pub deblunder_samples: usize,
+    pub tablebase_hits: usize,
+    pub tablebase_samples: usize,
     pub training_steps: usize,
     pub training_chunks: usize,
     pub test_chunks: usize,

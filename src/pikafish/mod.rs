@@ -669,3 +669,4 @@ fn position_command(initial_fen: Option<&str>, moves_uci: &[String]) -> String {
     }
     command
 }
+pub mod teacher;

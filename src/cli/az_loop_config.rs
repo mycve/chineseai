@@ -52,6 +52,25 @@ pub struct AzLoopFileConfig {
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub selfplay_opening_book: String,
+    /// LC0 式探索失误校正；只影响新生成的数据。
+    pub deblunder_enabled: bool,
+    pub deblunder_q_gap_threshold: f32,
+    pub deblunder_q_gap_width: f32,
+    /// GEVC：从共享的已访问局面循环档案起局的概率。
+    pub restart_fraction: f32,
+    pub restart_capacity: usize,
+    /// 仅接受与本引擎规则和完整历史匹配的已验证残局标签。
+    pub tablebase_sqlite: String,
+    /// 原 az-loop 直接启用本地残局教师；已有配置无需补字段或另换配置。
+    pub endgame_teacher_enabled: bool,
+    pub endgame_teacher_exe: String,
+    pub endgame_teacher_nnue: String,
+    pub endgame_teacher_processes: usize,
+    pub endgame_teacher_hash_mb: u32,
+    pub endgame_teacher_nodes: u64,
+    pub endgame_teacher_timeout_ms: u64,
+    pub endgame_teacher_max_pieces: usize,
+    pub endgame_teacher_max_plies: usize,
     /// 根节点连杀证明搜索的最大半回合数（0 = 关闭，9 = 最多 mate in 5，15 = mate in 8）。
     ///
     /// 带 `#[serde(default)]`：老配置文件里没有这一项时按 0（关闭）解析，不必改格式版本。
@@ -135,6 +154,21 @@ impl Default for AzLoopFileConfig {
             draw_score: 0.0,
             policy_softmax_temp: 1.45,
             selfplay_opening_book: "book.pgn.gz".into(),
+            deblunder_enabled: false,
+            deblunder_q_gap_threshold: 0.1,
+            deblunder_q_gap_width: 0.0,
+            restart_fraction: 0.0,
+            restart_capacity: 10_000,
+            tablebase_sqlite: String::new(),
+            endgame_teacher_enabled: true,
+            endgame_teacher_exe: "tools/pikafish.exe".into(),
+            endgame_teacher_nnue: "tools/pikafish.nnue".into(),
+            endgame_teacher_processes: 2,
+            endgame_teacher_hash_mb: 64,
+            endgame_teacher_nodes: 20_000,
+            endgame_teacher_timeout_ms: 30_000,
+            endgame_teacher_max_pieces: 12,
+            endgame_teacher_max_plies: 600,
             // 9 半回合 = mate in 5：实测把可证射程从 mate-in-4 推到 mate-in-5，
             // 而"有将军但无杀"的局面只 +4%，根局面没有将军着法时为 0。
             mate_search_plies: 9,
@@ -207,6 +241,30 @@ impl AzLoopFileConfig {
         line!("format_version", AZ_LOOP_CONFIG_FORMAT_VERSION);
         line!("model_path", q(&self.model_path));
         line!("selfplay_opening_book", q(&self.selfplay_opening_book));
+        line!("deblunder_enabled", self.deblunder_enabled);
+        line!(
+            "deblunder_q_gap_threshold",
+            f(self.deblunder_q_gap_threshold)
+        );
+        line!("deblunder_q_gap_width", f(self.deblunder_q_gap_width));
+        line!("restart_fraction", f(self.restart_fraction));
+        line!("restart_capacity", self.restart_capacity);
+        line!("tablebase_sqlite", q(&self.tablebase_sqlite));
+        line!("endgame_teacher_enabled", self.endgame_teacher_enabled);
+        line!("endgame_teacher_exe", q(&self.endgame_teacher_exe));
+        line!("endgame_teacher_nnue", q(&self.endgame_teacher_nnue));
+        line!("endgame_teacher_processes", self.endgame_teacher_processes);
+        line!("endgame_teacher_hash_mb", self.endgame_teacher_hash_mb);
+        line!("endgame_teacher_nodes", self.endgame_teacher_nodes);
+        line!(
+            "endgame_teacher_timeout_ms",
+            self.endgame_teacher_timeout_ms
+        );
+        line!(
+            "endgame_teacher_max_pieces",
+            self.endgame_teacher_max_pieces
+        );
+        line!("endgame_teacher_max_plies", self.endgame_teacher_max_plies);
         line!("mate_search_plies", self.mate_search_plies);
         line!("moves_left_enabled", self.moves_left_enabled);
         line!("moves_left_threshold", f(self.moves_left_threshold));
@@ -349,6 +407,46 @@ impl AzLoopFileConfig {
     }
 
     fn normalize(mut self) -> Self {
+        if self.endgame_teacher_enabled {
+            assert!(
+                !self.endgame_teacher_exe.trim().is_empty()
+                    && !self.endgame_teacher_nnue.trim().is_empty(),
+                "endgame teacher requires an executable and NNUE"
+            );
+            assert!(
+                self.endgame_teacher_processes > 0
+                    && self.endgame_teacher_hash_mb > 0
+                    && self.endgame_teacher_nodes > 0
+                    && self.endgame_teacher_timeout_ms > 0,
+                "endgame teacher process count, hash, nodes and timeout must be positive"
+            );
+            assert!(
+                (2..=32).contains(&self.endgame_teacher_max_pieces),
+                "endgame_teacher_max_pieces must be within [2, 32]"
+            );
+            assert!(
+                (1..=10_000).contains(&self.endgame_teacher_max_plies),
+                "endgame_teacher_max_plies must be within [1, 10000]"
+            );
+        }
+        assert!(
+            self.deblunder_q_gap_threshold.is_finite()
+                && (0.0..=2.0).contains(&self.deblunder_q_gap_threshold),
+            "deblunder_q_gap_threshold must be finite and within [0, 2]"
+        );
+        assert!(
+            self.deblunder_q_gap_width.is_finite()
+                && (0.0..=2.0).contains(&self.deblunder_q_gap_width),
+            "deblunder_q_gap_width must be finite and within [0, 2]"
+        );
+        assert!(
+            self.restart_fraction.is_finite() && (0.0..=1.0).contains(&self.restart_fraction),
+            "restart_fraction must be finite and within [0, 1]"
+        );
+        assert!(
+            self.restart_fraction == 0.0 || self.restart_capacity > 0,
+            "restart_capacity must be positive when restarts are enabled"
+        );
         let moves_left = self.moves_left_params();
         self.moves_left_enabled = moves_left.enabled;
         self.moves_left_threshold = moves_left.threshold;
@@ -415,6 +513,77 @@ impl AzLoopFileConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_config_enables_teacher_without_replacing_training_settings() {
+        let old = AzLoopFileConfig {
+            model_path: "existing/model.safetensors".into(),
+            selfplay_opening_book: "existing/book.pgn.gz".into(),
+            simulations: 2048,
+            lr: 0.0002,
+            batch_size: 256,
+            max_plies: 300,
+            hidden_size: 48,
+            workers: 3,
+            replay_capacity: 100000,
+            train_warmup_samples: 10000,
+            checkpoint_dir: "existing/checkpoints".into(),
+            ..AzLoopFileConfig::default()
+        };
+        let text = old
+            .to_file_text()
+            .lines()
+            .filter(|line| !line.starts_with("endgame_teacher_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let loaded = AzLoopFileConfig::parse(&text);
+        assert!(loaded.endgame_teacher_enabled);
+        assert_eq!(loaded.model_path, old.model_path);
+        assert_eq!(loaded.selfplay_opening_book, old.selfplay_opening_book);
+        assert_eq!(loaded.simulations, old.simulations);
+        assert_eq!(loaded.lr, old.lr);
+        assert_eq!(loaded.batch_size, old.batch_size);
+        assert_eq!(loaded.max_plies, old.max_plies);
+        assert_eq!(loaded.hidden_size, old.hidden_size);
+        assert_eq!(loaded.workers, old.workers);
+        assert_eq!(loaded.replay_capacity, old.replay_capacity);
+        assert_eq!(loaded.train_warmup_samples, old.train_warmup_samples);
+        assert_eq!(loaded.checkpoint_dir, old.checkpoint_dir);
+        assert!(
+            !AzLoopFileConfig::parse(&format!("{text}\nendgame_teacher_enabled = false"))
+                .endgame_teacher_enabled
+        );
+    }
+
+    #[test]
+    fn selfplay_corrections_roundtrip_and_reject_invalid_parameters() {
+        let mut config = AzLoopFileConfig::default();
+        config.deblunder_enabled = true;
+        config.deblunder_q_gap_threshold = 0.12;
+        config.deblunder_q_gap_width = 0.08;
+        config.restart_fraction = 0.9;
+        config.restart_capacity = 123;
+        config.tablebase_sqlite = "eval/endgames.sqlite".into();
+        let parsed = AzLoopFileConfig::parse(&config.to_file_text());
+        assert!(parsed.deblunder_enabled);
+        assert_eq!(parsed.deblunder_q_gap_threshold, 0.12);
+        assert_eq!(parsed.deblunder_q_gap_width, 0.08);
+        assert_eq!(parsed.restart_fraction, 0.9);
+        assert_eq!(parsed.restart_capacity, 123);
+        assert_eq!(parsed.tablebase_sqlite, "eval/endgames.sqlite");
+        for invalid in [
+            "restart_fraction = nan",
+            "restart_fraction = 1.1",
+            "restart_fraction = 0.5\nrestart_capacity = 0",
+            "deblunder_q_gap_threshold = -0.1",
+            "deblunder_q_gap_width = inf",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| AzLoopFileConfig::parse(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     #[test]
     fn embedded_defaults_match_public_px0_selfplay_settings() {

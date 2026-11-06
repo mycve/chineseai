@@ -24,6 +24,11 @@ pub(crate) fn run() {
                 return;
             }
         }
+        Some(CliCommand::AzTrain(cmd)) => {
+            if !crate::cli::az_train::run(cmd) {
+                return;
+            }
+        }
         Some(CliCommand::VsPikafish(cmd)) => vs_pikafish::run(cmd),
     }
     chineseai::infra::profile::print_report();

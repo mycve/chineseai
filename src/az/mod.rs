@@ -16,6 +16,8 @@ mod context;
 #[cfg(all(test, feature = "slow-tests"))]
 mod cuda_test_device;
 mod dataloader;
+mod deblunder;
+mod endgame;
 mod feature_map;
 mod fused_policy;
 mod fused_sparse_policy;
@@ -33,10 +35,13 @@ pub use policy_calibration::{PolicyCalibrationReport, calibrate_policy};
 pub mod px0_data;
 mod px0_policy_map;
 mod replay;
+mod rescore;
+mod restart;
 mod sample;
 mod shared;
 mod simd;
 mod start;
+mod tablebase;
 #[cfg(test)]
 mod tests;
 mod train;
@@ -58,12 +63,19 @@ pub use alphazero::{
     cp_from_q,
 };
 pub use dataloader::{AzSparseActivationStats, sparse_activation_stats};
+pub use deblunder::DeblunderConfig;
+pub use endgame::AzEndgameTeacherPool;
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
-    play_arena_games_from_positions, play_arena_games_from_snapshots,
+    play_arena_games_from_positions, play_arena_games_from_snapshots, try_generate_selfplay_data,
 };
 pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats, Px0ReplaySampler};
+pub use restart::{AzRestartArchive, AzRestartGame};
 pub use start::AzStartSnapshot;
+pub use tablebase::{
+    AzTablebase, TABLEBASE_RULESET, TABLEBASE_SCHEMA, TablebaseLabel, tablebase_rule_context,
+    write_verified_tablebase_label,
+};
 pub use train::{
     AzTrainOptimizer, train_samples, train_samples_weighted, train_samples_weighted_owned,
     train_samples_weighted_owned_with_optimizer, train_samples_weighted_shared,

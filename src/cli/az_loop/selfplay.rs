@@ -114,6 +114,13 @@ pub(crate) fn build_async_training_report(
             / pending.selfplay.start_games[source].max(1) as f32
     });
     AzLoopReport {
+        teacher_games: pending.selfplay.teacher_games,
+        teacher_samples: pending.selfplay.teacher_samples,
+        teacher_completed: pending.selfplay.teacher_completed,
+        deblunder_triggers: pending.selfplay.deblunder_triggers,
+        deblunder_samples: pending.selfplay.deblunder_samples,
+        tablebase_hits: pending.selfplay.tablebase_hits,
+        tablebase_samples: pending.selfplay.tablebase_samples,
         training_steps: 0,
         training_chunks: 0,
         test_chunks: 0,

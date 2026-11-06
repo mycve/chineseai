@@ -65,6 +65,32 @@ impl AzSearchSimulationStats {
 }
 
 impl AzTerminalStats {
+    fn record_rule_outcome(&mut self, outcome: RuleOutcome) -> f32 {
+        match outcome {
+            RuleOutcome::Draw(reason) => {
+                self.rule_draw += 1;
+                match reason {
+                    RuleDrawReason::NaturalMoveLimit => self.rule_draw_natural_limit += 1,
+                    RuleDrawReason::InsufficientMaterial => {
+                        self.rule_draw_insufficient_material += 1
+                    }
+                    RuleDrawReason::Repetition => self.rule_draw_repetition += 1,
+                    RuleDrawReason::MutualLongCheck => self.rule_draw_mutual_long_check += 1,
+                    RuleDrawReason::MutualLongChase => self.rule_draw_mutual_long_chase += 1,
+                }
+                0.0
+            }
+            RuleOutcome::Win(Color::Red) => {
+                self.rule_win_red += 1;
+                1.0
+            }
+            RuleOutcome::Win(Color::Black) => {
+                self.rule_win_black += 1;
+                -1.0
+            }
+        }
+    }
+
     fn record_no_legal_moves(&mut self, position: &Position) {
         self.no_legal_moves += 1;
         if !position.legal_moves().is_empty() {
@@ -189,6 +215,13 @@ fn score_rate_to_elo(score: f32) -> f32 {
 
 #[derive(Clone, Default)]
 pub struct AzSelfplayData {
+    pub teacher_games: usize,
+    pub teacher_samples: usize,
+    pub teacher_completed: usize,
+    pub deblunder_triggers: usize,
+    pub deblunder_samples: usize,
+    pub tablebase_hits: usize,
+    pub tablebase_samples: usize,
     pub samples: Vec<AzTrainingSample>,
     pub games: Vec<Vec<AzTrainingSample>>,
     pub position_fens: Vec<String>,
@@ -235,6 +268,13 @@ pub struct AzSelfplayData {
 
 impl AzSelfplayData {
     pub fn add_assign(&mut self, other: &Self) {
+        self.teacher_games += other.teacher_games;
+        self.teacher_samples += other.teacher_samples;
+        self.teacher_completed += other.teacher_completed;
+        self.deblunder_triggers += other.deblunder_triggers;
+        self.deblunder_samples += other.deblunder_samples;
+        self.tablebase_hits += other.tablebase_hits;
+        self.tablebase_samples += other.tablebase_samples;
         self.samples.extend(other.samples.iter().cloned());
         self.games.extend(other.games.iter().cloned());
         self.position_fens
@@ -286,6 +326,13 @@ impl AzSelfplayData {
 }
 
 pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+    try_generate_selfplay_data(model, config).expect("selfplay generation failed")
+}
+
+pub fn try_generate_selfplay_data(
+    model: &AzNnue,
+    config: &AzLoopConfig,
+) -> std::io::Result<AzSelfplayData> {
     crate::scope_profile!("az.selfplay.generate");
     // 连杀预算挂在模型上（`AzNnue::mate_search_plies`）。这里统一打一次补丁，让单线程与
     // 多线程两条路径共用同一份设置；两边本来就一样时不克隆（关闭态零代价）。
@@ -335,9 +382,9 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     });
     let mut merged = AzSelfplayData::default();
     for chunk in chunks {
-        merged.add_assign(&chunk);
+        merged.add_assign(&chunk?);
     }
-    merged
+    Ok(merged)
 }
 
 fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSearchLimits {
@@ -378,9 +425,25 @@ struct SelfplayStart {
 
 fn choose_selfplay_start(
     config: &AzLoopConfig,
-    _rng: &mut SplitMix64,
+    rng: &mut SplitMix64,
     game_index: usize,
 ) -> SelfplayStart {
+    if config.restart_fraction > 0.0
+        && let Some(archive) = &config.restart_archive
+        && !archive.is_empty()
+        && rng.unit_f32() < config.restart_fraction
+        && let Some(snapshot) = archive.sample(rng).filter(|snapshot| {
+            (snapshot.phase_ply as usize).saturating_add(config.max_plies) <= u16::MAX as usize
+        })
+    {
+        return SelfplayStart {
+            position: snapshot.position,
+            rule_history: snapshot.rule_history,
+            phase_ply: snapshot.phase_ply as usize,
+            source: AzStartSource::Midgame,
+            generation: snapshot.generation,
+        };
+    }
     if !config.opening_positions.is_empty() {
         let snapshot = &config.opening_positions[game_index % config.opening_positions.len()];
         return SelfplayStart {
@@ -402,7 +465,10 @@ fn choose_selfplay_start(
     }
 }
 
-fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+fn generate_selfplay_chunk(
+    model: &AzNnue,
+    config: &AzLoopConfig,
+) -> std::io::Result<AzSelfplayData> {
     crate::scope_profile!("az.selfplay.chunk");
     let mut rng = SplitMix64::new(config.seed);
     let mut samples = Vec::new();
@@ -448,8 +514,18 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
     let mut search_workspace = AzSearchWorkspace::new(model);
+    let mut deblunder_triggers = 0;
+    let mut deblunder_samples = 0;
+    let mut tablebase_hits = 0;
+    let mut tablebase_samples = 0;
+    let mut teacher_games = 0;
+    let mut teacher_samples = 0;
+    let mut teacher_completed = 0;
 
     for game_index in 0..config.games {
+        if selfplay_stopped(config) {
+            break;
+        }
         let start = choose_selfplay_start(config, &mut rng, game_index);
         let mut position = start.position;
         let mut rule_history = start.rule_history;
@@ -461,17 +537,48 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         start_phase_ply_sum[start_source_index] += start_phase_ply as u64;
         start_age_sum[start_source_index] += u64::from(start_age);
         start_age_max[start_source_index] = start_age_max[start_source_index].max(start_age);
-        start_temperature_sum[start_source_index] += temperature_for_ply(config, start_phase_ply);
+        let restart = start_source == AzStartSource::Midgame;
+        let temperature_start_ply = if restart { 0 } else { start_phase_ply };
+        start_temperature_sum[start_source_index] +=
+            temperature_for_ply(config, temperature_start_ply);
         let mut game_samples = Vec::new();
         let mut game_proofs = Vec::new();
+        let mut game_deblunder = Vec::new();
+        let mut game_tablebase = Vec::new();
+        let mut restart_game = config.restart_archive.as_ref().map(|a| a.start_recording());
         let mut result = None;
         let mut search_failed = false;
         let mut proven_termination = false;
         let mut proven_terminal_ply = None;
         let mut played_plies = 0usize;
         let mut plies = 0usize;
+        let mut teacher = None;
+        let mut teacher_command = String::new();
+        let mut teacher_start_ply = 0;
 
-        for local_ply in 0..config.max_plies.saturating_sub(start_phase_ply) {
+        let trajectory_limit = if restart {
+            config.max_plies
+        } else {
+            config.max_plies.saturating_sub(start_phase_ply)
+        };
+        let teacher_limit = config
+            .endgame_teacher
+            .as_ref()
+            .map_or(0, |pool| pool.max_plies());
+        let total_limit = trajectory_limit
+            .saturating_add(teacher_limit)
+            .min((u16::MAX as usize).saturating_sub(start_phase_ply));
+        for local_ply in 0..total_limit {
+            if selfplay_stopped(config) {
+                search_failed = true;
+                break;
+            }
+            if teacher.is_none() && local_ply >= trajectory_limit {
+                break;
+            }
+            if teacher.is_some() && local_ply - teacher_start_ply >= teacher_limit {
+                break;
+            }
             let ply = start_phase_ply + local_ply;
             plies = local_ply + 1;
             let legal = {
@@ -492,133 +599,206 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            search_simulations.searches += 1;
+            if local_ply == 0
+                && let Some(outcome) = position.rule_outcome_with_history(&rule_history)
+            {
+                result = Some(terminal.record_rule_outcome(outcome));
+                break;
+            }
+            if let Some(game) = &mut restart_game {
+                game.observe(&position, &rule_history, ply, config.generation_update);
+            }
 
-            let limits = selfplay_search_limits(
-                config,
-                ply,
-                rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
-            );
-            let search = {
-                crate::scope_profile!("az.selfplay.search");
-                alphazero_search_with_rules_reusing(
+            if teacher.is_none()
+                && let Some(pool) = &config.endgame_teacher
+                && pool.should_take_over(&position)
+            {
+                teacher_command =
+                    super::endgame::teacher_position_command(&position, &rule_history)?;
+                teacher = Some(pool.acquire()?);
+                teacher_start_ply = local_ply;
+                teacher_games += 1;
+            }
+            let (mv, proven_result, proven_distance) = if let Some(teacher) = &mut teacher {
+                let mv = teacher.best_move(&teacher_command, &legal)?;
+                let candidates = teacher_candidates(&legal, mv);
+                let index = legal
+                    .iter()
+                    .position(|&candidate| candidate == mv)
+                    .expect("validated teacher move") as u16;
+                let meta = AzSampleMeta {
+                    generation_update: config.generation_update,
+                    game_id: config.seed ^ game_index as u64,
+                    ply: ply as u16,
+                    best_index: index,
+                    played_index: index,
+                    start_source,
+                    ..AzSampleMeta::default()
+                };
+                if config.record_fens {
+                    position_fens.push(position.to_fen_with_history(&rule_history));
+                }
+                game_samples.push(make_training_sample(
                     &position,
                     &rule_history,
-                    legal,
-                    limits,
-                    &mut search_workspace,
-                )
-            };
-            search_simulations.simulations_sum += search.simulations;
-            search_simulations.nn_evaluations += search_workspace.last_nn_evaluations;
-            search_simulations.nn_cache_hits += search_workspace.last_cache_hits;
-            crate::scope_profile!("az.selfplay.post_search");
-            let proven_result = proven_root_value(&search.candidates).map(|value| {
-                value as f32
-                    * if position.side_to_move() == Color::Red {
-                        1.0
-                    } else {
-                        -1.0
-                    }
-            });
-            let entropy = policy_entropy(&search.candidates);
-            let shape = policy_shape_stats(&search.candidates);
-            raw_prior_top1_sum += shape.raw_prior_top1;
-            raw_prior_top2_sum += shape.raw_prior_top2;
-            policy_top1_sum += shape.policy_top1;
-            policy_top2_sum += shape.policy_top2;
-            q_gap_sum += shape.q_gap;
-            q_top1_abs_sum += shape.q_top1_abs;
-            visited_actions_sum += shape.visited_actions;
-            shape_count += 1;
-            entropy_all_sum += entropy;
-            entropy_all_count += 1;
-            if ply < temperature_opening_plies(config) {
-                entropy_opening_sum += entropy;
-                entropy_opening_count += 1;
-                opening_raw_prior_top1_sum += shape.raw_prior_top1;
-                opening_raw_prior_top2_sum += shape.raw_prior_top2;
-                opening_policy_top1_sum += shape.policy_top1;
-                opening_policy_top2_sum += shape.policy_top2;
-                opening_q_gap_sum += shape.q_gap;
-                opening_q_top1_abs_sum += shape.q_top1_abs;
-                opening_visited_actions_sum += shape.visited_actions;
-                opening_shape_count += 1;
+                    &candidates,
+                    0.0,
+                    [1.0 / 3.0; 3],
+                    rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+                    meta,
+                    0,
+                    1.0,
+                ));
+                game_proofs.push(None);
+                if config.deblunder.enabled {
+                    game_deblunder.push(None);
+                }
+                if let Some(tablebase) = &config.tablebase {
+                    let label = tablebase.probe(&position, &rule_history);
+                    tablebase_hits += usize::from(label.is_some());
+                    game_tablebase.push(label);
+                }
+                teacher_samples += 1;
+                (mv, None, None)
             } else {
-                entropy_mid_sum += entropy;
-                entropy_mid_count += 1;
-            }
-            let temperature = temperature_for_ply(config, ply);
-            let mv_opt = if temperature <= 1e-6 {
-                search.best_move.or_else(|| {
+                search_simulations.searches += 1;
+
+                let limits = selfplay_search_limits(
+                    config,
+                    ply,
+                    rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
+                );
+                let search = {
+                    crate::scope_profile!("az.selfplay.search");
+                    alphazero_search_with_rules_reusing(
+                        &position,
+                        &rule_history,
+                        legal,
+                        limits,
+                        &mut search_workspace,
+                    )
+                };
+                search_simulations.simulations_sum += search.simulations;
+                search_simulations.nn_evaluations += search_workspace.last_nn_evaluations;
+                search_simulations.nn_cache_hits += search_workspace.last_cache_hits;
+                crate::scope_profile!("az.selfplay.post_search");
+                let proven_result = proven_root_value(&search.candidates).map(|value| {
+                    value as f32
+                        * if position.side_to_move() == Color::Red {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                });
+                let entropy = policy_entropy(&search.candidates);
+                let shape = policy_shape_stats(&search.candidates);
+                raw_prior_top1_sum += shape.raw_prior_top1;
+                raw_prior_top2_sum += shape.raw_prior_top2;
+                policy_top1_sum += shape.policy_top1;
+                policy_top2_sum += shape.policy_top2;
+                q_gap_sum += shape.q_gap;
+                q_top1_abs_sum += shape.q_top1_abs;
+                visited_actions_sum += shape.visited_actions;
+                shape_count += 1;
+                entropy_all_sum += entropy;
+                entropy_all_count += 1;
+                if ply < temperature_opening_plies(config) {
+                    entropy_opening_sum += entropy;
+                    entropy_opening_count += 1;
+                    opening_raw_prior_top1_sum += shape.raw_prior_top1;
+                    opening_raw_prior_top2_sum += shape.raw_prior_top2;
+                    opening_policy_top1_sum += shape.policy_top1;
+                    opening_policy_top2_sum += shape.policy_top2;
+                    opening_q_gap_sum += shape.q_gap;
+                    opening_q_top1_abs_sum += shape.q_top1_abs;
+                    opening_visited_actions_sum += shape.visited_actions;
+                    opening_shape_count += 1;
+                } else {
+                    entropy_mid_sum += entropy;
+                    entropy_mid_count += 1;
+                }
+                let temperature =
+                    temperature_for_ply(config, if restart { local_ply } else { ply });
+                let mv_opt = if temperature <= 1e-6 {
+                    search.best_move.or_else(|| {
+                        choose_selfplay_move(
+                            &search.candidates,
+                            temperature,
+                            config.temperature_visit_offset,
+                            &mut rng,
+                        )
+                    })
+                } else {
                     choose_selfplay_move(
                         &search.candidates,
                         temperature,
                         config.temperature_visit_offset,
                         &mut rng,
                     )
-                })
-            } else {
-                choose_selfplay_move(
-                    &search.candidates,
-                    temperature,
-                    config.temperature_visit_offset,
-                    &mut rng,
-                )
-            };
-            let Some(mv) = mv_opt else {
-                terminal.search_no_move += 1;
-                search_failed = true;
-                break;
-            };
-            let mut move_meta = move_search_meta(
-                &search.candidates,
-                mv,
-                search.value_q,
-                config.generation_update,
-                config.seed ^ game_index as u64,
-                ply,
-            );
-            move_meta.start_source = start_source;
-            sampled_moves += 1;
-            sampled_best_moves += usize::from(move_meta.best_index == move_meta.played_index);
-            best_played_q_gap_sum += (move_meta.best_q - move_meta.played_q).max(0.0);
-            let top_visits = search
-                .candidates
-                .iter()
-                .map(|candidate| candidate.visits)
-                .max()
-                .unwrap_or(0);
-            played_top_visit_ratio_sum += if top_visits == 0 {
-                0.0
-            } else {
-                move_meta.played_visits as f32 / top_visits as f32
-            };
-            best_q_sum += move_meta.best_q;
-            played_q_sum += move_meta.played_q;
-            {
-                crate::scope_profile!("az.selfplay.make_sample");
-                if config.record_fens {
-                    position_fens.push(position.to_fen_with_history(&rule_history));
+                };
+                let Some(mv) = mv_opt else {
+                    terminal.search_no_move += 1;
+                    search_failed = true;
+                    break;
+                };
+                if config.deblunder.enabled {
+                    game_deblunder.push(super::deblunder::DeblunderStep::from_search(&search, mv));
                 }
-                let sample = make_training_sample(
-                    &position,
-                    &rule_history,
+                if let Some(tablebase) = &config.tablebase {
+                    let label = tablebase.probe(&position, &rule_history);
+                    tablebase_hits += usize::from(label.is_some());
+                    game_tablebase.push(label);
+                }
+                let mut move_meta = move_search_meta(
                     &search.candidates,
+                    mv,
                     search.value_q,
-                    search.value_wdl,
-                    rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
-                    move_meta,
-                    search.simulations,
-                    1.0,
+                    config.generation_update,
+                    config.seed ^ game_index as u64,
+                    ply,
                 );
-                game_samples.push(sample);
-                game_proofs.push(proven_root_value(&search.candidates));
-            }
+                move_meta.start_source = start_source;
+                sampled_moves += 1;
+                sampled_best_moves += usize::from(move_meta.best_index == move_meta.played_index);
+                best_played_q_gap_sum += (move_meta.best_q - move_meta.played_q).max(0.0);
+                let top_visits = search
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.visits)
+                    .max()
+                    .unwrap_or(0);
+                played_top_visit_ratio_sum += if top_visits == 0 {
+                    0.0
+                } else {
+                    move_meta.played_visits as f32 / top_visits as f32
+                };
+                best_q_sum += move_meta.best_q;
+                played_q_sum += move_meta.played_q;
+                {
+                    crate::scope_profile!("az.selfplay.make_sample");
+                    if config.record_fens {
+                        position_fens.push(position.to_fen_with_history(&rule_history));
+                    }
+                    let sample = make_training_sample(
+                        &position,
+                        &rule_history,
+                        &search.candidates,
+                        search.value_q,
+                        search.value_wdl,
+                        rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+                        move_meta,
+                        search.simulations,
+                        1.0,
+                    );
+                    game_samples.push(sample);
+                    game_proofs.push(proven_root_value(&search.candidates));
+                }
+                (mv, proven_result, search.proven_moves_left)
+            };
             if let Some(outcome) = proven_result {
                 terminal.search_proven[outcome_index(outcome)] += 1;
                 proven_termination = true;
-                proven_terminal_ply = search.proven_moves_left.map(|distance| ply + distance);
+                proven_terminal_ply = proven_distance.map(|distance| ply + distance);
                 result = Some(outcome);
                 break;
             }
@@ -627,6 +807,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             position.make_move(mv);
             played_plies += 1;
             rule_history.push(position.rule_history_entry_after_moved(mover, mv, captured));
+            if teacher.is_some() {
+                if !teacher_command.contains(" moves ") {
+                    teacher_command.push_str(" moves");
+                }
+                teacher_command.push(' ');
+                teacher_command.push_str(&mv.to_uci());
+            }
 
             if !position.has_general(Color::Red) {
                 result = Some(-1.0);
@@ -643,33 +830,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 position.rule_outcome_with_history(&rule_history)
             };
             if let Some(rule_outcome) = rule_outcome {
-                result = Some(match rule_outcome {
-                    RuleOutcome::Draw(_) => 0.0,
-                    RuleOutcome::Win(Color::Red) => 1.0,
-                    RuleOutcome::Win(Color::Black) => -1.0,
-                });
-                match rule_outcome {
-                    RuleOutcome::Draw(reason) => {
-                        terminal.rule_draw += 1;
-                        match reason {
-                            RuleDrawReason::NaturalMoveLimit => {
-                                terminal.rule_draw_natural_limit += 1
-                            }
-                            RuleDrawReason::InsufficientMaterial => {
-                                terminal.rule_draw_insufficient_material += 1
-                            }
-                            RuleDrawReason::Repetition => terminal.rule_draw_repetition += 1,
-                            RuleDrawReason::MutualLongCheck => {
-                                terminal.rule_draw_mutual_long_check += 1
-                            }
-                            RuleDrawReason::MutualLongChase => {
-                                terminal.rule_draw_mutual_long_chase += 1
-                            }
-                        }
-                    }
-                    RuleOutcome::Win(Color::Red) => terminal.rule_win_red += 1,
-                    RuleOutcome::Win(Color::Black) => terminal.rule_win_black += 1,
-                }
+                result = Some(terminal.record_rule_outcome(rule_outcome));
                 break;
             }
         }
@@ -688,6 +849,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
 
         let terminal_result = result;
+        let used_teacher = teacher.is_some();
+        teacher_completed += usize::from(used_teacher && terminal_result.is_some());
+        // 立即释放进程给其他对局，后续只做CPU标签整理。
+        drop(teacher);
         let result: f32 = terminal_result.unwrap_or(0.0);
         match result.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => red_wins += 1,
@@ -706,12 +871,49 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                         .then_some(start_phase_ply + played_plies)
                 }),
             );
+            if config.tablebase.is_some() {
+                tablebase_samples += super::rescore::apply_tablebase_targets(
+                    &mut game_samples,
+                    &mut game_proofs,
+                    &game_tablebase,
+                );
+            }
+            if config.deblunder.enabled && !used_teacher {
+                // 截断轨迹只允许处理已验证残局锚点之前的有效前缀。
+                let known_prefix = if terminal_result.is_some() {
+                    game_samples.len()
+                } else {
+                    game_tablebase
+                        .iter()
+                        .rposition(Option::is_some)
+                        .map_or(0, |i| i + 1)
+                };
+                let stats = super::deblunder::apply_deblunder(
+                    &mut game_samples[..known_prefix],
+                    &game_deblunder[..known_prefix],
+                    &game_proofs[..known_prefix],
+                    known_prefix > 0,
+                    config.deblunder,
+                );
+                deblunder_triggers += stats.triggers;
+                deblunder_samples += stats.corrected_samples;
+            }
+        }
+        if let (Some(archive), Some(game)) = (&config.restart_archive, restart_game) {
+            archive.add_game(game);
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
     }
 
-    AzSelfplayData {
+    Ok(AzSelfplayData {
+        teacher_games,
+        teacher_samples,
+        teacher_completed,
+        deblunder_triggers,
+        deblunder_samples,
+        tablebase_hits,
+        tablebase_samples,
         samples,
         games,
         position_fens,
@@ -754,7 +956,30 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         played_q_sum,
         terminal,
         search_simulations,
-    }
+    })
+}
+
+fn selfplay_stopped(config: &AzLoopConfig) -> bool {
+    config
+        .stop
+        .as_ref()
+        .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn teacher_candidates(legal: &[Move], chosen: Move) -> Vec<AzCandidate> {
+    legal
+        .iter()
+        .map(|&mv| AzCandidate {
+            mv,
+            visits: 0,
+            q: 0.0,
+            raw_prior: 0.0,
+            prior: 0.0,
+            policy: u8::from(mv == chosen) as f32,
+            solved: None,
+            moves_left: None,
+        })
+        .collect()
 }
 
 struct PolicyShapeStats {
@@ -1409,6 +1634,12 @@ mod tests {
             draw_score: 0.0,
             policy_softmax_temp: 1.0,
             opening_positions: Default::default(),
+            deblunder: super::super::DeblunderConfig::default(),
+            restart_fraction: 0.0,
+            restart_archive: None,
+            tablebase: None,
+            endgame_teacher: None,
+            stop: None,
             mirror_probability: 0.0,
             record_fens: false,
             moves_left_params: crate::az::AzMovesLeftParams::default(),
@@ -1438,6 +1669,85 @@ mod tests {
             );
             Position::from_fen(fen)
                 .unwrap_or_else(|err| panic!("recorded FEN does not round-trip `{fen}`: {err}"));
+        }
+    }
+
+    #[test]
+    fn teacher_policy_is_legal_one_hot_without_search_proofs() {
+        let legal = Position::startpos().legal_moves();
+        let candidates = teacher_candidates(&legal, legal[3]);
+        assert_eq!(candidates.iter().map(|c| c.policy).sum::<f32>(), 1.0);
+        assert_eq!(candidates[3].policy, 1.0);
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.solved.is_none() && c.visits == 0)
+        );
+        assert_eq!(proven_root_value(&candidates), None);
+    }
+
+    #[test]
+    fn cancelled_selfplay_does_not_start_a_game() {
+        let mut config = selfplay_test_config(4);
+        config.stop = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let model = AzNnue::random_with_arch(crate::az::AzNnueArch::default(), 11);
+        let data = generate_selfplay_data(&model, &config);
+        assert!(data.games.is_empty());
+        assert!(data.samples.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires local tools/pikafish.exe and tools/pikafish.nnue"]
+    fn local_teacher_rollout_trains_terminal_and_masks_truncation() {
+        use super::super::AzEndgameTeacherPool;
+        use crate::pikafish::teacher::TeacherConfig;
+        let teacher_config = TeacherConfig {
+            exe: "tools/pikafish.exe".into(),
+            nnue: "tools/pikafish.nnue".into(),
+            hash_mb: 16,
+            timeout: std::time::Duration::from_secs(10),
+        };
+        let position = Position::from_fen("4k4/9/9/9/9/9/9/R8/8R/3K5 w - - 0 1").unwrap();
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 1;
+        config.mirror_probability = 1.0;
+        config.deblunder.enabled = true;
+        config.opening_positions = vec![AzStartSnapshot {
+            rule_history: position.initial_rule_history(),
+            position,
+            phase_ply: 0,
+            generation: 0,
+        }]
+        .into();
+        let model = AzNnue::random_with_arch(crate::az::AzNnueArch::default(), 11);
+        for (limit, completes) in [(16, true), (1, false)] {
+            config.endgame_teacher = Some(Arc::new(
+                AzEndgameTeacherPool::new(teacher_config.clone(), 1, 20_000, 12, limit).unwrap(),
+            ));
+            let data = generate_selfplay_data(&model, &config);
+            assert_eq!(data.teacher_games, 1);
+            assert_eq!(data.teacher_completed, usize::from(completes));
+            assert_eq!(data.teacher_samples, data.samples.len());
+            assert_eq!(data.search_simulations.searches, 0);
+            assert_eq!(data.deblunder_samples, 0);
+            assert_eq!(data.terminal.search_proven, [0; 3]);
+            assert!(!data.samples.is_empty());
+            for sample in &data.samples {
+                assert_eq!(sample.search_simulations, 0);
+                assert_eq!(sample.policy.iter().filter(|&&p| p == 1.0).count(), 1);
+                assert_eq!(sample.value_weight, if completes { 1.0 } else { 0.0 });
+                assert_eq!(sample.moves_left_weight, if completes { 1.0 } else { 0.0 });
+                if completes {
+                    assert_eq!(sample.value, sample.side_sign);
+                }
+            }
+            if completes {
+                assert_eq!(data.red_wins, 1);
+                assert!(data.samples.len() > config.max_plies);
+                assert_eq!(data.terminal.no_legal_moves, 1);
+            } else {
+                assert_eq!(data.terminal.max_plies, 1);
+            }
         }
     }
 
@@ -1525,7 +1835,7 @@ mod tests {
             generation: 0,
         }]
         .into();
-        let data = generate_selfplay_chunk(&AzNnue::random(4, 7), &config);
+        let data = generate_selfplay_chunk(&AzNnue::random(4, 7), &config).unwrap();
         assert_eq!(data.samples.len(), 1);
         assert_eq!(data.samples[0].search_simulations, 400);
         assert_eq!(data.search_simulations.searches, 1);
@@ -1603,7 +1913,7 @@ mod tests {
         let mut config = selfplay_test_config(4);
         config.max_plies = 1;
         config.simulations = 2;
-        let data = generate_selfplay_chunk(&model, &config);
+        let data = generate_selfplay_chunk(&model, &config).unwrap();
         assert_eq!(data.terminal.max_plies, 4);
         assert_eq!(data.terminal.search_proven, [0, 0, 0]);
         assert!(data.samples.iter().all(|sample| sample.value_weight == 0.0));
@@ -1628,7 +1938,7 @@ mod tests {
             generation: 0,
         }]
         .into();
-        let data = generate_selfplay_chunk(&model, &config);
+        let data = generate_selfplay_chunk(&model, &config).unwrap();
         assert_eq!(data.terminal.search_proven, [1, 0, 0]);
         assert_eq!(data.samples.len(), 1);
         let sample = &data.samples[0];
@@ -1673,7 +1983,7 @@ mod tests {
             generation: 0,
         }]
         .into();
-        let data = generate_selfplay_chunk(&model, &config);
+        let data = generate_selfplay_chunk(&model, &config).unwrap();
         let sample = &data.samples[0];
         assert_eq!(
             sample.move_indices[sample.meta.played_index as usize],
@@ -1718,7 +2028,7 @@ mod tests {
         let mut config = selfplay_test_config(4);
         config.max_plies = 1;
         config.simulations = 2;
-        let data = generate_selfplay_chunk(&model, &config);
+        let data = generate_selfplay_chunk(&model, &config).unwrap();
         assert_eq!(data.terminal.max_plies, 4);
         assert_eq!(data.terminal.search_no_move, 0);
         assert_eq!(data.draws, 4);
@@ -2110,6 +2420,282 @@ mod tests {
         assert_eq!(
             choose_selfplay_move(&moves, 0.9, -0.8, &mut rng),
             Some(moves[1].mv)
+        );
+    }
+
+    fn restart_archive_with_snapshot(
+        position: &Position,
+        history: &[RuleHistoryEntry],
+        phase_ply: usize,
+    ) -> Arc<crate::az::AzRestartArchive> {
+        let archive = Arc::new(crate::az::AzRestartArchive::new(8));
+        let mut recording = archive.start_recording();
+        recording.observe(position, history, phase_ply, 3);
+        archive.add_game(recording);
+        archive
+    }
+
+    #[test]
+    fn selfplay_restart_archive_records_nonterminal_roots_after_generation() {
+        let archive = Arc::new(crate::az::AzRestartArchive::new(2));
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 3;
+        config.simulations = 2;
+        config.restart_archive = Some(Arc::clone(&archive));
+        let data = generate_selfplay_chunk(&AzNnue::random(4, 41), &config).unwrap();
+        assert_eq!(data.samples.len(), 3);
+        assert_eq!(archive.seen(), 3);
+        assert_eq!(archive.len(), 2);
+        let mut rng = SplitMix64::new(19);
+        for _ in 0..16 {
+            let snapshot = archive.sample(&mut rng).unwrap();
+            assert!((1..=2).contains(&snapshot.phase_ply));
+            assert_eq!(
+                snapshot
+                    .position
+                    .rule_outcome_with_history(&snapshot.rule_history),
+                None
+            );
+            assert!(
+                !snapshot
+                    .position
+                    .legal_moves_with_rules(&snapshot.rule_history)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn selfplay_restart_uses_local_budget_after_late_phase_snapshot() {
+        let position = Position::startpos();
+        let history = position.initial_rule_history();
+        let archive = restart_archive_with_snapshot(&position, &history, 4000);
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 3;
+        config.simulations = 2;
+        config.restart_fraction = 1.0;
+        config.restart_archive = Some(Arc::clone(&archive));
+        let data = generate_selfplay_chunk(&AzNnue::random(4, 41), &config).unwrap();
+        assert_eq!(data.samples.len(), 3);
+        assert_eq!(data.terminal.max_plies, 1);
+        assert_eq!(data.start_games[AzStartSource::Midgame.index()], 1);
+        assert_eq!(
+            data.start_phase_ply_sum[AzStartSource::Midgame.index()],
+            4000
+        );
+        assert_eq!(
+            data.samples.iter().map(|s| s.meta.ply).collect::<Vec<_>>(),
+            [4000, 4001, 4002]
+        );
+        assert_eq!(archive.seen(), 4);
+    }
+
+    #[test]
+    fn selfplay_restart_resets_temperature_but_keeps_rule_history() {
+        let mut position = Position::startpos();
+        position.set_rule60_max_ply(Some(90));
+        let mut history = position.initial_rule_history();
+        for text in ["b0c2", "b9c7", "c2b0"] {
+            let mv = position.parse_uci_move(text).unwrap();
+            history.push(position.rule_history_entry_after_move(mv));
+            position.make_move(mv);
+        }
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 1;
+        config.simulations = 2;
+        config.temperature_start = 1.2;
+        config.temperature_endgame = 0.1;
+        config.temperature_decay_delay_plies = 40;
+        config.temperature_decay_plies = 80;
+        config.temperature_cutoff_plies = 78;
+        config.restart_fraction = 1.0;
+        config.restart_archive = Some(restart_archive_with_snapshot(&position, &history, 420));
+        let selected = choose_selfplay_start(&config, &mut SplitMix64::new(1), 0);
+        assert_eq!(selected.position, position);
+        assert_eq!(selected.rule_history, history);
+        assert_eq!(selected.generation, 3);
+        assert_eq!(selected.phase_ply, 420);
+        let data = generate_selfplay_chunk(&AzNnue::random(4, 41), &config).unwrap();
+        assert_eq!(data.samples.len(), 1);
+        assert_eq!(data.samples[0].meta.ply, 420);
+        assert_eq!(
+            data.samples[0].rule_context,
+            rule_context_features(&position, &history)
+        );
+        assert_eq!(
+            data.start_temperature_sum[AzStartSource::Midgame.index()],
+            1.2
+        );
+    }
+
+    #[test]
+    fn selfplay_restart_disabled_preserves_generated_samples_and_rng() {
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 3;
+        config.simulations = 2;
+        config.temperature_start = 0.9;
+        config.temperature_endgame = 0.6;
+        config.temperature_decay_delay_plies = 40;
+        config.temperature_decay_plies = 120;
+        config.record_fens = true;
+        let model = AzNnue::random(4, 41);
+        let baseline = generate_selfplay_chunk(&model, &config).unwrap();
+        let position = Position::startpos();
+        config.restart_archive = Some(restart_archive_with_snapshot(
+            &position,
+            &position.initial_rule_history(),
+            4000,
+        ));
+        let observed = generate_selfplay_chunk(&model, &config).unwrap();
+        assert_eq!(baseline.position_fens, observed.position_fens);
+        assert_eq!(baseline.samples.len(), observed.samples.len());
+        for (expected, actual) in baseline.samples.iter().zip(&observed.samples) {
+            assert_eq!(expected.features, actual.features);
+            assert_eq!(expected.policy, actual.policy);
+            assert_eq!(expected.value_wdl, actual.value_wdl);
+            assert_eq!(expected.root_search_wdl, actual.root_search_wdl);
+            assert_eq!(expected.value_weight, actual.value_weight);
+            assert_eq!(expected.meta.played_index, actual.meta.played_index);
+            assert_eq!(expected.meta.game_id, actual.meta.game_id);
+        }
+        assert_eq!(observed.start_games[AzStartSource::Midgame.index()], 0);
+    }
+
+    #[test]
+    fn selfplay_restart_archive_excludes_rule_terminal_initial_position() {
+        let position = Position::from_fen("4k4/9/9/9/9/9/9/9/9/3K5 w").unwrap();
+        let history = position.initial_rule_history();
+        assert!(position.rule_outcome_with_history(&history).is_some());
+        assert!(!position.legal_moves_with_rules(&history).is_empty());
+        let archive = Arc::new(crate::az::AzRestartArchive::new(2));
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 1;
+        config.simulations = 2;
+        config.restart_archive = Some(Arc::clone(&archive));
+        config.opening_positions = vec![AzStartSnapshot {
+            position,
+            rule_history: history,
+            phase_ply: 0,
+            generation: 0,
+        }]
+        .into();
+        generate_selfplay_chunk(&AzNnue::random(4, 41), &config).unwrap();
+        assert!(archive.is_empty(), "规则已终局的起点不能进入重启档案");
+        assert_eq!(archive.seen(), 0);
+    }
+
+    #[test]
+    fn selfplay_verified_tablebase_labels_a_mirrored_truncated_game() {
+        let position = Position::from_fen(
+            "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1",
+        )
+        .unwrap();
+        let history = position.initial_rule_history();
+        let proof = crate::az::search_root_mate_profiled(
+            &position,
+            &history,
+            crate::az::MateSearchLimits {
+                max_plies: 15,
+                max_nodes: 200_000,
+            },
+        );
+        assert_eq!(
+            proof.solution.expect("离线证明器应证出 mate-in-8").plies,
+            15
+        );
+        assert!(!proof.budget_exhausted);
+        assert!(!proof.interrupted);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chineseai-selfplay-verified-tablebase-{}-{nonce}.sqlite",
+            std::process::id(),
+        ));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        crate::az::write_verified_tablebase_label(
+            &connection,
+            &position,
+            &history,
+            crate::az::TablebaseLabel {
+                value: 1,
+                // 连杀证明给出可胜路线，不能把受限搜索距离当全局最短 DTM。
+                moves_left: None,
+            },
+            "search_root_mate_profiled:depth=15,nodes=200000",
+        )
+        .unwrap();
+        let tablebase = crate::az::AzTablebase::load(&path).unwrap();
+        assert_eq!(tablebase.len(), 1);
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 1;
+        config.simulations = 2;
+        config.mate_search_plies = 0;
+        config.mirror_probability = 1.0;
+        config.deblunder.enabled = true;
+        config.opening_positions = vec![AzStartSnapshot {
+            position,
+            rule_history: history,
+            phase_ply: 0,
+            generation: 0,
+        }]
+        .into();
+        let model = AzNnue::random(4, 41);
+        let baseline = generate_selfplay_data(&model, &config);
+        assert_eq!(baseline.terminal.max_plies, 1);
+        assert_eq!(baseline.samples[0].value_weight, 0.0);
+
+        config.tablebase = Some(Arc::new(tablebase));
+        let data = generate_selfplay_data(&model, &config);
+        assert_eq!(data.terminal.max_plies, 1);
+        assert_eq!(data.terminal.search_proven, [0, 0, 0]);
+        assert_eq!(data.tablebase_hits, 1);
+        assert_eq!(data.tablebase_samples, 1);
+        assert_eq!(data.samples.len(), 1);
+        let sample = &data.samples[0];
+        assert_eq!(sample.value_weight, 1.0);
+        assert_eq!(sample.value, 1.0);
+        assert_eq!(sample.value_wdl, [1.0, 0.0, 0.0]);
+        assert_eq!(sample.moves_left_weight, 0.0);
+        assert_eq!(sample.policy_weight, 1.0);
+        assert!(!sample.policy.is_empty());
+        assert_eq!(sample.policy, baseline.samples[0].policy);
+        assert_eq!(sample.features, baseline.samples[0].features);
+        assert_eq!(
+            sample.meta.played_index,
+            baseline.samples[0].meta.played_index
+        );
+    }
+
+    #[test]
+    fn selfplay_restart_rejects_phase_that_would_overflow_training_metadata() {
+        let position = Position::startpos();
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 3;
+        config.simulations = 2;
+        config.restart_fraction = 1.0;
+        config.restart_archive = Some(restart_archive_with_snapshot(
+            &position,
+            &position.initial_rule_history(),
+            u16::MAX as usize - 1,
+        ));
+        let selected = choose_selfplay_start(&config, &mut SplitMix64::new(1), 0);
+        assert_eq!(selected.source, AzStartSource::Startpos);
+        assert_eq!(selected.phase_ply, 0);
+        let data = generate_selfplay_chunk(&AzNnue::random(4, 41), &config).unwrap();
+        assert_eq!(data.samples.len(), 3);
+        assert_eq!(data.start_games[AzStartSource::Midgame.index()], 0);
+        assert_eq!(
+            data.samples
+                .iter()
+                .map(|sample| sample.meta.ply)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
         );
     }
 }

@@ -10,8 +10,8 @@ use crate::cli::reporting::*;
 use crate::cli::training_console;
 use chineseai::az::{
     AzArenaReport, AzExperiencePool, AzLoopReport, AzNnue, AzSearchLimits, AzTrainLossWeights,
-    Px0ReplaySampler, SplitMix64, generate_selfplay_data, policy_target_entropy,
-    train_samples_weighted_owned_with_optimizer,
+    Px0ReplaySampler, SplitMix64, policy_target_entropy,
+    train_samples_weighted_owned_with_optimizer, try_generate_selfplay_data,
 };
 use chineseai::xiangqi::Position;
 use rusqlite::Connection;
@@ -61,10 +61,41 @@ pub(crate) fn build_selfplay_supply(
 }
 
 pub(crate) fn run(cmd: AzLoopArgs) -> bool {
-    let config_path = cmd.config;
-    let Some(config) = load_or_create_az_loop_config(&config_path) else {
+    let Some(config) = load_or_create_az_loop_config(&cmd.config) else {
         return false;
     };
+    run_config(cmd, config)
+}
+
+pub(crate) fn run_config(
+    cmd: AzLoopArgs,
+    config: crate::cli::az_loop_config::AzLoopFileConfig,
+) -> bool {
+    let config_path = cmd.config;
+    let endgame_teacher = config.endgame_teacher_enabled.then(|| {
+        use chineseai::pikafish::teacher::TeacherConfig;
+        let pool = chineseai::az::AzEndgameTeacherPool::new(
+            TeacherConfig {
+                exe: PathBuf::from(&config.endgame_teacher_exe),
+                nnue: PathBuf::from(&config.endgame_teacher_nnue),
+                hash_mb: config.endgame_teacher_hash_mb,
+                timeout: Duration::from_millis(config.endgame_teacher_timeout_ms),
+            },
+            config.endgame_teacher_processes,
+            config.endgame_teacher_nodes,
+            config.endgame_teacher_max_pieces,
+            config.endgame_teacher_max_plies,
+        )
+        .unwrap_or_else(|err| panic!("cannot start local endgame teacher: {err}"));
+        println!(
+            "teacher  : local Pikafish, processes={} nodes={} takeover_pieces<={} tail_limit={}",
+            config.endgame_teacher_processes,
+            config.endgame_teacher_nodes,
+            config.endgame_teacher_max_pieces,
+            config.endgame_teacher_max_plies
+        );
+        Arc::new(pool)
+    });
     let target_update = cmd.target_update.map(|update| update.max(1));
     let progress_boot = load_az_loop_progress(&config_path);
     let mut start_update = progress_boot.next_update.max(1);
@@ -267,13 +298,40 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         model: Arc::new(initial_selfplay_model),
     }));
     let supply = Arc::new(std::sync::Mutex::new(build_selfplay_supply(&config)));
+    let restart_archive = (config.restart_fraction > 0.0).then(|| {
+        Arc::new(chineseai::az::AzRestartArchive::new(
+            config.restart_capacity,
+        ))
+    });
+    let tablebase = (!config.tablebase_sqlite.trim().is_empty()).then(|| {
+        let cache = chineseai::az::AzTablebase::load(&config.tablebase_sqlite)
+            .unwrap_or_else(|err| panic!("failed to load verified tablebase `{}`: {err}", config.tablebase_sqlite));
+        assert!(!cache.is_empty(), "tablebase has no labels verified for this engine's rules; CDB raw responses cannot be used as exact targets");
+        println!("tablebase: {} verified context-bound labels", cache.len());
+        Arc::new(cache)
+    });
+    println!(
+        "selfplay corrections: deblunder={} q_gap={} width={} restart_fraction={} restart_capacity={}",
+        config.deblunder_enabled,
+        config.deblunder_q_gap_threshold,
+        config.deblunder_q_gap_width,
+        config.restart_fraction,
+        restart_archive
+            .as_ref()
+            .map_or(0, |archive| archive.capacity())
+    );
     let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
+    let selfplay_error = Arc::new(std::sync::Mutex::new(None::<String>));
     for worker_id in 0..selfplay_worker_count {
         let selfplay_stop = stop_requested.clone();
         let selfplay_config = config.clone();
         let selfplay_tx = selfplay_tx.clone();
         let shared_model = Arc::clone(&shared_model);
         let supply = Arc::clone(&supply);
+        let restart_archive = restart_archive.clone();
+        let tablebase = tablebase.clone();
+        let endgame_teacher = endgame_teacher.clone();
+        let selfplay_error = selfplay_error.clone();
         selfplay_handles.push(thread::spawn(move || {
             let mut batch_index = 0usize;
             let mut local_version = u64::MAX;
@@ -304,18 +362,29 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                     &Arc::default(),
                 );
                 loop_config.games = 4;
+                loop_config.restart_archive = restart_archive.clone();
+                loop_config.tablebase = tablebase.clone();
+                loop_config.endgame_teacher = endgame_teacher.clone();
+                loop_config.stop = Some(selfplay_stop.clone());
                 loop_config.opening_positions = supply
                     .lock()
                     .unwrap_or_else(|_| panic!("selfplay supply poisoned"))
                     .next_batch(loop_config.games, local_learner_update)
                     .unwrap_or_else(|err| panic!("invalid selfplay opening: {err}"))
                     .into();
-                let data = generate_selfplay_data(
+                let data = match try_generate_selfplay_data(
                     local_model
                         .as_deref()
                         .expect("selfplay model not initialized"),
                     &loop_config,
-                );
+                ) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        *selfplay_error.lock().unwrap() = Some(error.to_string());
+                        selfplay_stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                };
                 let batch = SelfplayBatch { data };
                 if selfplay_tx.send(batch).is_err() {
                     break;
@@ -545,7 +614,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     let mut update = start_update;
     let mut interrupt_save_model: Option<AzNnue> = None;
     let mut interrupt_save_next_update = start_update;
-    loop {
+    'updates: loop {
         if interrupted.load(Ordering::SeqCst) {
             exited_after_ctrl_c = true;
             break;
@@ -557,6 +626,9 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                     candidate_model,
                 }) => break (report, candidate_model),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if selfplay_error.lock().unwrap().is_some() {
+                        break 'updates;
+                    }
                     if interrupted.load(Ordering::SeqCst) {
                         exited_after_ctrl_c = true;
                         break (
@@ -628,6 +700,9 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if selfplay_error.lock().unwrap().is_some() {
+                        break 'updates;
+                    }
                     if interrupted.load(Ordering::SeqCst) {
                         exited_after_ctrl_c = true;
                         break (
@@ -739,6 +814,12 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             true_draws,
             checkpoint_saved.is_some(),
         );
+        if config.endgame_teacher_enabled {
+            println!(
+                "teacher  : games={} completed={} policy_samples={}",
+                report.teacher_games, report.teacher_completed, report.teacher_samples
+            );
+        }
         for check in &report.holdout_checks {
             console.test(check);
             for (tag, value) in [
@@ -819,6 +900,29 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 report.search_nn_cache_hit_rate,
             ),
             ("selfplay/avg_plies", report.avg_plies),
+            (
+                "selfplay/deblunder_triggers",
+                report.deblunder_triggers as f32,
+            ),
+            (
+                "selfplay/deblunder_samples",
+                report.deblunder_samples as f32,
+            ),
+            ("selfplay/tablebase_hits", report.tablebase_hits as f32),
+            ("selfplay/teacher_games", report.teacher_games as f32),
+            ("selfplay/teacher_samples", report.teacher_samples as f32),
+            (
+                "selfplay/teacher_completed",
+                report.teacher_completed as f32,
+            ),
+            (
+                "selfplay/tablebase_samples",
+                report.tablebase_samples as f32,
+            ),
+            (
+                "selfplay/restart_archive_size",
+                restart_archive.as_ref().map_or(0, |a| a.len()) as f32,
+            ),
             ("selfplay/completed_games", completed as f32),
             ("selfplay/visit_policy_entropy", report.root_visit_entropy),
             (
@@ -1291,7 +1395,9 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         .join()
         .unwrap_or_else(|_| panic!("training thread panicked"))
         .unwrap_or_else(|err| panic!("failed to save training state: {err}"));
-    if exited_after_ctrl_c || exited_after_target_update {
+    let selfplay_error = selfplay_error.lock().unwrap().take();
+    drop(endgame_teacher);
+    if exited_after_ctrl_c || exited_after_target_update || selfplay_error.is_some() {
         if let Some(model) = interrupt_save_model.as_ref() {
             save_model(model, Path::new(&config.model_path));
             save_az_loop_progress_pair(
@@ -1321,6 +1427,10 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 }
             );
         }
+    }
+    if let Some(error) = selfplay_error {
+        eprintln!("本地残局教师失败，已停止产数并回收进程：{error}");
+        std::process::exit(1);
     }
     true
 }
