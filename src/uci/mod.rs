@@ -23,6 +23,7 @@ const DEFAULT_FPU_VALUE: f32 = 0.23;
 const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 1.0;
 const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.4;
 const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
+const OPENING_MAX_Q_GAP: f32 = 0.05;
 /// 对局/分析时默认开启的连杀证明深度：15 半回合 = 最多 mate in 8。
 ///
 /// 与自博弈配置默认的 9 不同，因为 UCI 这边是"人看着的强度/分析"，而自博弈还要考虑
@@ -54,6 +55,7 @@ struct UciState {
     policy_softmax_temp: f32,
     opening_temp_plies: usize,
     opening_temperature: f32,
+    analyse_mode: bool,
     game_ply: Option<usize>,
     draw_score: f32,
     sixty_move_rule: bool,
@@ -91,6 +93,7 @@ impl Default for UciState {
             policy_softmax_temp: DEFAULT_POLICY_SOFTMAX_TEMP,
             opening_temp_plies: 0,
             opening_temperature: DEFAULT_OPENING_TEMPERATURE,
+            analyse_mode: false,
             game_ply: Some(0),
             draw_score: 0.0,
             sixty_move_rule: true,
@@ -197,6 +200,7 @@ fn print_uci_id() {
     println!("option name PolicySoftmaxTemp type string default {DEFAULT_POLICY_SOFTMAX_TEMP}");
     println!("option name OpeningTempPlies type spin default 0 min 0 max 1000");
     println!("option name OpeningTemperature type string default {DEFAULT_OPENING_TEMPERATURE}");
+    println!("option name UCI_AnalyseMode type check default false");
     println!("option name DrawScore type string default 0.0");
     println!("option name Sixty Move Rule type check default true");
     println!("option name RepetitionDraw type check default true");
@@ -390,6 +394,7 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 state.opening_temperature = temperature.clamp(0.0, 2.0);
             }
         }
+        "uci_analysemode" => state.analyse_mode = value.eq_ignore_ascii_case("true"),
         "drawscore" => {
             state.draw_score = value
                 .parse::<f32>()
@@ -739,20 +744,12 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     }
     match result.best_move {
         Some(mv) => {
-            let chosen = if state
-                .game_ply
-                .is_some_and(|ply| ply < state.opening_temp_plies)
-                && state.opening_temperature > 0.0
-            {
+            let temperature = opening_temperature_for(&state, &params);
+            let chosen = if temperature > 0.0 {
                 let entropy = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |time| time.as_nanos() as u64);
-                choose_opening_move(
-                    &result.candidates,
-                    mv,
-                    state.opening_temperature,
-                    state.seed ^ entropy,
-                )
+                choose_opening_move(&result.candidates, mv, temperature, state.seed ^ entropy)
             } else {
                 mv
             };
@@ -873,6 +870,20 @@ fn flush() {
     let _ = io::stdout().flush();
 }
 
+fn opening_temperature_for(state: &UciState, params: &GoParams) -> f32 {
+    if state.analyse_mode || params.infinite || params.mate.is_some() {
+        return 0.0;
+    }
+    if state
+        .game_ply
+        .is_some_and(|ply| ply < state.opening_temp_plies)
+    {
+        state.opening_temperature
+    } else {
+        0.0
+    }
+}
+
 fn choose_opening_move(
     candidates: &[AzCandidate],
     best: Move,
@@ -884,18 +895,35 @@ fn choose_opening_move(
         .map(AzCandidate::proof_priority)
         .max()
         .unwrap_or(0);
+    // 最高优先级为胜或负时，根节点已有明确胜负证明。
+    if priority != 1 || temperature <= 0.0 {
+        return best;
+    }
+    let Some(best_q) = candidates
+        .iter()
+        .find(|candidate| candidate.mv == best)
+        .map(|candidate| candidate.q)
+        .filter(|q| q.is_finite())
+    else {
+        return best;
+    };
+    let eligible = |candidate: &AzCandidate| {
+        candidate.proof_priority() == priority
+            && candidate.q.is_finite()
+            && best_q - candidate.q <= OPENING_MAX_Q_GAP
+    };
     let max_visits = candidates
         .iter()
-        .filter(|candidate| candidate.proof_priority() == priority)
+        .filter(|candidate| eligible(candidate))
         .map(|candidate| candidate.visits)
         .max()
         .unwrap_or(0);
-    if max_visits == 0 || temperature <= 0.0 {
+    if max_visits == 0 {
         return best;
     }
     let exponent = 1.0 / temperature;
     let weight = |candidate: &AzCandidate| {
-        if candidate.proof_priority() != priority {
+        if !eligible(candidate) {
             return 0.0;
         }
         let visit_ratio = candidate.visits as f32 / max_visits as f32;
@@ -1221,10 +1249,10 @@ mod tests {
     }
 
     #[test]
-    fn opening_temperature_samples_only_visited_moves() {
+    fn opening_temperature_filters_by_q_before_visit_weighting() {
         let best = Move::new(0, 1);
         let alternate = Move::new(0, 2);
-        let candidates = [
+        let mut candidates = [
             AzCandidate {
                 mv: best,
                 visits: 80,
@@ -1255,6 +1283,16 @@ mod tests {
                 solved: None,
                 moves_left: None,
             },
+            AzCandidate {
+                mv: Move::new(0, 4),
+                visits: 400,
+                q: -0.06,
+                raw_prior: 0.0,
+                prior: 0.0,
+                policy: 0.0,
+                solved: None,
+                moves_left: None,
+            },
         ];
         assert_eq!(choose_opening_move(&candidates, best, 0.0, 1), best);
         let alternates = (0..1000)
@@ -1263,6 +1301,39 @@ mod tests {
             .filter(|mv| *mv == alternate)
             .count();
         assert!((100..300).contains(&alternates));
+
+        // 即使另一条已证胜的路线访问量更大，也沿用搜索选出的最佳着法。
+        candidates[0].solved = Some(1);
+        candidates[3].solved = Some(1);
+        candidates[3].q = candidates[0].q;
+        for seed in 0..32 {
+            assert_eq!(choose_opening_move(&candidates, best, 2.0, seed), best);
+        }
+        for candidate in &mut candidates {
+            candidate.solved = Some(-1);
+        }
+        for seed in 0..32 {
+            assert_eq!(choose_opening_move(&candidates, best, 2.0, seed), best);
+        }
+    }
+
+    #[test]
+    fn opening_temperature_is_disabled_during_analysis() {
+        let mut state = UciState::default();
+        handle_setoption("setoption name OpeningTempPlies value 20", &mut state);
+        handle_setoption("setoption name OpeningTemperature value 1", &mut state);
+        let play = parse_go("go movetime 100");
+        assert_eq!(opening_temperature_for(&state, &play), 1.0);
+        for command in ["go infinite", "go mate 4"] {
+            assert_eq!(opening_temperature_for(&state, &parse_go(command)), 0.0);
+        }
+        handle_setoption("setoption name UCI_AnalyseMode value true", &mut state);
+        assert_eq!(
+            opening_temperature_for(&state, &parse_go("go depth 4")),
+            0.0
+        );
+        handle_setoption("setoption name UCI_AnalyseMode value false", &mut state);
+        assert_eq!(opening_temperature_for(&state, &play), 1.0);
     }
 
     #[test]
