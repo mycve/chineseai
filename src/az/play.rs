@@ -448,6 +448,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
     let mut search_workspace = AzSearchWorkspace::new(model);
+    let chessdb = super::chessdb::SelfplayTablebase::open();
+    let dtm = super::chessdb::DtmTablebase::shared();
 
     for game_index in 0..config.games {
         let start = choose_selfplay_start(config, &mut rng, game_index);
@@ -490,6 +492,29 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 });
                 terminal.record_no_legal_moves(&position);
                 break;
+            }
+
+            if (dtm.is_some() || chessdb.is_some())
+                && (local_ply == 0 || position.halfmove_clock() == 0)
+                && let Some(fen) = super::chessdb::endgame_fen(&position)
+            {
+                let cached = dtm.filter(|tablebase| tablebase.cached_or_request(&fen));
+                if (cached.is_some() || chessdb.is_some())
+                    && position.halfmove_clock() == 0
+                    && position.repetition_draw_enabled()
+                    && !game_samples.is_empty()
+                    && legal.len() == position.legal_moves().len()
+                    && position.rule_outcome_with_history(&rule_history).is_none()
+                    && let Some(outcome) = cached
+                        .and_then(|tablebase| tablebase.adjudicate(&fen, &position))
+                        .or_else(|| chessdb.as_ref()?.adjudicate(&fen, &position, &legal))
+                {
+                    result = Some(outcome);
+                    // 价值标签可用，残局库的裁定不代表对局已经走到真实终点。
+                    proven_termination = true;
+                    plies = played_plies;
+                    break;
+                }
             }
 
             search_simulations.searches += 1;

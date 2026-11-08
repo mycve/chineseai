@@ -17,6 +17,7 @@ tools
 !tools/
 tools/*
 !tools/policy_arch_search.py
+!tools/setup_chessdb_dtm.py
 eval/*.csv
 eval/*.fens
 eval/*.bin

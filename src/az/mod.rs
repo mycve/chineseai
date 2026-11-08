@@ -11,6 +11,7 @@ mod arch;
 ))]
 #[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 mod candle_model;
+mod chessdb;
 mod context;
 // slow-tests 的 CUDA 对照测试共用同一个设备，避免每个测试重复 JIT 编译 kernel。
 #[cfg(all(test, feature = "slow-tests"))]
