@@ -138,6 +138,8 @@ pub struct AzLoopReport {
     pub terminal_rule_win_black: usize,
     pub terminal_max_plies: usize,
     pub terminal_search_proven: [usize; 3],
+    pub terminal_tablebase_games: usize,
+    pub terminal_tablebase_positions: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

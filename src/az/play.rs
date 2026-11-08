@@ -29,6 +29,8 @@ fn outcome_index(result_red: f32) -> usize {
 pub struct AzTerminalStats {
     /// 已由搜索证明的提前终局，按红胜、和棋、黑胜排列。
     pub search_proven: [usize; 3],
+    pub tablebase_games: usize,
+    pub tablebase_positions: usize,
     pub no_legal_moves: usize,
     pub checkmate: usize,
     pub stalemate: usize,
@@ -80,6 +82,8 @@ impl AzTerminalStats {
         for (count, other_count) in self.search_proven.iter_mut().zip(other.search_proven) {
             *count += other_count;
         }
+        self.tablebase_games += other.tablebase_games;
+        self.tablebase_positions += other.tablebase_positions;
         self.no_legal_moves += other.no_legal_moves;
         self.checkmate += other.checkmate;
         self.stalemate += other.stalemate;
@@ -465,7 +469,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         start_age_max[start_source_index] = start_age_max[start_source_index].max(start_age);
         start_temperature_sum[start_source_index] += temperature_for_ply(config, start_phase_ply);
         let mut game_samples = Vec::new();
-        let mut game_proofs = Vec::new();
+        let mut game_proofs: Vec<Option<i8>> = Vec::new();
         let mut result = None;
         let mut search_failed = false;
         let mut proven_termination = false;
@@ -509,6 +513,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                         .and_then(|tablebase| tablebase.adjudicate(&fen, &position))
                         .or_else(|| chessdb.as_ref()?.adjudicate(&fen, &position, &legal))
                 {
+                    terminal.tablebase_games += 1;
+                    terminal.tablebase_positions +=
+                        game_proofs.iter().filter(|proof| proof.is_none()).count();
                     result = Some(outcome);
                     // 价值标签可用，残局库的裁定不代表对局已经走到真实终点。
                     proven_termination = true;

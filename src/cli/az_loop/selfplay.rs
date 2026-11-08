@@ -223,5 +223,7 @@ pub(crate) fn build_async_training_report(
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
         terminal_search_proven: pending.selfplay.terminal.search_proven,
+        terminal_tablebase_games: pending.selfplay.terminal.tablebase_games,
+        terminal_tablebase_positions: pending.selfplay.terminal.tablebase_positions,
     }
 }

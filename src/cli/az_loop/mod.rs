@@ -871,6 +871,14 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 "terminal/search_proven",
                 report.terminal_search_proven.iter().sum::<usize>() as f32,
             ),
+            (
+                "terminal/tablebase_games",
+                report.terminal_tablebase_games as f32,
+            ),
+            (
+                "terminal/tablebase_positions",
+                report.terminal_tablebase_positions as f32,
+            ),
         ] {
             log_scalar(&mut tb, tag, report.training_steps, value);
         }

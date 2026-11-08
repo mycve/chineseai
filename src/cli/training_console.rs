@@ -62,7 +62,7 @@ impl TrainingConsole {
         checkpoint: bool,
     ) {
         let production = format!(
-            "update {update:04}: selfplay={:.1}s games={} total={} pool={}/{} chunks(train/test)={}/{} R/B/D={}/{}/{} cutoff={} failed={}{}",
+            "update {update:04}: selfplay={:.1}s games={} total={} pool={}/{} chunks(train/test)={}/{} R/B/D={}/{}/{} cutoff={} failed={} tablebase(games/positions)={}/{}{}",
             report.total_seconds,
             report.games,
             games_total,
@@ -75,6 +75,8 @@ impl TrainingConsole {
             draws,
             report.terminal_max_plies,
             report.terminal_search_no_move,
+            report.terminal_tablebase_games,
+            report.terminal_tablebase_positions,
             if checkpoint { " checkpoint=saved" } else { "" }
         );
         let loss = format!(
