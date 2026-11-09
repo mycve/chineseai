@@ -540,6 +540,7 @@ struct AzNode {
 struct AzChild {
     mv: Move,
     gives_check: bool,
+    repeats_position: bool,
     prior: f32,
     visits: u32,
     value_wdl_sum: [f32; 3],
@@ -616,8 +617,10 @@ impl<'a> AzTree<'a> {
                 .then_with(|| right.visits.cmp(&left.visits))
                 .then_with(|| right.q.total_cmp(&left.q))
         });
-        let best_move = self
+        let selected_child = self
             .best_root_child(self.root)
+            .map(|index| self.prefer_endgame_progress(index));
+        let best_move = selected_child
             .map(|child_index| root_children[child_index].mv)
             .or_else(|| candidates.first().map(|candidate| candidate.mv));
         AzSearchResult {
@@ -626,19 +629,17 @@ impl<'a> AzTree<'a> {
             value_cp: cp_from_q(searched_value),
             value_wdl: searched_wdl,
             network_value_wdl: root_node.value_wdl,
-            best_value_wdl: self
-                .best_root_child(self.root)
-                .map_or(searched_wdl, |index| {
-                    let child = &root_children[index];
-                    if let Some(value) = self.child_solved(child) {
-                        return scalar_terminal_wdl(value as f32);
-                    }
-                    if child.visits == 0 {
-                        searched_wdl
-                    } else {
-                        child.value_wdl_sum.map(|v| v / child.visits as f32)
-                    }
-                }),
+            best_value_wdl: selected_child.map_or(searched_wdl, |index| {
+                let child = &root_children[index];
+                if let Some(value) = self.child_solved(child) {
+                    return scalar_terminal_wdl(value as f32);
+                }
+                if child.visits == 0 {
+                    searched_wdl
+                } else {
+                    child.value_wdl_sum.map(|v| v / child.visits as f32)
+                }
+            }),
             proven_moves_left: root_node.proven_moves_left,
             simulations,
             search_depth_avg: self.search_depth_avg(),
@@ -1108,9 +1109,11 @@ impl<'a> AzTree<'a> {
                     .into_iter()
                     .zip(priors.drain(..))
                     .zip(&self.eval_scratch.policy_gives_check)
-                    .map(|((mv, prior), &gives_check)| AzChild {
+                    .zip(repetition_flags)
+                    .map(|(((mv, prior), &gives_check), repeats)| AzChild {
                         mv,
                         gives_check: gives_check != 0.0,
+                        repeats_position: repeats != 0,
                         prior,
                         visits: 0,
                         value_wdl_sum: [0.0; 3],
@@ -1467,6 +1470,13 @@ impl<'a> AzTree<'a> {
         };
         let cpuct = self.compute_cpuct(node.visits, is_root);
         let moves_left = self.moves_left_context(node_index);
+        // 只调整选枝效用。重复局面的 WDL 和棋规证明仍按实际搜索结果回传。
+        let parent_q = if node.visits > 0 {
+            wdl_sum_utility(node.value_wdl_sum, node.visits, 0.0)
+        } else {
+            wdl_utility(node.value_wdl, 0.0)
+        };
+        let repetition_cost = ((parent_q - 0.75) * 0.4).clamp(0.0, 0.04);
         // 一趟同时取"证明优先级 → PUCT 分数 → 先验"的字典序最大值。
         // 原实现先扫一遍找已证明胜的子节点、再扫一遍求最高优先级、最后在最高
         // 优先级里比分数，每个子节点要查三次 `child_solved`（每次都随机访问
@@ -1479,7 +1489,7 @@ impl<'a> AzTree<'a> {
             if priority == 2 {
                 return index;
             }
-            let score = self.child_score_with_solved(
+            let mut score = self.child_score_with_solved(
                 child,
                 solved,
                 draw_score,
@@ -1488,6 +1498,9 @@ impl<'a> AzTree<'a> {
                 cpuct,
                 moves_left.as_ref(),
             );
+            if child.repeats_position && solved.is_none() {
+                score -= repetition_cost;
+            }
             let replace = best.is_none_or(|(_, best_priority, best_prior, best_score)| {
                 priority > best_priority
                     || (priority == best_priority
@@ -1520,6 +1533,35 @@ impl<'a> AzTree<'a> {
                     .then_with(|| left.prior.total_cmp(&right.prior))
             })
             .map(|(index, _)| index)
+    }
+
+    /// 大优时优先选已充分搜索且价值相近的非重复着法，避免把可赢局面走回旧局面。
+    fn prefer_endgame_progress(&self, best_index: usize) -> usize {
+        const MIN_WINNING_Q: f32 = 0.75;
+        const MAX_Q_GAP: f32 = 0.04;
+        let root = &self.nodes[self.root];
+        let children = self.node_children(self.root);
+        let best = &children[best_index];
+        let best_q = self.child_q(best, 0.0);
+        if root.solved.is_some()
+            || self.child_solved(best).is_some()
+            || best_q < MIN_WINNING_Q
+            || !best.repeats_position
+        {
+            return best_index;
+        }
+        let min_visits = (best.visits / 8).max(8);
+        children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| {
+                child.visits >= min_visits
+                    && self.child_solved(child).is_none()
+                    && self.child_q(child, 0.0) >= (best_q - MAX_Q_GAP).max(MIN_WINNING_Q)
+                    && !child.repeats_position
+            })
+            .max_by_key(|(_, child)| child.visits)
+            .map_or(best_index, |(index, _)| index)
     }
 
     /// 已证明胜负时，最终走法与证明距离采用同一条见证路线：快赢、慢输。
@@ -2378,6 +2420,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<AzChild>(), 32);
         let mut child = AzChild {
             gives_check: false,
+            repeats_position: false,
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
             visits: 0,
@@ -2414,6 +2457,7 @@ mod tests {
     fn wdl_q_applies_draw_score_instead_of_discarding_draw_probability() {
         let child = AzChild {
             gives_check: false,
+            repeats_position: false,
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
             visits: 4,
@@ -2608,6 +2652,63 @@ mod tests {
                 .zip(&noisy.candidates)
                 .any(|(left, right)| (left.prior - right.prior).abs() > 1e-6)
         );
+    }
+
+    #[test]
+    fn winning_endgame_prefers_a_searched_non_repeating_move() {
+        let model = AzNnue::random(8, 79);
+        let mut position =
+            Position::from_fen("7c1/3k5/4b4/9/3N2b2/4C4/4p4/3AB4/4A4/5KB2 w - - 0 1").unwrap();
+        let mut history = position.initial_rule_history();
+        for text in ["e4d4", "d8e8", "d5c7", "e8d8"] {
+            let mv = position.parse_uci_move(text).unwrap();
+            history.push(position.rule_history_entry_after_move(mv));
+            position.make_move(mv);
+        }
+        let repeat = position.parse_uci_move("c7d5").unwrap();
+        let progress = position.parse_uci_move("c7b5").unwrap();
+        assert!(position.move_repeats_history(&history, repeat));
+        assert!(!position.move_repeats_history(&history, progress));
+        let mut tree = AzTree::new(
+            position,
+            history,
+            Some(vec![repeat, progress]),
+            &model,
+            AzSearchLimits::default(),
+        );
+        tree.expand(tree.root);
+        for child in tree.node_children_mut(tree.root) {
+            if child.mv == repeat {
+                child.visits = 100;
+                child.value_wdl_sum = [90.0, 5.0, 5.0];
+            } else {
+                child.visits = 20;
+                child.value_wdl_sum = [16.4, 3.6, 0.0];
+            }
+        }
+        let result = tree.search_result(120);
+        assert_eq!(result.best_move, Some(progress));
+        assert_eq!(result.best_value_wdl[2], 0.0);
+        tree.nodes[tree.root].visits = 100;
+        tree.nodes[tree.root].value_wdl_sum = [90.0, 5.0, 5.0];
+        for child in tree.node_children_mut(tree.root) {
+            child.prior = 0.0;
+        }
+        assert_eq!(
+            tree.node_children(tree.root)[tree.select_child(tree.root)].mv,
+            progress
+        );
+        tree.nodes[tree.root].value_wdl_sum = [70.0, 20.0, 10.0];
+        assert_eq!(
+            tree.node_children(tree.root)[tree.select_child(tree.root)].mv,
+            repeat
+        );
+        for child in tree.node_children_mut(tree.root) {
+            if child.mv == progress {
+                child.value_wdl_sum = [14.0, 6.0, 0.0];
+            }
+        }
+        assert_eq!(tree.search_result(120).best_move, Some(repeat));
     }
 
     #[test]
@@ -2854,6 +2955,7 @@ mod tests {
             vec![
                 AzChild {
                     gives_check: false,
+                    repeats_position: false,
                     mv: legal[0],
                     prior: 0.10,
                     visits: 1,
@@ -2863,6 +2965,7 @@ mod tests {
                 },
                 AzChild {
                     gives_check: false,
+                    repeats_position: false,
                     mv: legal[1],
                     prior: 0.90,
                     visits: 1,
@@ -2947,6 +3050,7 @@ mod tests {
             [
                 AzChild {
                     gives_check: false,
+                    repeats_position: false,
                     mv: legal[0],
                     prior: 0.25,
                     visits: 1,
@@ -2956,6 +3060,7 @@ mod tests {
                 },
                 AzChild {
                     gives_check: false,
+                    repeats_position: false,
                     mv: legal[1],
                     prior: 0.75,
                     visits: 0,
