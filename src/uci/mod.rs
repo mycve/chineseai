@@ -828,7 +828,7 @@ fn human_move_delay(priors: &[f32], scale_percent: u64) -> Duration {
         / (priors.len() as f32).ln();
     // 首选从 60% 到 80% 时逐步去掉等待，避免在阈值附近突然跳变。
     let confidence_taper = ((0.80 - top_prior) / 0.20).clamp(0.0, 1.0);
-    let delay_ms = (10.0 * scale_percent as f32 * entropy.clamp(0.0, 1.0).powi(2)
+    let delay_ms = (50.0 * scale_percent as f32 * entropy.clamp(0.0, 1.0).powi(2)
         * confidence_taper)
         .round() as u64;
     Duration::from_millis(delay_ms)
@@ -1386,9 +1386,9 @@ mod tests {
         let uniform = human_move_delay(&[0.5, 0.5], 100);
         assert_eq!(concentrated, Duration::ZERO);
         assert_eq!(human_move_delay(&[0.8, 0.2], 500), Duration::ZERO);
-        assert!(human_move_delay(&[0.75, 0.25], 100) < Duration::from_millis(200));
-        assert!(human_move_delay(&[0.6, 0.4], 100) > Duration::from_millis(800));
-        assert_eq!(uniform, Duration::from_secs(1));
+        assert!(human_move_delay(&[0.75, 0.25], 100) < Duration::from_secs(1));
+        assert!(human_move_delay(&[0.6, 0.4], 100) > Duration::from_secs(4));
+        assert_eq!(uniform, Duration::from_secs(5));
         assert_eq!(human_move_delay(&[0.5, 0.5], 200), uniform * 2);
         assert_eq!(human_move_delay(&[1.0], 100), Duration::ZERO);
     }
