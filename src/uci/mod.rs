@@ -23,6 +23,7 @@ const DEFAULT_FPU_VALUE: f32 = 0.23;
 const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 1.0;
 const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.4;
 const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
+const HUMAN_TIMING_FREE_OPENING_PLIES: usize = 12;
 const OPENING_MAX_Q_GAP: f32 = 0.05;
 /// 对局/分析时默认开启的连杀证明深度：15 半回合 = 最多 mate in 8。
 ///
@@ -777,6 +778,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
                 );
             }
             if state.human_move_timing
+                && state.game_ply.is_none_or(|ply| ply >= HUMAN_TIMING_FREE_OPENING_PLIES)
                 && !state.analyse_mode
                 && !params.infinite
                 && params.mate.is_none()
