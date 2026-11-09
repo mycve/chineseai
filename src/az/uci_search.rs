@@ -135,12 +135,20 @@ pub(crate) fn search_uci(
     limits: AzSearchLimits,
     control: &AzSearchControl,
     multipv: usize,
+    pace_deadline: impl FnOnce(&[f32]) -> Option<Instant>,
     mut progress: impl FnMut(&AzUciSearchResult),
 ) -> AzUciSearchResult {
     let mut tree = AzTree::new(position.clone(), history, Some(root_moves), model, limits);
     tree.adjudicate_root_rules = false;
     tree.search_control = Some(control.clone());
     tree.expand(0);
+    let mut control = control.clone();
+    if let (Some(hard_deadline), Some(target)) =
+        (control.deadline, pace_deadline(&tree.root_raw_priors))
+    {
+        control.deadline = Some(hard_deadline.min(target));
+        tree.search_control = Some(control.clone());
+    }
     tree.prove_root_mate(position, model);
     let mut used = 0;
     let mut last_progress = Instant::now();
@@ -187,6 +195,7 @@ mod tests {
             limits,
             &control,
             4,
+            |_| None,
             |_| {},
         )
     }

@@ -56,6 +56,8 @@ struct UciState {
     opening_temp_plies: usize,
     opening_temperature: f32,
     analyse_mode: bool,
+    human_move_timing: bool,
+    human_time_scale: u64,
     game_ply: Option<usize>,
     draw_score: f32,
     sixty_move_rule: bool,
@@ -94,6 +96,8 @@ impl Default for UciState {
             opening_temp_plies: 0,
             opening_temperature: DEFAULT_OPENING_TEMPERATURE,
             analyse_mode: false,
+            human_move_timing: false,
+            human_time_scale: 100,
             game_ply: Some(0),
             draw_score: 0.0,
             sixty_move_rule: true,
@@ -116,6 +120,7 @@ struct ActiveSearch {
 impl ActiveSearch {
     fn stop_and_join(self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.handle.thread().unpark();
         let _ = self.handle.join();
     }
 }
@@ -201,6 +206,8 @@ fn print_uci_id() {
     println!("option name OpeningTempPlies type spin default 0 min 0 max 1000");
     println!("option name OpeningTemperature type string default {DEFAULT_OPENING_TEMPERATURE}");
     println!("option name UCI_AnalyseMode type check default false");
+    println!("option name HumanMoveTiming type check default false");
+    println!("option name HumanTimeScale type spin default 100 min 10 max 500");
     println!("option name DrawScore type string default 0.0");
     println!("option name Sixty Move Rule type check default true");
     println!("option name RepetitionDraw type check default true");
@@ -395,6 +402,12 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             }
         }
         "uci_analysemode" => state.analyse_mode = value.eq_ignore_ascii_case("true"),
+        "humanmovetiming" => state.human_move_timing = value.eq_ignore_ascii_case("true"),
+        "humantimescale" => {
+            if let Ok(scale) = value.parse::<u64>() {
+                state.human_time_scale = scale.clamp(10, 500);
+            }
+        }
         "drawscore" => {
             state.draw_score = value
                 .parse::<f32>()
@@ -666,6 +679,9 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
     let control = AzSearchControl::new(Arc::clone(&stop), deadline);
+    let pacing_enabled =
+        state.human_move_timing && !state.analyse_mode && !params.infinite && params.mate.is_none();
+    let mut paced_until = None;
     println!(
         "info string searchparams cpuct={:.4}/{:.4} base={:.1}/{:.1} factor={:.4}/{:.4} fpu={:.4}/{:.4} policytemp={:.4}",
         state.cpuct,
@@ -721,6 +737,13 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         },
         &control,
         state.multipv,
+        |priors| {
+            if pacing_enabled {
+                paced_until =
+                    Some(started + human_move_duration(priors, state.human_time_scale, budget_ms));
+            }
+            paced_until
+        },
         &mut report_progress,
     );
     let result = &report.search;
@@ -763,6 +786,15 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
                     chosen
                 );
             }
+            if let Some(target) = paced_until {
+                flush();
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(remaining) = target.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    thread::park_timeout(remaining);
+                }
+            }
             println!("bestmove {chosen}");
         }
         None => {
@@ -776,6 +808,24 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         }
     }
     flush();
+}
+
+fn human_move_duration(priors: &[f32], scale_percent: u64, budget_ms: Option<u64>) -> Duration {
+    if priors.len() < 2 {
+        return Duration::ZERO;
+    }
+    let entropy = priors
+        .iter()
+        .copied()
+        .filter(|&p| p > 0.0)
+        .map(|p| -p * p.ln())
+        .sum::<f32>()
+        / (priors.len() as f32).ln();
+    let base_ms = budget_ms.unwrap_or(1_000).min(1_000);
+    let target_ms = (base_ms as f32 * (0.1 + 0.9 * entropy.clamp(0.0, 1.0)) * scale_percent as f32
+        / 100.0)
+        .round() as u64;
+    Duration::from_millis(target_ms.min(budget_ms.unwrap_or(u64::MAX)))
 }
 
 fn uci_simulation_limit(params: &GoParams, configured: usize, has_time_control: bool) -> usize {
@@ -1315,6 +1365,27 @@ mod tests {
         for seed in 0..32 {
             assert_eq!(choose_opening_move(&candidates, best, 2.0, seed), best);
         }
+    }
+
+    #[test]
+    fn human_move_timing_scales_with_policy_entropy_and_respects_clock() {
+        let mut state = UciState::default();
+        assert!(!state.human_move_timing);
+        handle_setoption("setoption name HumanMoveTiming value true", &mut state);
+        handle_setoption("setoption name HumanTimeScale value 200", &mut state);
+        assert!(state.human_move_timing);
+        assert_eq!(state.human_time_scale, 200);
+
+        let concentrated = human_move_duration(&[1.0, 0.0], 100, None);
+        let uniform = human_move_duration(&[0.5, 0.5], 100, None);
+        assert_eq!(concentrated, Duration::from_millis(100));
+        assert_eq!(uniform, Duration::from_secs(1));
+        assert_eq!(human_move_duration(&[0.5, 0.5], 200, None), uniform * 2);
+        assert_eq!(
+            human_move_duration(&[0.5, 0.5], 200, Some(250)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(human_move_duration(&[1.0], 100, None), Duration::ZERO);
     }
 
     #[test]
