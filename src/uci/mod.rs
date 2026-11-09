@@ -679,9 +679,6 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
     let control = AzSearchControl::new(Arc::clone(&stop), deadline);
-    let pacing_enabled =
-        state.human_move_timing && !state.analyse_mode && !params.infinite && params.mate.is_none();
-    let mut paced_until = None;
     println!(
         "info string searchparams cpuct={:.4}/{:.4} base={:.1}/{:.1} factor={:.4}/{:.4} fpu={:.4}/{:.4} policytemp={:.4}",
         state.cpuct,
@@ -737,13 +734,6 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         },
         &control,
         state.multipv,
-        |priors| {
-            if pacing_enabled {
-                paced_until =
-                    Some(started + human_move_duration(priors, state.human_time_scale, budget_ms));
-            }
-            paced_until
-        },
         &mut report_progress,
     );
     let result = &report.search;
@@ -786,7 +776,18 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
                     chosen
                 );
             }
-            if let Some(target) = paced_until {
+            if state.human_move_timing
+                && !state.analyse_mode
+                && !params.infinite
+                && params.mate.is_none()
+                && !stop.load(Ordering::Relaxed)
+            {
+                let priors: Vec<_> = result
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.raw_prior)
+                    .collect();
+                let target = Instant::now() + human_move_delay(&priors, state.human_time_scale);
                 flush();
                 while !stop.load(Ordering::Relaxed) {
                     let Some(remaining) = target.checked_duration_since(Instant::now()) else {
@@ -810,7 +811,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     flush();
 }
 
-fn human_move_duration(priors: &[f32], scale_percent: u64, budget_ms: Option<u64>) -> Duration {
+fn human_move_delay(priors: &[f32], scale_percent: u64) -> Duration {
     if priors.len() < 2 {
         return Duration::ZERO;
     }
@@ -821,11 +822,9 @@ fn human_move_duration(priors: &[f32], scale_percent: u64, budget_ms: Option<u64
         .map(|p| -p * p.ln())
         .sum::<f32>()
         / (priors.len() as f32).ln();
-    let base_ms = budget_ms.unwrap_or(1_000).min(1_000);
-    let target_ms = (base_ms as f32 * (0.1 + 0.9 * entropy.clamp(0.0, 1.0)) * scale_percent as f32
-        / 100.0)
+    let delay_ms = (1_000.0 * (0.1 + 0.9 * entropy.clamp(0.0, 1.0)) * scale_percent as f32 / 100.0)
         .round() as u64;
-    Duration::from_millis(target_ms.min(budget_ms.unwrap_or(u64::MAX)))
+    Duration::from_millis(delay_ms)
 }
 
 fn uci_simulation_limit(params: &GoParams, configured: usize, has_time_control: bool) -> usize {
@@ -1368,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn human_move_timing_scales_with_policy_entropy_and_respects_clock() {
+    fn human_move_delay_scales_with_policy_entropy() {
         let mut state = UciState::default();
         assert!(!state.human_move_timing);
         handle_setoption("setoption name HumanMoveTiming value true", &mut state);
@@ -1376,16 +1375,12 @@ mod tests {
         assert!(state.human_move_timing);
         assert_eq!(state.human_time_scale, 200);
 
-        let concentrated = human_move_duration(&[1.0, 0.0], 100, None);
-        let uniform = human_move_duration(&[0.5, 0.5], 100, None);
+        let concentrated = human_move_delay(&[1.0, 0.0], 100);
+        let uniform = human_move_delay(&[0.5, 0.5], 100);
         assert_eq!(concentrated, Duration::from_millis(100));
         assert_eq!(uniform, Duration::from_secs(1));
-        assert_eq!(human_move_duration(&[0.5, 0.5], 200, None), uniform * 2);
-        assert_eq!(
-            human_move_duration(&[0.5, 0.5], 200, Some(250)),
-            Duration::from_millis(250)
-        );
-        assert_eq!(human_move_duration(&[1.0], 100, None), Duration::ZERO);
+        assert_eq!(human_move_delay(&[0.5, 0.5], 200), uniform * 2);
+        assert_eq!(human_move_delay(&[1.0], 100), Duration::ZERO);
     }
 
     #[test]
